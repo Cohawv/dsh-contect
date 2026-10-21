@@ -11,5 +11,11 @@ node_modules/
 *.log
 *.txt
 
+# 备份快照（可回滚产物，不进版本库）
+backup/
+
+# 本地运行产物
+bin/
+
 # AI 会话数据（非项目源码）
 .workbuddy/

@@ -8,12 +8,18 @@ var DEFAULT_HEARTBEAT_MS = 15e3;
 var DEFAULT_REQUEST_TIMEOUT_MS = 3e3;
 var DEFAULT_INBOX_LIMIT = 200;
 var DEFAULT_RECONNECT_MAX_MS = 3e4;
+var CLIENT_PROTO = 2;
+var CLIENT_CAPS = ["structured-ack", "heartbeat-negotiation"];
 var HubClient = class {
   host;
   port;
   agentId;
   agentName;
+  /** 心跳间隔：初始值来自配置，注册后可能被服务端协商值覆盖 */
   heartbeatMs;
+  /** 协商后的协议版本与服务端能力集（注册回执下发） */
+  negotiatedProto = 1;
+  serverCaps = [];
   reconnectEnabled;
   reconnectMaxMs;
   requestTimeoutMs;
@@ -64,7 +70,12 @@ var HubClient = class {
     sock.setNoDelay(true);
     sock.on("connect", () => {
       this.retryDelay = 1e3;
-      this.sendRaw({ type: "register", from: this.agentId, content: { name: this.agentName } });
+      this.sendRaw({
+        type: "register",
+        v: CLIENT_PROTO,
+        from: this.agentId,
+        content: { name: this.agentName, caps: CLIENT_CAPS }
+      });
       this.startHeartbeat();
       this.log(`[lan-hub] connected to ${this.host}:${this.port} as ${this.agentId}`);
     });
@@ -124,10 +135,40 @@ var HubClient = class {
   /** 等待注册完成（socket 建立后还需等服务端回执），用于启动时的确定性等待 */
   async waitReady(timeoutMs = this.requestTimeoutMs) {
     if (this.ready) return;
-    await this.waitFor(
-      (e) => e.type === "system" && typeof e.content?.text === "string" && e.content.text.startsWith("registered as"),
-      timeoutMs
-    );
+    await this.waitFor((e) => this.isRegisterAck(e), timeoutMs);
+  }
+  /** 协商后的协议版本（调试用） */
+  get proto() {
+    return this.negotiatedProto;
+  }
+  /** 服务端声明的能力集（调试用） */
+  get caps() {
+    return this.serverCaps.slice();
+  }
+  // ---------- 注册回执识别与协商 ----------
+  /**
+   * 识别注册回执：优先匹配结构化 action，旧服务端没有该字段时回退到历史文案。
+   * 双判定是为了让客户端能同时对接新旧两版服务端——任一侧先升级都不会断。
+   */
+  isRegisterAck(env) {
+    if (env.type !== "system") return false;
+    const c = env.content;
+    if (!c) return false;
+    return c.action === "registered" || typeof c.text === "string" && c.text.startsWith("registered as");
+  }
+  /** 应用服务端下发的协商结果：协议版本、能力集、心跳间隔 */
+  applyNegotiation(env) {
+    const c = env.content;
+    if (!c) return;
+    const proto = Number(c.proto);
+    if (Number.isFinite(proto) && proto > 0) this.negotiatedProto = proto;
+    if (Array.isArray(c.serverCaps)) this.serverCaps = c.serverCaps;
+    const hb = Number(c.heartbeatMs);
+    if (Number.isFinite(hb) && hb > 0 && hb !== this.heartbeatMs) {
+      this.heartbeatMs = hb;
+      if (this.heartbeat) this.startHeartbeat();
+    }
+    this.log(`[lan-hub] negotiated proto=${this.negotiatedProto} heartbeat=${this.heartbeatMs}ms`);
   }
   // ---------- 收件箱（拉取后清空） ----------
   /** Hub 是推送式的：收到的消息先进 inbox，由调用方主动拉取 */
@@ -165,8 +206,9 @@ var HubClient = class {
     }
   }
   onFrame(env) {
-    if (!this.ready && env.type === "system" && typeof env.content?.text === "string" && env.content.text.startsWith("registered as")) {
+    if (!this.ready && this.isRegisterAck(env)) {
       this.ready = true;
+      this.applyNegotiation(env);
     }
     for (let i = 0; i < this.pending.length; i++) {
       const p = this.pending[i];

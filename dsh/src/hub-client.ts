@@ -61,12 +61,21 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 3_000
 const DEFAULT_INBOX_LIMIT = 200
 const DEFAULT_RECONNECT_MAX_MS = 30_000
 
+/** 客户端声明的协议版本；服务端据此决定是否下发新字段（能力协商） */
+const CLIENT_PROTO = 2
+/** 客户端声明的能力集 */
+const CLIENT_CAPS = ['structured-ack', 'heartbeat-negotiation']
+
 export class HubClient {
   private readonly host: string
   private readonly port: number
   private readonly agentId: string
   private readonly agentName: string
-  private readonly heartbeatMs: number
+  /** 心跳间隔：初始值来自配置，注册后可能被服务端协商值覆盖 */
+  private heartbeatMs: number
+  /** 协商后的协议版本与服务端能力集（注册回执下发） */
+  private negotiatedProto = 1
+  private serverCaps: string[] = []
   private readonly reconnectEnabled: boolean
   private readonly reconnectMaxMs: number
   private readonly requestTimeoutMs: number
@@ -126,7 +135,12 @@ export class HubClient {
 
     sock.on('connect', () => {
       this.retryDelay = 1_000
-      this.sendRaw({ type: 'register', from: this.agentId, content: { name: this.agentName } })
+      this.sendRaw({
+        type: 'register',
+        v: CLIENT_PROTO,
+        from: this.agentId,
+        content: { name: this.agentName, caps: CLIENT_CAPS },
+      })
       this.startHeartbeat()
       this.log(`[lan-hub] connected to ${this.host}:${this.port} as ${this.agentId}`)
     })
@@ -198,10 +212,50 @@ export class HubClient {
   /** 等待注册完成（socket 建立后还需等服务端回执），用于启动时的确定性等待 */
   async waitReady(timeoutMs = this.requestTimeoutMs): Promise<void> {
     if (this.ready) return
-    await this.waitFor(
-      (e) => e.type === 'system' && typeof e.content?.text === 'string' && e.content.text.startsWith('registered as'),
-      timeoutMs,
+    await this.waitFor((e) => this.isRegisterAck(e), timeoutMs)
+  }
+
+  /** 协商后的协议版本（调试用） */
+  get proto(): number {
+    return this.negotiatedProto
+  }
+
+  /** 服务端声明的能力集（调试用） */
+  get caps(): string[] {
+    return this.serverCaps.slice()
+  }
+
+  // ---------- 注册回执识别与协商 ----------
+
+  /**
+   * 识别注册回执：优先匹配结构化 action，旧服务端没有该字段时回退到历史文案。
+   * 双判定是为了让客户端能同时对接新旧两版服务端——任一侧先升级都不会断。
+   */
+  private isRegisterAck(env: Envelope): boolean {
+    if (env.type !== 'system') return false
+    const c = env.content as Record<string, any> | undefined
+    if (!c) return false
+    return (
+      c.action === 'registered' ||
+      (typeof c.text === 'string' && c.text.startsWith('registered as'))
     )
+  }
+
+  /** 应用服务端下发的协商结果：协议版本、能力集、心跳间隔 */
+  private applyNegotiation(env: Envelope): void {
+    const c = env.content as Record<string, any> | undefined
+    if (!c) return
+    const proto = Number(c.proto)
+    if (Number.isFinite(proto) && proto > 0) this.negotiatedProto = proto
+    if (Array.isArray(c.serverCaps)) this.serverCaps = c.serverCaps as string[]
+
+    const hb = Number(c.heartbeatMs)
+    if (Number.isFinite(hb) && hb > 0 && hb !== this.heartbeatMs) {
+      this.heartbeatMs = hb
+      if (this.heartbeat) this.startHeartbeat() // 以服务端值为准重启心跳
+    }
+    // 协商结果总是记一条，便于排障时确认两端到底用的哪套契约
+    this.log(`[lan-hub] negotiated proto=${this.negotiatedProto} heartbeat=${this.heartbeatMs}ms`)
   }
 
   // ---------- 收件箱（拉取后清空） ----------
@@ -247,13 +301,9 @@ export class HubClient {
 
   private onFrame(env: Envelope): void {
     // 0) 识别注册回执，标记就绪（必须早于 pending 匹配，否则会被 waitReady 吞掉）
-    if (
-      !this.ready &&
-      env.type === 'system' &&
-      typeof env.content?.text === 'string' &&
-      env.content.text.startsWith('registered as')
-    ) {
+    if (!this.ready && this.isRegisterAck(env)) {
       this.ready = true
+      this.applyNegotiation(env)
     }
     // 1) 先喂给等待中的请求-响应式调用（回执不进收件箱，避免污染）
     for (let i = 0; i < this.pending.length; i++) {

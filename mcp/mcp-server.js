@@ -30,6 +30,38 @@ const inbox = []; // Hub 推来的消息，供 read_messages 拉取
 const sock = net.connect(HUB_PORT, HUB_HOST);
 let hbuf = '';
 
+// 客户端声明的协议版本与能力集；服务端据此决定是否下发新字段（能力协商）
+const CLIENT_PROTO = 2;
+const CLIENT_CAPS = ['structured-ack', 'heartbeat-negotiation'];
+
+let heartbeatMs = 15000;
+let heartbeatTimer = null;
+
+function startHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(() => send({ type: 'heartbeat', from: AGENT_ID }), heartbeatMs);
+  if (heartbeatTimer.unref) heartbeatTimer.unref();
+}
+
+// 服务端在注册回执里下发心跳间隔时以它为准，避免两端硬编码不一致
+function applyNegotiatedHeartbeat(ms) {
+  const n = Number(ms);
+  if (Number.isFinite(n) && n > 0 && n !== heartbeatMs) {
+    heartbeatMs = n;
+    startHeartbeat();
+  }
+  // 协商结果总是记一条，便于排障时确认两端到底用的哪套契约
+  process.stderr.write('[lan-hub-mcp] heartbeat interval -> ' + heartbeatMs + 'ms\n');
+}
+
+function isRegisterAck(env) {
+  if (!env || env.type !== 'system' || !env.content) return false;
+  const c = env.content;
+  // 优先用结构化 action；旧服务端没有该字段时回退到历史文案
+  return c.action === 'registered' ||
+    (typeof c.text === 'string' && c.text.startsWith('registered as'));
+}
+
 sock.on('data', (chunk) => {
   hbuf += chunk.toString('utf8');
   let idx;
@@ -38,7 +70,9 @@ sock.on('data', (chunk) => {
     hbuf = hbuf.slice(idx + 1);
     if (!line) continue;
     try {
-      inbox.push(JSON.parse(line));
+      const env = JSON.parse(line);
+      if (isRegisterAck(env)) applyNegotiatedHeartbeat(env.content.heartbeatMs);
+      inbox.push(env);
     } catch (e) {
       process.stderr.write('bad hub line: ' + e.message + '\n');
     }
@@ -48,8 +82,13 @@ sock.on('data', (chunk) => {
 sock.on('error', (e) => process.stderr.write('hub socket error: ' + e.message + '\n'));
 
 sock.on('connect', () => {
-  send({ type: 'register', from: AGENT_ID, content: { name: AGENT_NAME } });
-  setInterval(() => send({ type: 'heartbeat', from: AGENT_ID }), 15000);
+  send({
+    type: 'register',
+    v: CLIENT_PROTO,
+    from: AGENT_ID,
+    content: { name: AGENT_NAME, caps: CLIENT_CAPS }
+  });
+  startHeartbeat();
 });
 
 function send(env) {

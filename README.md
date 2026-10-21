@@ -14,8 +14,8 @@
 ## 运行
 
 ```bash
-# 启动 Hub（默认监听 :8080）
-go run . -addr :8080
+# 启动 Hub（默认监听 :8080，HTTP 网关 :8081）
+go run ./cmd/hub -addr :8080
 
 # 另开两个终端，启动两个测试客户端
 go run ./client -id A -name Alice
@@ -35,8 +35,36 @@ go run ./client -id B -name Bob
 
 ```bash
 go vet ./...
-go test ./...    # 覆盖：私聊、建房+进房广播、离线提示
+go test ./...              # 覆盖：私聊、建房+进房广播、离线提示、版本协商、契约兼容
+bash scripts/check-deps.sh # 模块依赖方向守卫（分层被破坏即失败）
+node scripts/probe.js 8099 2 demo   # 协议探针：查看不同版本下的注册回执
 ```
+
+## 模块化架构
+
+服务端按职责分为四层，依赖严格单向（由 `scripts/check-deps.sh` 强制）：
+
+| 包 | 职责 | 依赖 |
+|----|------|------|
+| `internal/protocol` | 对外契约：Envelope、类型、版本协商、编解码 | 无（叶子包） |
+| `internal/core` | 业务内核：注册、路由、房间、上下线事件 | 仅 protocol |
+| `internal/transport` | 通信实现：NDJSON over TCP（可插拔换 WebSocket） | 仅 protocol |
+| `internal/adapter` | 把传输连接适配为业务 Session；HTTP 网关 | core + transport |
+| `cmd/hub` | 装配与启动 | 全部 |
+
+业务层通过 `core.Session` 接口下发消息，完全不感知 TCP / 序列化 / 连接管理。
+
+## 协议版本与兼容
+
+- 信封新增 `v` 字段：不声明即按 v1 处理，行为与历史版本一致。
+- 注册时能力协商：服务端在回执里下发 `proto` / `serverCaps` / `heartbeatMs`，
+  但这些字段**仅在协商版本 ≥ 2 时下发**（版本门控）。
+- 回执同时输出结构化 `action` 与旧 `text`：老客户端读 `text`，新客户端读 `action`。
+- 演进规则：字段只增不改；旧接口下线走 D1 双写 → D2 观察 → D3 移除。
+
+详见 `docs/ARCHITECTURE.md`（方案与评审）与 `docs/IMPLEMENTATION_PLAN.md`（分期实施）。
+
+**因此：服务端可独立升级，客户端无需同步改动。** 已用备份的旧客户端实测验证。
 
 ## 协议（统一信封 Envelope）
 

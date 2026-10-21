@@ -1,19 +1,25 @@
-package main
+package adapter
 
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+
+	"lan-agent-hub/internal/core"
+	"lan-agent-hub/internal/protocol"
 )
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	// 便于观测：客户端可据此判断服务端支持的协议版本
+	w.Header().Set("X-Proto-Version", strconv.Itoa(protocol.ProtoCurrent))
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// StartHTTP 启动 HTTP 控制网关（REST），复用同一套 Hub 逻辑。
-// 这样 Python / Node / DSH / curl 等非 Go 客户端也能通过 HTTP 接入，
-// 与 TCP 客户端共用统一的 Envelope 协议。
-func (h *Hub) StartHTTP(addr string) error {
+// StartHTTP 启动 REST 网关，复用同一套 core 逻辑。
+// 注意：HTTP 是无连接的请求-响应式接入，没有 Session 概念，
+// 因此这里直接调用内核方法；离线提示等需要回执的能力仅在长连接形态下提供。
+func StartHTTP(addr string, hub *core.Hub) error {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/agents", func(w http.ResponseWriter, r *http.Request) {
@@ -21,7 +27,7 @@ func (h *Hub) StartHTTP(addr string) error {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		writeJSON(w, map[string]any{"agents": h.listAgents()})
+		writeJSON(w, map[string]any{"agents": hub.ListAgents()})
 	})
 
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
@@ -34,7 +40,8 @@ func (h *Hub) StartHTTP(addr string) error {
 			http.Error(w, "need from/to/text", http.StatusBadRequest)
 			return
 		}
-		h.route(newEnvelope(TypeChat, p.From, p.To, "", map[string]string{"text": p.Text}))
+		hub.Router.Route(protocol.NewEnvelope(protocol.TypeChat, p.From, p.To, "",
+			map[string]string{"text": p.Text}))
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
@@ -48,7 +55,8 @@ func (h *Hub) StartHTTP(addr string) error {
 			http.Error(w, "need from/roomId/text", http.StatusBadRequest)
 			return
 		}
-		h.route(newEnvelope(TypeRoom, p.From, "", p.RoomID, map[string]string{"text": p.Text}))
+		hub.Router.Route(protocol.NewEnvelope(protocol.TypeRoom, p.From, "", p.RoomID,
+			map[string]string{"text": p.Text}))
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
@@ -62,8 +70,7 @@ func (h *Hub) StartHTTP(addr string) error {
 			http.Error(w, "bad body", http.StatusBadRequest)
 			return
 		}
-		id := h.createRoom(p.Name, p.Members)
-		writeJSON(w, map[string]string{"roomId": id})
+		writeJSON(w, map[string]string{"roomId": hub.Rooms.Create(p.Name, p.Members)})
 	})
 
 	mux.HandleFunc("/api/join", func(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +82,7 @@ func (h *Hub) StartHTTP(addr string) error {
 			http.Error(w, "need roomId", http.StatusBadRequest)
 			return
 		}
-		h.joinRoom(p.RoomID, p.From)
+		hub.Rooms.Join(p.RoomID, p.From)
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
@@ -88,7 +95,7 @@ func (h *Hub) StartHTTP(addr string) error {
 			http.Error(w, "need roomId", http.StatusBadRequest)
 			return
 		}
-		h.leaveRoom(p.RoomID, p.From)
+		hub.Rooms.Leave(p.RoomID, p.From)
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
