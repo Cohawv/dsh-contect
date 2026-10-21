@@ -41,6 +41,9 @@ export const Config: Schema<Config> = Schema.object({
   requestTimeoutMs: Schema.number().default(3000).description('请求响应超时（毫秒）'),
   inboxLimit: Schema.number().default(200).description('收件箱上限'),
   autoInject: Schema.boolean().default(false).description('收到消息时自动注入 Agent 上下文'),
+  /** 局域网自动发现：把 host 设为 "auto" 即启用，无需手动填 IP */
+  autoDiscover: Schema.boolean().default(false).description('host 为 auto 时启用 UDP 局域网自动发现'),
+  discoverPort: Schema.number().default(8082).description('Hub 发现服务 UDP 端口（与服务端 -discover 一致）'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -53,6 +56,8 @@ export function apply(ctx: Context, config: Config) {
     reconnect: config.reconnect,
     requestTimeoutMs: config.requestTimeoutMs,
     inboxLimit: config.inboxLimit,
+    autoDiscover: config.host === 'auto' || config.autoDiscover,
+    discoverPort: config.discoverPort,
     log: (m) => console.error(m),
   })
 

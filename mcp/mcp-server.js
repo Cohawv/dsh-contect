@@ -14,6 +14,41 @@
 const net = require('net');
 const http = require('http');
 const crypto = require('crypto');
+const dgram = require('dgram');
+
+// 局域网自动发现：向广播地址发 query，服务端单播回 beacon（含 Hub IP 与端口）
+const DISCOVER_PORT = parseInt(process.env.HUB_DISCOVER_PORT || '8082', 10);
+function discoverHub(timeoutMs, port) {
+  return new Promise((resolve, reject) => {
+    const s = dgram.createSocket('udp4');
+    const t = setTimeout(() => {
+      try { s.close(); } catch (e) { /* ignore */ }
+      reject(new Error('discovery timeout'));
+    }, timeoutMs);
+    s.on('message', (msg, rinfo) => {
+      try {
+        const b = JSON.parse(msg.toString());
+        if (b && b.type === '_lanhub_beacon' && typeof b.tcpPort === 'number') {
+          clearTimeout(t);
+          try { s.close(); } catch (e) { /* ignore */ }
+          resolve({ host: rinfo.address, port: b.tcpPort });
+        }
+      } catch (e) { /* 非法帧忽略 */ }
+    });
+    s.on('error', (e) => {
+      clearTimeout(t);
+      try { s.close(); } catch (_) { /* ignore */ }
+      reject(e);
+    });
+    s.bind(() => {
+      try { s.setBroadcast(true); } catch (e) { /* ignore */ }
+      const q = Buffer.from(JSON.stringify({ type: '_lanhub_query' }));
+      s.send(q, 0, q.length, port, '255.255.255.255', (err) => {
+        if (err) { clearTimeout(t); try { s.close(); } catch (_) { /* ignore */ } reject(err); }
+      });
+    });
+  });
+}
 
 const HUB_HOST = process.env.HUB_HOST || '127.0.0.1';
 const HUB_PORT = parseInt(process.env.HUB_PORT || '8080', 10);
@@ -27,12 +62,12 @@ const DEFAULT_VERSION = '2025-03-26';
 const inbox = []; // Hub 推来的消息，供 read_messages 拉取
 
 // ---------------- Hub 连接 ----------------
-const sock = net.connect(HUB_PORT, HUB_HOST);
+let sock = null;
 let hbuf = '';
 
 // 客户端声明的协议版本与能力集；服务端据此决定是否下发新字段（能力协商）
-const CLIENT_PROTO = 2;
-const CLIENT_CAPS = ['structured-ack', 'heartbeat-negotiation'];
+const CLIENT_PROTO = 3;
+const CLIENT_CAPS = ['structured-ack', 'heartbeat-negotiation', 'discovery', 'agent-caps', 'endpoints'];
 
 let heartbeatMs = 15000;
 let heartbeatTimer = null;
@@ -62,6 +97,7 @@ function isRegisterAck(env) {
     (typeof c.text === 'string' && c.text.startsWith('registered as'));
 }
 
+function attachHandlers() {
 sock.on('data', (chunk) => {
   hbuf += chunk.toString('utf8');
   let idx;
@@ -90,6 +126,7 @@ sock.on('connect', () => {
   });
   startHeartbeat();
 });
+}
 
 function send(env) {
   sock.write(JSON.stringify(env) + '\n');
@@ -406,7 +443,24 @@ function runHTTP(port) {
 }
 
 // ---------------- 入口 ----------------
-function main() {
+async function main() {
+  let host = HUB_HOST;
+  let port = HUB_PORT;
+  if (HUB_HOST === 'auto' || HUB_HOST === '') {
+    try {
+      const f = await discoverHub(2000, DISCOVER_PORT);
+      host = f.host;
+      port = f.port;
+      process.stderr.write('[lan-hub-mcp] discovered hub at ' + host + ':' + port + '\n');
+    } catch (e) {
+      process.stderr.write('[lan-hub-mcp] discovery failed: ' + e.message + ', fallback 127.0.0.1:8080\n');
+      host = '127.0.0.1';
+      port = 8080;
+    }
+  }
+  sock = net.connect(port, host);
+  attachHandlers();
+
   const argv = process.argv.slice(2);
   if (argv[0] === '--http') {
     const p = parseInt(argv[1] || process.env.MCP_HTTP_PORT || '8082', 10);

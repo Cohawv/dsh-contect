@@ -12,6 +12,7 @@
  */
 
 import net from 'node:net'
+import dgram from 'node:dgram'
 
 /** 统一的消息信封，与服务端 protocol.go 的 Envelope 一一对应 */
 export interface Envelope {
@@ -28,6 +29,12 @@ export interface Envelope {
 export interface AgentInfo {
   id: string
   name?: string
+}
+
+/** 自动发现的 Hub 端点 */
+export interface DiscoveredHub {
+  host: string
+  port: number
 }
 
 export interface HubClientOptions {
@@ -47,6 +54,14 @@ export interface HubClientOptions {
   /** 收件箱上限，超出丢弃最旧的，防止长时间运行内存膨胀 */
   inboxLimit?: number
   log?: (msg: string) => void
+  // ---------- 局域网自动发现 ----------
+  /** 是否启用自动发现：host 设为 'auto' 时即触发，无需显式开启 */
+  autoDiscover?: boolean
+  /** 发现服务 UDP 端口（与服务端 -discover 一致），默认 8082 */
+  discoverPort?: number
+  /** 发现超时后回退的连接地址（默认 127.0.0.1:8080） */
+  fallbackHost?: string
+  fallbackPort?: number
 }
 
 interface Pending {
@@ -62,20 +77,32 @@ const DEFAULT_INBOX_LIMIT = 200
 const DEFAULT_RECONNECT_MAX_MS = 30_000
 
 /** 客户端声明的协议版本；服务端据此决定是否下发新字段（能力协商） */
-const CLIENT_PROTO = 2
-/** 客户端声明的能力集 */
-const CLIENT_CAPS = ['structured-ack', 'heartbeat-negotiation']
+const CLIENT_PROTO = 3
+/**
+ * 客户端声明的能力集。
+ * 新增 discovery / agent-caps / endpoints 后，服务端才会下发对应字段；
+ * 老服务端（v<3）不认识这些 cap，直接忽略，连接照常工作。
+ */
+const CLIENT_CAPS = ['structured-ack', 'heartbeat-negotiation', 'discovery', 'agent-caps', 'endpoints']
+const DEFAULT_DISCOVER_PORT = 8082
+const DEFAULT_DISCOVER_TIMEOUT_MS = 2000
 
 export class HubClient {
   private readonly host: string
   private readonly port: number
   private readonly agentId: string
   private readonly agentName: string
+  /** 自动发现：host 为 'auto'/'' 时触发，找到后覆盖实际连接地址 */
+  private readonly autoDiscover: boolean
+  private readonly discoverPort: number
+  private readonly fallbackHost: string
+  private readonly fallbackPort: number
   /** 心跳间隔：初始值来自配置，注册后可能被服务端协商值覆盖 */
   private heartbeatMs: number
   /** 协商后的协议版本与服务端能力集（注册回执下发） */
   private negotiatedProto = 1
   private serverCaps: string[] = []
+  private serverFeatures: Record<string, any> = {}
   private readonly reconnectEnabled: boolean
   private readonly reconnectMaxMs: number
   private readonly requestTimeoutMs: number
@@ -105,6 +132,10 @@ export class HubClient {
     this.requestTimeoutMs = o.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
     this.inboxLimit = o.inboxLimit ?? DEFAULT_INBOX_LIMIT
     this.log = o.log ?? ((m) => console.error(m))
+    this.autoDiscover = o.autoDiscover ?? (o.host === 'auto' || o.host === '')
+    this.discoverPort = o.discoverPort ?? DEFAULT_DISCOVER_PORT
+    this.fallbackHost = o.fallbackHost ?? '127.0.0.1'
+    this.fallbackPort = o.fallbackPort ?? 8080
   }
 
   get id(): string {
@@ -125,10 +156,26 @@ export class HubClient {
     this.listeners.push(cb)
   }
 
-  /** 建立连接；重连逻辑内置，调用方无需关心 */
-  connect(): void {
+  /**
+   * 建立连接；host 为 'auto' 时先走 UDP 自动发现，找到 Hub 再连。
+   * 重连逻辑内置，调用方无需关心。
+   */
+  async connect(): Promise<void> {
     if (this.disposed) return
-    const sock = net.connect(this.port, this.host)
+    let host = this.host
+    let port = this.port
+    if (this.autoDiscover) {
+      try {
+        const found = await this.discover()
+        host = found.host
+        port = found.port
+      } catch (e) {
+        this.log(`[lan-hub] discovery failed: ${(e as Error).message}, fallback ${this.fallbackHost}:${this.fallbackPort}`)
+        host = this.fallbackHost
+        port = this.fallbackPort
+      }
+    }
+    const sock = net.connect(port, host)
     this.sock = sock
     // 禁用 Nagle，降低小包延时（低延时的关键一项）
     sock.setNoDelay(true)
@@ -142,7 +189,7 @@ export class HubClient {
         content: { name: this.agentName, caps: CLIENT_CAPS },
       })
       this.startHeartbeat()
-      this.log(`[lan-hub] connected to ${this.host}:${this.port} as ${this.agentId}`)
+      this.log(`[lan-hub] connected to ${host}:${port} as ${this.agentId}`)
     })
 
     sock.on('data', (chunk) => this.onData(chunk))
@@ -163,6 +210,53 @@ export class HubClient {
       this.sock.destroy()
       this.sock = null
     }
+  }
+
+  // ---------- 局域网自动发现（UDP 广播查询 + 单播应答） ----------
+
+  /**
+   * 通过 UDP 发现同网段的 Hub：向广播地址发 _lanhub_query，
+   * 服务端 discovery 服务收到后立即单播回一个 _lanhub_beacon，
+   * 从中取出 Hub 的真实 IP 与 tcp 端口。失败（超时/无 Hub）则 reject，
+   * 由 connect 回退到 fallback 地址。
+   */
+  private discover(): Promise<DiscoveredHub> {
+    return new Promise((resolve, reject) => {
+      const sock = dgram.createSocket('udp4')
+      const timeout = setTimeout(() => {
+        try { sock.close() } catch { /* ignore */ }
+        reject(new Error('discovery timeout'))
+      }, DEFAULT_DISCOVER_TIMEOUT_MS)
+
+      sock.on('message', (msg, rinfo) => {
+        try {
+          const b = JSON.parse(msg.toString('utf8'))
+          if (b && b.type === '_lanhub_beacon' && typeof b.tcpPort === 'number') {
+            clearTimeout(timeout)
+            try { sock.close() } catch { /* ignore */ }
+            resolve({ host: rinfo.address, port: b.tcpPort })
+          }
+        } catch {
+          /* 非法帧忽略，继续等 */
+        }
+      })
+      sock.on('error', (e) => {
+        clearTimeout(timeout)
+        try { sock.close() } catch { /* ignore */ }
+        reject(e)
+      })
+      sock.bind(() => {
+        try { sock.setBroadcast(true) } catch { /* ignore */ }
+        const q = Buffer.from(JSON.stringify({ type: '_lanhub_query' }))
+        sock.send(q, 0, q.length, this.discoverPort, '255.255.255.255', (err) => {
+          if (err) {
+            clearTimeout(timeout)
+            try { sock.close() } catch { /* ignore */ }
+            reject(err)
+          }
+        })
+      })
+    })
   }
 
   // ---------- 发送类（fire-and-forget，服务端保证 seq 有序） ----------
@@ -241,13 +335,14 @@ export class HubClient {
     )
   }
 
-  /** 应用服务端下发的协商结果：协议版本、能力集、心跳间隔 */
+  /** 应用服务端下发的协商结果：协议版本、能力集、心跳间隔、feature 开关 */
   private applyNegotiation(env: Envelope): void {
     const c = env.content as Record<string, any> | undefined
     if (!c) return
     const proto = Number(c.proto)
     if (Number.isFinite(proto) && proto > 0) this.negotiatedProto = proto
     if (Array.isArray(c.serverCaps)) this.serverCaps = c.serverCaps as string[]
+    if (c.features && typeof c.features === 'object') this.serverFeatures = c.features as Record<string, any>
 
     const hb = Number(c.heartbeatMs)
     if (Number.isFinite(hb) && hb > 0 && hb !== this.heartbeatMs) {
@@ -255,7 +350,8 @@ export class HubClient {
       if (this.heartbeat) this.startHeartbeat() // 以服务端值为准重启心跳
     }
     // 协商结果总是记一条，便于排障时确认两端到底用的哪套契约
-    this.log(`[lan-hub] negotiated proto=${this.negotiatedProto} heartbeat=${this.heartbeatMs}ms`)
+    const feat = Object.keys(this.serverFeatures).filter((k) => this.serverFeatures[k]).join(',')
+    this.log(`[lan-hub] negotiated proto=${this.negotiatedProto} heartbeat=${this.heartbeatMs}ms features=[${feat}]`)
   }
 
   // ---------- 收件箱（拉取后清空） ----------

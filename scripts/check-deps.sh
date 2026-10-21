@@ -18,9 +18,10 @@ check() {
 }
 
 echo "检查模块依赖方向..."
-check internal/protocol 'lan-agent-hub/internal/(core|transport|adapter)' 'protocol 是叶子包'
-check internal/core     'lan-agent-hub/internal/(transport|adapter)'      'core 不依赖传输/适配层'
-check internal/transport 'lan-agent-hub/internal/(core|adapter)'          'transport 不依赖业务/适配层'
+check internal/protocol 'lan-agent-hub/internal/(core|transport|adapter|discovery)' 'protocol 是叶子包'
+check internal/core     'lan-agent-hub/internal/(transport|adapter|discovery)'     'core 不依赖传输/适配/发现层'
+check internal/transport 'lan-agent-hub/internal/(core|adapter|discovery)'        'transport 不依赖业务/适配/发现层'
+check internal/discovery 'lan-agent-hub/internal/(core|transport|adapter|protocol)' 'discovery 是叶子包'
 
 if [ "$fail" -ne 0 ]; then
   echo

@@ -20,6 +20,9 @@ type Hub struct {
 	// 保活参数，注册时通过能力协商下发给客户端
 	HeartbeatMs int64
 	TimeoutMs   int64
+	// 服务端暴露的端口，注册回执在 cap: endpoints 下发给客户端（支持自动发现后的二次确认）
+	TCPPort  int
+	HTTPPort int
 }
 
 func NewHub() *Hub {
@@ -66,7 +69,7 @@ func (h *Hub) HandleEnvelope(sess Session, env *protocol.Envelope) {
 		// 版本协商：服务端迁就客户端
 		proto := protocol.Negotiate(env.V)
 		a := h.Registry.Bind(env.From, p.Name, p.Caps, proto, sess)
-		a.Deliver(protocol.RegisteredAck(env.From, proto, h.HeartbeatMs, h.TimeoutMs))
+		a.Deliver(protocol.RegisteredAck(env.From, p.Caps, proto, h.ackCfg()))
 		h.Bus.Publish(protocol.TopicAgentOnline, env.From)
 
 	case protocol.TypeHeartbeat:
@@ -109,8 +112,12 @@ func (h *Hub) HandleEnvelope(sess Session, env *protocol.Envelope) {
 		}
 
 	case protocol.TypeList:
+		var lp struct {
+			Caps []string `json:"caps"`
+		}
+		_ = protocol.UnmarshalContent(env.Content, &lp)
 		sess.Deliver(protocol.NewEnvelope(protocol.TypeSystem, "hub", env.From, "",
-			map[string]any{"action": protocol.ActionList, "agents": h.ListAgents()}))
+			map[string]any{"action": protocol.ActionList, "agents": h.ListAgents(lp.Caps)}))
 
 	default:
 		sess.Deliver(protocol.NewEnvelope(protocol.TypeSystem, "hub", env.From, "", map[string]any{
@@ -158,7 +165,26 @@ func (h *Hub) SweepLoop(interval time.Duration) {
 	}
 }
 
-// ListAgents 返回在线列表（对外契约：id/name 恒定，caps 为增量字段）。
-func (h *Hub) ListAgents() []map[string]any {
+// ListAgents 返回在线列表。是否携带各 agent 的 caps/proto 由请求者声明的
+// cap: agent-caps 门控——不声明的客户端拿到的就是最轻量的 id/name 列表。
+func (h *Hub) ListAgents(viewerCaps []string) []map[string]any {
+	if protocol.CapSet(viewerCaps).Has(protocol.CapAgentCaps) {
+		return h.Registry.ListAgentsDetailed()
+	}
 	return h.Registry.ListAgents()
+}
+
+// ListAgentsDetailed 总是返回带 caps/proto 的明细（HTTP 调试网关用）。
+func (h *Hub) ListAgentsDetailed() []map[string]any {
+	return h.Registry.ListAgentsDetailed()
+}
+
+// ackCfg 拼装注册回执所需的端点 / 保活配置。
+func (h *Hub) ackCfg() protocol.EndpointsCfg {
+	return protocol.EndpointsCfg{
+		HeartbeatMs: h.HeartbeatMs,
+		TimeoutMs:   h.TimeoutMs,
+		TCPPort:     h.TCPPort,
+		HTTPPort:    h.HTTPPort,
+	}
 }

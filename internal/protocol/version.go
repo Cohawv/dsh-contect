@@ -8,7 +8,8 @@ package protocol
 //   - 版本号只用于「启用新行为」，不用于「拒绝服务」。
 const (
 	ProtoLegacy       = 1 // 历史版本：无能力协商，回执靠 text 承载语义
-	ProtoCurrent      = 2 // 当前版本：能力协商 + 结构化回执
+	ProtoV2           = 2 // v2：能力协商 + 结构化回执
+	ProtoCurrent      = 3 // 当前版本：能力协商增强（features / 自动发现 / 端点信息）
 	ProtoMinSupported = 1
 )
 
@@ -30,8 +31,11 @@ func Negotiate(clientV int) int {
 // ServerCaps 是服务端当前开放的能力集，在注册回执里下发给客户端。
 // 客户端应忽略不认识的 cap，而不是报错——这样服务端新增能力不会打断老客户端。
 var ServerCaps = []string{
-	"structured-ack",       // 回执带结构化 action 字段
+	"structured-ack",        // 回执带结构化 action 字段
 	"heartbeat-negotiation", // 心跳参数由服务端下发
+	"discovery",             // 局域网自动发现（UDP 广播 + 单播探测）
+	"agent-caps",            // list 回执携带各 agent 的 caps/proto
+	"endpoints",             // 注册回执下发 tcp/http 端点
 }
 
 // HasCap 判断能力集中是否包含某个能力。
@@ -50,8 +54,10 @@ func HasCap(caps []string, want string) bool {
 //   - text 恒定输出（老客户端的唯一生命线，长期保留）；
 //   - action / agentId 是纯增量字段，老客户端会忽略，因此无条件输出；
 //   - proto / serverCaps / heartbeatMs / timeoutMs 会改变客户端行为，
-//     因此仅在协商版本 >= 2 时下发（版本门控）。
-func RegisteredAck(agentID string, proto int, heartbeatMs, timeoutMs int64) Envelope {
+//     因此仅在协商版本 >= 2 时下发（版本门控）；
+//   - features / clientCaps / endpoints 是 v3 新增，仅在 proto >= 3 时下发，
+//     且 features 内部仍按客户端声明的 cap 逐位门控。
+func RegisteredAck(agentID string, clientCaps []string, proto int, hb EndpointsCfg) Envelope {
 	content := map[string]any{
 		"text":    "registered as " + agentID,
 		"action":  ActionRegistered,
@@ -60,8 +66,24 @@ func RegisteredAck(agentID string, proto int, heartbeatMs, timeoutMs int64) Enve
 	if proto >= 2 {
 		content["proto"] = proto
 		content["serverCaps"] = ServerCaps
-		content["heartbeatMs"] = heartbeatMs
-		content["timeoutMs"] = timeoutMs
+		content["heartbeatMs"] = hb.HeartbeatMs
+		content["timeoutMs"] = hb.TimeoutMs
+	}
+	if proto >= 3 {
+		content["features"] = ComputeFeatures(proto, clientCaps)
+		// 回显客户端声明的能力集，便于排障（尤其自动发现是否生效）
+		content["clientCaps"] = CapSet(clientCaps).Sorted()
+		if ComputeFeatures(proto, clientCaps).Endpoints {
+			content["endpoints"] = Endpoints{TCPPort: hb.TCPPort, HTTPPort: hb.HTTPPort}
+		}
 	}
 	return NewEnvelope(TypeSystem, "hub", agentID, "", content)
+}
+
+// EndpointsCfg 携带服务端保活参数与端口信息，供 RegisteredAck 渲染。
+type EndpointsCfg struct {
+	HeartbeatMs int64
+	TimeoutMs   int64
+	TCPPort     int
+	HTTPPort    int
 }

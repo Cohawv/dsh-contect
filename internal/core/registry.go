@@ -99,15 +99,31 @@ func (r *Registry) Sweep(timeoutMs int64) []*Agent {
 	return dropped
 }
 
-// ListAgents 输出在线列表（对外契约的一部分：id/name 恒定，caps 为增量字段）。
+// ListAgents 输出在线列表（默认：仅 id/name，最轻量，老客户端友好）。
 func (r *Registry) ListAgents() []map[string]any {
+	return r.listAgents(false)
+}
+
+// ListAgentsDetailed 输出带 caps/proto 的明细列表（受 cap: agent-caps 门控）。
+func (r *Registry) ListAgentsDetailed() []map[string]any {
+	return r.listAgents(true)
+}
+
+// listAgents 按 detailed 决定是否下发每个 agent 的 caps/proto 等增量字段。
+// 增量字段对不声明对应 cap 的客户端无意义，下发反而是噪声，故默认不下发。
+func (r *Registry) listAgents(detailed bool) []map[string]any {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]map[string]any, 0, len(r.agents))
 	for _, a := range r.agents {
 		item := map[string]any{"id": a.ID, "name": a.Name}
-		if len(a.Caps) > 0 {
-			item["caps"] = a.Caps
+		if detailed {
+			if len(a.Caps) > 0 {
+				item["caps"] = a.Caps
+			}
+			if a.Proto > 0 {
+				item["proto"] = a.Proto
+			}
 		}
 		out = append(out, item)
 	}

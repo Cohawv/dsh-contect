@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"lan-agent-hub/internal/core"
+	"lan-agent-hub/internal/discovery"
 	"lan-agent-hub/internal/protocol"
 )
 
@@ -19,15 +20,25 @@ func writeJSON(w http.ResponseWriter, v any) {
 // StartHTTP 启动 REST 网关，复用同一套 core 逻辑。
 // 注意：HTTP 是无连接的请求-响应式接入，没有 Session 概念，
 // 因此这里直接调用内核方法；离线提示等需要回执的能力仅在长连接形态下提供。
-func StartHTTP(addr string, hub *core.Hub) error {
+// disco 可为 nil（关闭自动发现时），此时 /api/discover 返回 404。
+func StartHTTP(addr string, hub *core.Hub, disco *discovery.Service) error {
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/discover", func(w http.ResponseWriter, r *http.Request) {
+		if disco == nil {
+			http.Error(w, "discovery disabled", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(disco.BeaconJSON())
+	})
 
 	mux.HandleFunc("/api/agents", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		writeJSON(w, map[string]any{"agents": hub.ListAgents()})
+		writeJSON(w, map[string]any{"agents": hub.ListAgentsDetailed()})
 	})
 
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {

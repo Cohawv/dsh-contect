@@ -4,22 +4,31 @@ import Schema from "@deepseek-ai/schemastery";
 
 // src/hub-client.ts
 import net from "node:net";
+import dgram from "node:dgram";
 var DEFAULT_HEARTBEAT_MS = 15e3;
 var DEFAULT_REQUEST_TIMEOUT_MS = 3e3;
 var DEFAULT_INBOX_LIMIT = 200;
 var DEFAULT_RECONNECT_MAX_MS = 3e4;
-var CLIENT_PROTO = 2;
-var CLIENT_CAPS = ["structured-ack", "heartbeat-negotiation"];
+var CLIENT_PROTO = 3;
+var CLIENT_CAPS = ["structured-ack", "heartbeat-negotiation", "discovery", "agent-caps", "endpoints"];
+var DEFAULT_DISCOVER_PORT = 8082;
+var DEFAULT_DISCOVER_TIMEOUT_MS = 2e3;
 var HubClient = class {
   host;
   port;
   agentId;
   agentName;
+  /** 自动发现：host 为 'auto'/'' 时触发，找到后覆盖实际连接地址 */
+  autoDiscover;
+  discoverPort;
+  fallbackHost;
+  fallbackPort;
   /** 心跳间隔：初始值来自配置，注册后可能被服务端协商值覆盖 */
   heartbeatMs;
   /** 协商后的协议版本与服务端能力集（注册回执下发） */
   negotiatedProto = 1;
   serverCaps = [];
+  serverFeatures = {};
   reconnectEnabled;
   reconnectMaxMs;
   requestTimeoutMs;
@@ -47,6 +56,10 @@ var HubClient = class {
     this.requestTimeoutMs = o.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.inboxLimit = o.inboxLimit ?? DEFAULT_INBOX_LIMIT;
     this.log = o.log ?? ((m) => console.error(m));
+    this.autoDiscover = o.autoDiscover ?? (o.host === "auto" || o.host === "");
+    this.discoverPort = o.discoverPort ?? DEFAULT_DISCOVER_PORT;
+    this.fallbackHost = o.fallbackHost ?? "127.0.0.1";
+    this.fallbackPort = o.fallbackPort ?? 8080;
   }
   get id() {
     return this.agentId;
@@ -62,10 +75,26 @@ var HubClient = class {
   onMessage(cb) {
     this.listeners.push(cb);
   }
-  /** 建立连接；重连逻辑内置，调用方无需关心 */
-  connect() {
+  /**
+   * 建立连接；host 为 'auto' 时先走 UDP 自动发现，找到 Hub 再连。
+   * 重连逻辑内置，调用方无需关心。
+   */
+  async connect() {
     if (this.disposed) return;
-    const sock = net.connect(this.port, this.host);
+    let host = this.host;
+    let port = this.port;
+    if (this.autoDiscover) {
+      try {
+        const found = await this.discover();
+        host = found.host;
+        port = found.port;
+      } catch (e) {
+        this.log(`[lan-hub] discovery failed: ${e.message}, fallback ${this.fallbackHost}:${this.fallbackPort}`);
+        host = this.fallbackHost;
+        port = this.fallbackPort;
+      }
+    }
+    const sock = net.connect(port, host);
     this.sock = sock;
     sock.setNoDelay(true);
     sock.on("connect", () => {
@@ -77,7 +106,7 @@ var HubClient = class {
         content: { name: this.agentName, caps: CLIENT_CAPS }
       });
       this.startHeartbeat();
-      this.log(`[lan-hub] connected to ${this.host}:${this.port} as ${this.agentId}`);
+      this.log(`[lan-hub] connected to ${host}:${port} as ${this.agentId}`);
     });
     sock.on("data", (chunk) => this.onData(chunk));
     sock.on("error", (e) => this.log(`[lan-hub] socket error: ${e.message}`));
@@ -96,6 +125,64 @@ var HubClient = class {
       this.sock.destroy();
       this.sock = null;
     }
+  }
+  // ---------- 局域网自动发现（UDP 广播查询 + 单播应答） ----------
+  /**
+   * 通过 UDP 发现同网段的 Hub：向广播地址发 _lanhub_query，
+   * 服务端 discovery 服务收到后立即单播回一个 _lanhub_beacon，
+   * 从中取出 Hub 的真实 IP 与 tcp 端口。失败（超时/无 Hub）则 reject，
+   * 由 connect 回退到 fallback 地址。
+   */
+  discover() {
+    return new Promise((resolve, reject) => {
+      const sock = dgram.createSocket("udp4");
+      const timeout = setTimeout(() => {
+        try {
+          sock.close();
+        } catch {
+        }
+        reject(new Error("discovery timeout"));
+      }, DEFAULT_DISCOVER_TIMEOUT_MS);
+      sock.on("message", (msg, rinfo) => {
+        try {
+          const b = JSON.parse(msg.toString("utf8"));
+          if (b && b.type === "_lanhub_beacon" && typeof b.tcpPort === "number") {
+            clearTimeout(timeout);
+            try {
+              sock.close();
+            } catch {
+            }
+            resolve({ host: rinfo.address, port: b.tcpPort });
+          }
+        } catch {
+        }
+      });
+      sock.on("error", (e) => {
+        clearTimeout(timeout);
+        try {
+          sock.close();
+        } catch {
+        }
+        reject(e);
+      });
+      sock.bind(() => {
+        try {
+          sock.setBroadcast(true);
+        } catch {
+        }
+        const q = Buffer.from(JSON.stringify({ type: "_lanhub_query" }));
+        sock.send(q, 0, q.length, this.discoverPort, "255.255.255.255", (err) => {
+          if (err) {
+            clearTimeout(timeout);
+            try {
+              sock.close();
+            } catch {
+            }
+            reject(err);
+          }
+        });
+      });
+    });
   }
   // ---------- 发送类（fire-and-forget，服务端保证 seq 有序） ----------
   sendTo(to, text) {
@@ -156,19 +243,21 @@ var HubClient = class {
     if (!c) return false;
     return c.action === "registered" || typeof c.text === "string" && c.text.startsWith("registered as");
   }
-  /** 应用服务端下发的协商结果：协议版本、能力集、心跳间隔 */
+  /** 应用服务端下发的协商结果：协议版本、能力集、心跳间隔、feature 开关 */
   applyNegotiation(env) {
     const c = env.content;
     if (!c) return;
     const proto = Number(c.proto);
     if (Number.isFinite(proto) && proto > 0) this.negotiatedProto = proto;
     if (Array.isArray(c.serverCaps)) this.serverCaps = c.serverCaps;
+    if (c.features && typeof c.features === "object") this.serverFeatures = c.features;
     const hb = Number(c.heartbeatMs);
     if (Number.isFinite(hb) && hb > 0 && hb !== this.heartbeatMs) {
       this.heartbeatMs = hb;
       if (this.heartbeat) this.startHeartbeat();
     }
-    this.log(`[lan-hub] negotiated proto=${this.negotiatedProto} heartbeat=${this.heartbeatMs}ms`);
+    const feat = Object.keys(this.serverFeatures).filter((k) => this.serverFeatures[k]).join(",");
+    this.log(`[lan-hub] negotiated proto=${this.negotiatedProto} heartbeat=${this.heartbeatMs}ms features=[${feat}]`);
   }
   // ---------- 收件箱（拉取后清空） ----------
   /** Hub 是推送式的：收到的消息先进 inbox，由调用方主动拉取 */
@@ -303,7 +392,10 @@ var Config = Schema.object({
   reconnect: Schema.boolean().default(true).description("\u65AD\u7EBF\u81EA\u52A8\u91CD\u8FDE"),
   requestTimeoutMs: Schema.number().default(3e3).description("\u8BF7\u6C42\u54CD\u5E94\u8D85\u65F6\uFF08\u6BEB\u79D2\uFF09"),
   inboxLimit: Schema.number().default(200).description("\u6536\u4EF6\u7BB1\u4E0A\u9650"),
-  autoInject: Schema.boolean().default(false).description("\u6536\u5230\u6D88\u606F\u65F6\u81EA\u52A8\u6CE8\u5165 Agent \u4E0A\u4E0B\u6587")
+  autoInject: Schema.boolean().default(false).description("\u6536\u5230\u6D88\u606F\u65F6\u81EA\u52A8\u6CE8\u5165 Agent \u4E0A\u4E0B\u6587"),
+  /** 局域网自动发现：把 host 设为 "auto" 即启用，无需手动填 IP */
+  autoDiscover: Schema.boolean().default(false).description("host \u4E3A auto \u65F6\u542F\u7528 UDP \u5C40\u57DF\u7F51\u81EA\u52A8\u53D1\u73B0"),
+  discoverPort: Schema.number().default(8082).description("Hub \u53D1\u73B0\u670D\u52A1 UDP \u7AEF\u53E3\uFF08\u4E0E\u670D\u52A1\u7AEF -discover \u4E00\u81F4\uFF09")
 });
 function apply(ctx, config) {
   const client = new HubClient({
@@ -315,6 +407,8 @@ function apply(ctx, config) {
     reconnect: config.reconnect,
     requestTimeoutMs: config.requestTimeoutMs,
     inboxLimit: config.inboxLimit,
+    autoDiscover: config.host === "auto" || config.autoDiscover,
+    discoverPort: config.discoverPort,
     log: (m) => console.error(m)
   });
   ctx.effect(() => {

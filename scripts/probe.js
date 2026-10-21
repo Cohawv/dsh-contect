@@ -28,7 +28,10 @@ sock.on('connect', () => {
   const env = { type: 'register', from: agentId, content: { name: 'Probe-' + agentId } };
   if (v > 0) {
     env.v = v;
-    env.content.caps = ['structured-ack', 'heartbeat-negotiation'];
+    // v3 起声明全部能力，验证 features / endpoints / agent-caps 下发
+    env.content.caps = (v >= 3)
+      ? ['structured-ack', 'heartbeat-negotiation', 'discovery', 'agent-caps', 'endpoints']
+      : ['structured-ack', 'heartbeat-negotiation'];
   }
   sock.write(JSON.stringify(env) + '\n');
   setTimeout(() => { sock.end(); process.exit(0); }, 800);
