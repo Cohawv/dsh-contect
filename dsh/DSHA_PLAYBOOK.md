@@ -4,7 +4,7 @@
 > **读法**：直接跳到第 0 节抄命令。若出问题，按第 9 节决策树走。
 > **价值**：本文记录的所有路径均已实测通过。按本文执行可跳过约 60+ 次无效探索（`adb root` / `run-as` / token 认证 / HTTP 直链 / TS 源码发布等都是死路）。
 >
-> **本文件位置**：手机 `/sdcard/DSHA_PLAYBOOK.md`（PC 侧副本，仓库根 `D:/AI-Agent/vibe`：`dsh/DSHA_PLAYBOOK.md`）。
+> **本文件位置**：手机 `/sdcard/DSHA_PLAYBOOK.md`（PC 侧副本，仓库根 `D:/AI-Agent/vibe/Agent-core-contect`：`dsh/DSHA_PLAYBOOK.md`）。
 > 读取：`adb -s <target> shell cat /sdcard/DSHA_PLAYBOOK.md`
 > 若担心 /sdcard 被清理，可在容器终端持久化一份：
 > `cp /sdcard/DSHA_PLAYBOOK.md /root/local-plugins/DSHA_PLAYBOOK.md`
@@ -215,7 +215,7 @@ OUT=/sdcard/your.log
 ### 6.1 打包（PC 侧）
 
 ```bash
-cd D:/AI-Agent/vibe/dsh
+cd D:/AI-Agent/vibe/Agent-core-contect/dsh
 npm pack      # → dsh-plugin-lan-hub-0.1.0.tgz
 ```
 
@@ -290,6 +290,8 @@ node -e "fetch('http://127.0.0.1:8081/api/agents').then(r=>r.text()).then(t=>con
 | 12 | 手机连不上电脑端口 | 电脑防火墙 Private/Public profile 为 Enabled | 放行入站；或确认 Hub 监听 `0.0.0.0` 而非 `127.0.0.1` |
 | 13 | 改插件配置时误伤 bundle 层 | profile 层 patch 在 bundle 层之后应用 | 用 **id-targeted** 写法：`- update: {id: lan-hub, config: {...}}` |
 | 14 | `npm pack` 包内缺文件 | `files` 字段未含 `dist` | `files` 加 `dist`；`test/` 不进包 |
+| 15 | 连通性测试永远返回 CONNECT_FAIL，但实际上是通的 | 用了 `(echo > /dev/tcp/...)`——**dash 不支持 `/dev/tcp`**（bash 专有） | 改用 `node -e "net.connect(...)"` 或 `nc -z -w3 ip port` |
+| 16 | DSHA 显示 READY，但 Hub 上看不到 phone-agent | 手机息屏 / App 进后台 → 网络被系统冻结，插件连接 `ETIMEDOUT` | **不用干预**：插件指数退避重连会自动恢复。核实：`grep '\[lan-hub\]' /root/dsh-web.log` |
 
 ---
 
@@ -298,12 +300,16 @@ node -e "fetch('http://127.0.0.1:8081/api/agents').then(r=>r.text()).then(t=>con
 **先单测再装插件**（把网络问题和插件问题分开，否则会误判）：
 
 ```sh
-# 容器内
+# 容器内（用 node 测，别用 /dev/tcp —— 见下方警告）
 {
   echo "=== 手机 → 电脑 Hub 连通性 ==="
-  (echo > /dev/tcp/192.0.2.78/8080) 2>/dev/null && echo CONNECT_OK || echo CONNECT_FAIL
+  node -e "const n=require('net'),s=n.connect(8080,'192.0.2.78',()=>{console.log('CONNECT_OK');s.end()});s.on('error',e=>console.log('CONNECT_FAIL',e.code));s.setTimeout(3000,()=>{console.log('TIMEOUT');s.destroy()})"
 } > /sdcard/net.log 2>&1
 ```
+
+> ⚠️ **不要用 `(echo > /dev/tcp/host/port)` 测连通性**：`/dev/tcp` 是 **bash 专有特性**，
+> 而容器脚本的 shebang 是 `#!/bin/sh`（dash），不支持它 → **永远返回 CONNECT_FAIL 的假阴性**。
+> 我最初的手册就写错了这条。用 `node -e` 或 `nc -z -w3 <ip> <port>` 才是可靠做法。
 
 PC 侧确认：
 
@@ -372,8 +378,8 @@ OUT=/sdcard/diag.log
   echo "=== 本次启动加载情况 ==="
   grep -iE "lan-hub|failed|did not activate" /root/dsh-web.log 2>/dev/null | tail -20
 
-  echo "=== 容器 → Hub 连通性 ==="
-  (echo > /dev/tcp/192.0.2.78/8080) 2>/dev/null && echo CONNECT_OK || echo CONNECT_FAIL
+  echo "=== 容器 → Hub 连通性（用 node，别用 /dev/tcp）==="
+  node -e "const n=require('net'),s=n.connect(8080,'192.0.2.78',()=>{console.log('CONNECT_OK');s.end()});s.on('error',e=>console.log('CONNECT_FAIL',e.code));s.setTimeout(3000,()=>{console.log('TIMEOUT');s.destroy()})"
 } > $OUT 2>&1
 ```
 
@@ -425,7 +431,20 @@ hub_list_agents, hub_read_messages, hub_send, hub_send_room
   手机 → 电脑：{"type":"chat","from":"wb-verify","to":"pc-agent","content":{"text":"hello-from-phone"},"seq":2}
 ```
 
-参考资料（PC 侧仓库）：
+**实测：手机息屏后的自动重连行为**（无需人工干预）
+
+```
+[lan-hub] disconnected, reconnecting in 16000ms
+[lan-hub] socket error: connect ETIMEDOUT 192.0.2.78:8080
+[lan-hub] disconnected, reconnecting in 30000ms
+[lan-hub] socket error: connect ETIMEDOUT 192.0.2.78:8080
+[lan-hub] connected to 192.0.2.78:8080 as phone-agent   ← 自动恢复
+```
+
+> 插件日志前缀是 `[lan-hub]`。容器里 `grep '\[lan-hub\]' /root/dsh-web.log`
+> 可完整看清连接生命周期（含退避间隔），是判断"断线还是没装好"的最快依据。
+
+参考资料（PC 侧仓库，根 `D:/AI-Agent/vibe/Agent-core-contect`）：
 - `dsh/README.md` —— DSHA 安装章节、配置写法
 - `dsh/build.mjs` —— esbuild 编译（`external: @deepseek-ai/*`）
 - `dsh/tools/wb_*.sh` —— 本文用到的全部容器脚本
