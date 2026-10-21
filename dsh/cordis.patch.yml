@@ -1,0 +1,17 @@
+# dsh-plugin-lan-hub 的配置层。
+#
+# 注意：patch 的 config 是「整块替换」而非深合并，
+# 因此这里列出全部字段；只想改某一项时，其余项请保留默认值。
+- insert:
+    - id: lan-hub
+      name: dsh-plugin-lan-hub
+      config:
+        host: '127.0.0.1'
+        port: 8080
+        agentId: 'dsh-agent'
+        agentName: 'HarnessAgent'
+        heartbeatMs: 15000
+        reconnect: true
+        requestTimeoutMs: 3000
+        inboxLimit: 200
+        autoInject: false

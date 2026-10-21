@@ -1,0 +1,15 @@
+# 依赖
+node_modules/
+
+# Go 构建产物
+*.exe
+
+# 打包产物（dsh/dist/ 必须提交：从 git 安装不执行 build 脚本）
+*.tgz
+
+# 日志与临时文件
+*.log
+*.txt
+
+# AI 会话数据（非项目源码）
+.workbuddy/

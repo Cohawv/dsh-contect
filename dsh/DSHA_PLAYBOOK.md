@@ -1,0 +1,431 @@
+# DSHA 真机实战手册（给后来的 AI）
+
+> **用途**：在安卓真机（DSHA = DeepSeek Harness Android Launcher）上打通容器 shell、安装/调试插件、与局域网 Hub 通信。
+> **读法**：直接跳到第 0 节抄命令。若出问题，按第 9 节决策树走。
+> **价值**：本文记录的所有路径均已实测通过。按本文执行可跳过约 60+ 次无效探索（`adb root` / `run-as` / token 认证 / HTTP 直链 / TS 源码发布等都是死路）。
+>
+> **本文件位置**：手机 `/sdcard/DSHA_PLAYBOOK.md`（PC 侧副本，仓库根 `D:/AI-Agent/vibe`：`dsh/DSHA_PLAYBOOK.md`）。
+> 读取：`adb -s <target> shell cat /sdcard/DSHA_PLAYBOOK.md`
+> 若担心 /sdcard 被清理，可在容器终端持久化一份：
+> `cp /sdcard/DSHA_PLAYBOOK.md /root/local-plugins/DSHA_PLAYBOOK.md`
+
+---
+
+## 0. TL;DR —— 最快路径（复制即用）
+
+```bash
+# 环境（Windows Git Bash，必须先设）
+export MSYS_NO_PATHCONV=1          # 防止 /sdcard 被转成 C:/Program Files/Git/sdcard
+ADB="D:/AI-Agent/dsh-phone/platform-tools/adb.exe"
+T="192.0.2.202:43829"            # 手机无线调试地址（端口每次重开都会变）
+
+# 1) 连手机（有多台设备时后续所有命令必须带 -s "$T"）
+"$ADB" connect $T
+
+# 2) 拿到容器 root shell 的执行权（核心套路）
+#    把脚本 push 到 /sdcard  →  在 DSHA 终端里执行  →  输出写回 /sdcard  →  读回
+"$ADB" -s "$T" push your.sh /sdcard/your.sh
+"$ADB" -s "$T" shell input tap 600 1400                    # 点终端主体，获取焦点
+"$ADB" -s "$T" shell "/system/bin/input text 'sh'"         # 注意：必须全路径调用
+"$ADB" -s "$T" shell input keyevent 62                     # 空格（input text 不支持空格！）
+"$ADB" -s "$T" shell "/system/bin/input text '/sdcard/your.sh'"
+"$ADB" -s "$T" shell input keyevent 66                     # 回车
+sleep 5
+"$ADB" -s "$T" shell "cat /sdcard/your.log"                # 读回输出
+```
+
+三行的本质：**容器文件 adb 看不见，但容器把 `/sdcard` 挂进来了**。所有交互都走「文件共享 + 终端注入」。
+
+---
+
+## 1. 环境事实表（已验证，可直接采信）
+
+| 项 | 值 |
+|---|---|
+| 手机 | 荣耀 SDY-AN00，Android 14（SDK 34） |
+| DSHA 包名 / 版本 | `com.dsh.client` / App 0.2.21 |
+| 容器内 dsh 版本 | **0.2.0-rc.2** |
+| 容器内 Node | **v24.19.0** |
+| 容器 | PRoot + Ubuntu，容器内 uid=0(root)，**手机本身无 root** |
+| DSH_HOME / profile | `/root/.dsh` / `web` |
+| 容器暴露端口 | 3080(dsh web)、3081(LanProxy)、3090 |
+| 容器↔Android 共享目录 | `/sdcard` |
+| 手机无线调试 | 192.0.2.202:43829（**每次重开无线调试端口都会变**） |
+| 电脑 Hub | 192.0.2.78:8080(TCP) / 8081(HTTP)，监听 `0.0.0.0` |
+
+**容器内可直接用的命令**：`dsh`、`node`、`npm`、`pnpm`、`sh`、`nc`、apt 源可用（能联网装包）。
+
+---
+
+## 2. ADB 无线调试通道
+
+```bash
+export MSYS_NO_PATHCONV=1          # 必设！否则 /sdcard 路径被 Git Bash 转换
+ADB="D:/AI-Agent/dsh-phone/platform-tools/adb.exe"
+T="192.0.2.202:43829"
+
+"$ADB" connect $T
+"$ADB" devices -l
+```
+
+**必须注意**
+
+- **实测 `adb devices` 会有 3 台**（物理设备 USB、无线调试、mDNS 发现项各一条）：
+  ```
+  ERLDU19613005705                                  device
+  192.0.2.202:43829                               device
+  adb-AJTYUT2630003756-fwfAYu (2)._adb-tls-connect._tcp  device
+  ```
+  之后**每条命令都要 `-s "$T"`**，否则报 `more than one device/host`。
+- 手机侧 AD 提示：设置 → 开发者选项 → 无线调试 → 使用配对码配对（首次），之后可直接 `connect ip:port`。
+- 端口每次重开无线调试都会变，**先用 `adb devices` 确认，别硬编 43829**。
+- 端口转发（需要时）：`"$ADB" -s "$T" forward tcp:3080 tcp:3080`
+
+---
+
+## 3. 容器 shell 通路（本文最关键的突破）
+
+### 3.1 为什么普通方法都走不通（**别再试了**）
+
+| 尝试 | 结果 |
+|---|---|
+| `adb root` | ❌ `adbd cannot run as root in production builds` |
+| `run-as com.dsh.client` | ❌ App 非 debuggable，不可用 |
+| `adb shell ls /data/user/0/com.dsh.client` | ❌ 权限 700 |
+| 容器 3080/3081 API + token | ❌ 401（详见第 7 节） |
+| `adb shell dsh ...` | ❌ adb shell 只到 Android 的 shell 用户，dsh 在 PRoot 容器里 |
+
+### 3.2 真正的通路：DSHA 内置的 PTY 终端
+
+DSHA 底部导航第 4 个是「终端」页，标题为 **Ubuntu · PTY** —— 它是容器内的真实 root shell。
+
+**进入方法**
+
+```bash
+"$ADB" -s "$T" shell input tap 1050 2548     # 底部导航 → 终端页
+sleep 3
+"$ADB" -s "$T" shell input tap 1020 602      # 点「+」新建终端（重要，见下）
+sleep 5
+```
+
+**为什么必须新建终端**：DSH 服务每次重启，旧终端会话会失效（输入无反应且**无任何报错**）。症状是"命令敲了但文件没生成"——此时点 (1020,602) 新建即可，不要去排查别的。
+
+### 3.3 输入注入的三条铁律
+
+1. **必须直接调 `/system/bin/input`**
+   写 `adb shell "input text 'date>/sdcard/a.txt'"` 时，`>` 会被 adb 的 `sh -c` 当成重定向吃掉，命令变成写入 adb 端文件。
+   ✅ 正确：`"$ADB" -s "$T" shell "/system/bin/input text 'date>/sdcard/a.txt'"`
+
+2. **`input text` 不支持空格**
+   空格会被丢弃或截断。用 `input keyevent 62`（KEYCODE_SPACE）拼接。
+
+3. **复杂命令一律写成 .sh 文件**
+   逐字注入既慢又易错。把命令写进脚本 push 到 /sdcard，终端里只敲 `sh /sdcard/x.sh`。
+
+### 3.4 结果回读
+
+**uiautomator 抓不到终端内容**（终端是自定义绘制，不是 TextView）。所以：
+
+```bash
+# 脚本内
+{
+  echo "=== 结果 ==="
+  your_command
+} > /sdcard/wbxxx.log 2>&1
+
+# PC 侧
+"$ADB" -s "$T" shell "cat /sdcard/wbxxx.log"
+```
+
+**模板脚本**（所有容器脚本都套这个骨架）：
+
+```sh
+#!/bin/sh
+export DSH_HOME=/root/.dsh
+OUT=/sdcard/your.log
+{
+  echo "=== whoami ==="
+  id -un
+  echo "=== 你的命令 ==="
+  ...
+} > $OUT 2>&1
+```
+
+---
+
+## 4. 文件进出容器
+
+```bash
+# 推入（Windows 路径要用 D:/... 形式）
+"$ADB" -s "$T" push "D:/path/to/file" /sdcard/file
+
+# 拉取（例如导出编译产物）
+"$ADB" -s "$T" pull /sdcard/out.js "D:/path/to/dist/out.js"
+```
+
+容器内路径视角：`/sdcard` 即容器里的 `/sdcard`（bind mount），可直接读写。
+
+> 注意：不要长期把插件依赖放在 /sdcard 上（会被系统媒体扫描、也可能被清理）。最终依赖应落到容器内部路径，如 `/root/local-plugins/`。
+
+---
+
+## 5. UI 自动化（DSHA 四个页面）
+
+底部导航（**坐标随分辨率而变，见 5.1**）：
+
+| 位置 | 页面 |
+|---|---|
+| 第 1 个 | 启动（状态 / 重启 / 停止 / 启动 DSHA） |
+| 第 2 个 | 插件（含「从链接安装」+ 插件管理 tab） |
+| 第 3 个 | 设置 |
+| 第 4 个 | 终端 |
+
+### 5.1 坐标必须 dump 获取，不要猜
+
+**这是本次最大的时间陷阱。** 我曾按"猜"的坐标点「重启」，结果全部落空且**界面毫无反应**，导致误判成"重启功能不生效"，浪费大量轮次。真正坐标是 y≈886，猜的是 y≈455。
+
+```bash
+# 一键拿到当前页所有可点击节点 + 坐标
+"$ADB" -s "$T" shell "uiautomator dump /sdcard/ui.xml" >/dev/null 2>&1
+"$ADB" -s "$T" shell "grep -oE '<node[^>]*clickable=\"true\"[^>]*>' /sdcard/ui.xml" \
+  | sed -E 's/.*text="([^"]*)".*bounds="([^"]*)".*/\1 | \2/'
+# bounds 形如 [600,886][1128,1102]，取中心点：x=(600+1128)/2, y=(886+1102)/2
+```
+
+参考（1200×2640 逻辑分辨率实测值，机型不同必须重取）：
+
+```
+底部导航 4 个按钮：150 / 450 / 750 / 1050  ，y=2548
+启动页：  重启 (349,886)   停止 (851,886)   启动 DSHA (600,710)
+插件页：  插件管理 tab (864,465)   只看自己装的 开关 (600,1057)   直链输入框 (600,1204)
+终端页：  新建终端 (1020,602)   终端主体 (600,1400)
+```
+
+### 5.2 页面文本读取
+
+```bash
+"$ADB" -s "$T" shell "uiautomator dump /sdcard/ui.xml" >/dev/null 2>&1
+"$ADB" -s "$T" shell "sed 's/></>\n</g' /sdcard/ui.xml | grep -oE 'text=\"[^\"]+\"' | sort -u"
+```
+
+---
+
+## 6. 插件安装全流程（可复制）
+
+### 6.1 打包（PC 侧）
+
+```bash
+cd D:/AI-Agent/vibe/dsh
+npm pack      # → dsh-plugin-lan-hub-0.1.0.tgz
+```
+
+### 6.2 推到手机 + 容器内安装
+
+```bash
+"$ADB" -s "$T" push dsh-plugin-lan-hub-0.1.0.tgz /sdcard/plugin.tgz
+```
+
+容器内脚本 `install.sh`：
+
+```sh
+#!/bin/sh
+export DSH_HOME=/root/.dsh
+{
+  # 依赖源放容器内部，别依赖 /sdcard
+  mkdir -p /root/local-plugins
+  cp /sdcard/plugin.tgz /root/local-plugins/plugin.tgz
+  cd /root/.dsh/profiles/web
+  dsh plugin --profile web add /root/local-plugins/plugin.tgz 2>&1
+} > /sdcard/install.log 2>&1
+```
+
+> `dsh plugin add` 底层就是 pnpm，工作在 `/root/.dsh/profiles/web`，**支持 tarball 本地文件**。
+
+### 6.3 生效：必须「停止 → 启动」，不是「重启」
+
+```bash
+# 启动页
+"$ADB" -s "$T" shell input tap 851 886     # 停止
+sleep 15
+"$ADB" -s "$T" shell input tap 600 710     # 启动 DSHA
+sleep 90                                    # 完整启动约 60~90s
+```
+
+**只点「重启 Web」不会刷新插件清单**，插件不会进入加载流程。
+
+### 6.4 验证
+
+```bash
+# PC 侧问 Hub：有没有 phone-agent 上线
+node -e "fetch('http://127.0.0.1:8081/api/agents').then(r=>r.text()).then(t=>console.log(t))"
+# 期望：{"agents":[{"id":"phone-agent","name":"PhoneAgent"}]}
+```
+
+容器内查加载状态：
+
+```sh
+{
+  echo "=== 本次启动是否加载了本插件 ==="
+  grep -iE "lan-hub|failed to import|did not activate" /root/dsh-web.log | tail -20
+} > /sdcard/check.log 2>&1
+```
+
+---
+
+## 7. 踩坑清单（症状 → 根因 → 解法）
+
+| # | 症状 | 根因 | 解法 |
+|---|---|---|---|
+| 1 | 点「重启」无反应、状态不变 | **坐标是按猜的，落空了**（最大陷阱） | 先 `uiautomator dump` 取真实 bounds 中心点 |
+| 2 | 终端敲命令无反应、文件没生成 | DSH 重启后旧终端会话失效；且**无任何报错** | 点 (1020,602) 新建终端 |
+| 3 | 命令里的 `>` 被吃掉 | `adb shell "input ..."` 经 `sh -c`，`>` 被当重定向 | 用全路径 `/system/bin/input text '...'` |
+| 4 | 带空格的命令被截断 | `input text` 不支持空格 | 用 `input keyevent 62` 拼空格 |
+| 5 | `$IFS` 不展开 | 目标 shell 不是 bash 或注入环境不展开变量 | 直接用 keyevent 62 拼空格，别用 $IFS |
+| 6 | 插件 `failed to import`，无堆栈 | **Node 24 的 type stripping 不支持 node_modules 下的文件**；插件正是以 node_modules 包被加载 | 必须编译成 JS：`main` 指向 `dist/index.js` |
+| 7 | 插件装不上 / 报版本不满足 | `engines.dsh` 写了 `>=0.2.0`，但 `0.2.0-rc.2 < 0.2.0`（**prerelease 被纯数字范围排除**） | **删掉 `engines.dsh`**，回退到 `peerDependencies: {"@deepseek-ai/dsh": "*"}` |
+| 8 | Web 直链安装被拒 | DSHA 只认 **HTTPS** 直链，http 被拒 | 放弃直链，改 `adb push` + 本地 tarball 安装 |
+| 9 | 3080/3081 API 一直 401 | UI 上显示的 token 是 **App 侧**凭据，容器 API 要的是另一套，且 DSH 重启会轮换 | 别走 API 路线，走终端 |
+| 10 | Hub 上插件已加载但没上线 | 配置里 `host` 是默认的 `127.0.0.1`，在手机上指向**手机自己** | 配置改电脑局域网 IP |
+| 11 | 改了配置却不生效 | ①config 是**整块替换不是深合并**，漏字段会退回默认值 ②`patchReload: "startup"` 需重启 | 写全所有字段 + 停止→启动 |
+| 12 | 手机连不上电脑端口 | 电脑防火墙 Private/Public profile 为 Enabled | 放行入站；或确认 Hub 监听 `0.0.0.0` 而非 `127.0.0.1` |
+| 13 | 改插件配置时误伤 bundle 层 | profile 层 patch 在 bundle 层之后应用 | 用 **id-targeted** 写法：`- update: {id: lan-hub, config: {...}}` |
+| 14 | `npm pack` 包内缺文件 | `files` 字段未含 `dist` | `files` 加 `dist`；`test/` 不进包 |
+
+---
+
+## 8. 网络与连通性
+
+**先单测再装插件**（把网络问题和插件问题分开，否则会误判）：
+
+```sh
+# 容器内
+{
+  echo "=== 手机 → 电脑 Hub 连通性 ==="
+  (echo > /dev/tcp/192.0.2.78/8080) 2>/dev/null && echo CONNECT_OK || echo CONNECT_FAIL
+} > /sdcard/net.log 2>&1
+```
+
+PC 侧确认：
+
+```bash
+# 监听在 0.0.0.0 才对（不是 127.0.0.1）
+netstat -ano | grep LISTENING | grep ":8080 "
+# 防火墙 profile
+Get-NetFirewallProfile | Select-Object Name, Enabled
+```
+
+**关键**：手机里 `127.0.0.1` 是手机自己。所有指向电脑的地址必须写**局域网 IP**（如 192.0.2.78），且该 IP 可能变（路由器重连后），要能快速复核。
+
+---
+
+## 9. 排障决策树
+
+```
+插件没上线？
+├─ Hub 上完全没有 agent
+│   ├─ 容器→Hub TCP 不通 → 查 IP / 防火墙 / Hub 是否 0.0.0.0
+│   ├─ 终端无响应 → 新建终端
+│   └─ 日志有 failed to import → 是不是发了 TS 源码（坑 6）
+├─ 日志里根本没有插件名
+│   └─ 只点了「重启」→ 改「停止 → 启动」（§6.3）
+└─ 上线了但连错地方
+    └─ 配置 host 还是 127.0.0.1（坑 10）
+```
+
+```
+命令敲了没反应？
+├─ 先跑最简命令 'date>/sdcard/wb.txt' 验证通路
+│   ├─ 不通 → 页面不在终端页 / 焦点不对 → 重进终端页 + 点 (600,1400)
+│   ├─ 仍不通 → 旧会话失效 → 点 (1020,602) 新建
+│   └─ 通了但我的命令不通 → 空格/重定向问题（坑 3、4）
+```
+
+---
+
+## 10. 时间陷阱（最烧 token 的几处，直接跳过）
+
+1. ❌ 不要尝试 `adb root` / `run-as` / 找 su / magisk —— 手机无 root，此路不通。
+2. ❌ 不要在 3080/3081 token 认证上反复试参数名（token / access_token / bearer / x-token 全试过）—— 无效。
+3. ❌ 不要用 HTTP 直链装插件 —— DSHA 只要 HTTPS。
+4. ❌ 不要凭猜测点 UI 坐标 —— 必然落空且无报错。
+5. ❌ 不要指望 uiautomator 能读到终端内容 —— 读不到，走文件回读。
+6. ❌ 不要发布 TS 源码给 DSH 插件 —— node_modules 下无法 type-strip，必然 import 失败。
+7. ❌ 不要用「重启 Web」刷新插件清单 —— 不生效，要「停止 → 启动」。
+
+---
+
+## 11. 通用模板：容器内诊断/验证脚本
+
+```sh
+#!/bin/sh
+export DSH_HOME=/root/.dsh
+OUT=/sdcard/diag.log
+{
+  echo "=== 身份 / 版本 ==="
+  id -un
+  dsh --version 2>&1 | head -2
+  node -v
+
+  echo "=== 插件是否在 bundles 中 ==="
+  dsh --profile web --dump-config 2>&1 | grep -A6 "lan-hub"
+
+  echo "=== 本次启动加载情况 ==="
+  grep -iE "lan-hub|failed|did not activate" /root/dsh-web.log 2>/dev/null | tail -20
+
+  echo "=== 容器 → Hub 连通性 ==="
+  (echo > /dev/tcp/192.0.2.78/8080) 2>/dev/null && echo CONNECT_OK || echo CONNECT_FAIL
+} > $OUT 2>&1
+```
+
+调用：
+
+```bash
+"$ADB" -s "$T" push diag.sh /sdcard/diag.sh >/dev/null 2>&1
+"$ADB" -s "$T" shell input tap 600 1400
+"$ADB" -s "$T" shell "/system/bin/input text 'sh'"
+"$ADB" -s "$T" shell input keyevent 62
+"$ADB" -s "$T" shell "/system/bin/input text '/sdcard/diag.sh'"
+"$ADB" -s "$T" shell input keyevent 66
+sleep 8
+"$ADB" -s "$T" shell "cat /sdcard/diag.log"
+```
+
+---
+
+## 12. 现成脚本索引（`dsh/tools/`，直接用别重写）
+
+全部脚本的输出都写回 `/sdcard/wb*.log`，调用方式统一见 §0/§11。
+
+| 脚本 | 用途 |
+|---|---|
+| `wb_whoami.sh` | 容器内身份 / dsh / node 版本探测 |
+| `wb_probe.sh` | 探查 `dsh plugin add` 用法与 profile 目录 |
+| `wb_install.sh` | 从 tarball 安装插件 |
+| `wb_reinstall.sh` | 重装（改用容器内部路径 `/root/local-plugins/`） |
+| `wb_readcfg.sh` | 读回插件配置 + 测试手机→Hub 连通性 |
+| `wb_config.sh` | 写入 id-targeted 配置（host 指向电脑 IP） |
+| `wb_log.sh` | 读 `/root/dsh-web.log` 启动日志 |
+| `wb_diag.sh` | 综合诊断（bundles / 加载情况 / 连通性） |
+| `wb_import_err.sh` | 抓 `failed to import` 的详细错误 |
+| `wb_ts_test.sh` | 验证 TS 源码在 node_modules 下是否可导入（本文结论：不可） |
+| `wb_build.sh` | 容器内 `npm i esbuild` + 编译出 `dist/index.js` |
+| `wb_extract.sh` | 把编译产物导出到 /sdcard 供 `adb pull` 拉回 |
+| `wb_e2e.sh` | 端到端：加载插件、调用 8 个工具、与电脑端双向收发 |
+| `wb_final.sh` | 最终状态核实 |
+
+## 13. 本项目已验证的终态
+
+```
+容器内加载插件 → 8 个工具全部可用：
+hub_broadcast, hub_create_room, hub_join_room, hub_leave_room,
+hub_list_agents, hub_read_messages, hub_send, hub_send_room
+
+手机 ↔ 电脑双向互通：
+  电脑 → 手机：{"type":"chat","from":"pc","to":"wb-verify","content":{"text":"hello-from-pc-to-phone"},"seq":1}
+  手机 → 电脑：{"type":"chat","from":"wb-verify","to":"pc-agent","content":{"text":"hello-from-phone"},"seq":2}
+```
+
+参考资料（PC 侧仓库）：
+- `dsh/README.md` —— DSHA 安装章节、配置写法
+- `dsh/build.mjs` —— esbuild 编译（`external: @deepseek-ai/*`）
+- `dsh/tools/wb_*.sh` —— 本文用到的全部容器脚本
