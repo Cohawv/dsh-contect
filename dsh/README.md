@@ -20,18 +20,22 @@
 
 ```
 dsh/
-├── package.json          # dsh.bundle 声明；main 指向 dist（编译产物）
-├── build.mjs             # 构建：src/*.ts --bundle--> dist/index.js（esbuild）
+├── package.json          # dsh.bundle 声明；main 指向 dist（编译产物）；bin: lanhub-policy
+├── build.mjs             # 构建：src/*.ts + CLI --bundle--> dist（esbuild，默认 minify）
 ├── dist/
-│   └── index.js          # 实际被 dsh 加载的产物（已随包发布）
+│   ├── index.js          # 实际被 dsh 加载的产物（已随包发布）
+│   ├── lanhub-policy.mjs # 策略 CLI 单文件（bin: lanhub-policy）
+│   └── lanhub-update.mjs # 更新通道 CLI 单文件（bin: lanhub-update）
 ├── cordis.patch.yml      # 配置层（含全部配置项与默认值）
-├── src/
-│   ├── index.ts          # 插件入口：apply(ctx, config) + 8 个 tools
-│   └── hub-client.ts     # 核心客户端（纯 Node，零依赖、零 DSH 依赖）
-├── tools/                # DSHA 真机调试用的辅助脚本（不进包）
+├── src/                  # 不进发布包（已编译进 dist）
+│   ├── index.ts          # 插件入口：apply(ctx, config) + 10 个 tools
+│   ├── hub-client.ts     # 核心客户端（纯 Node，零依赖、零 DSH 依赖）
+│   └── policy.mjs        # 策略规范：字段/类型/默认值/钳制，插件与 CLI 共用
+├── tools/                # lanhub-policy.mjs 源码（不进包）+ wb_*.sh（进包）
 ├── test/
 │   ├── smoke.ts          # 核心客户端端到端测试（需真实 Hub）
 │   ├── plugin-sim.ts     # 插件入口测试（模拟 Cordis 运行时）
+│   ├── update-sim.ts     # 更新通道端到端测试（本地假分发源 + 真实调用 CLI）
 │   └── mocks/            # @deepseek-ai/* 的 mock + 解析钩子
 └── README.md
 ```
@@ -152,7 +156,8 @@ Stripping types is currently unsupported for files under node_modules
     - id: lan-hub
       name: dsh-plugin-lan-hub
       config:
-        host: '127.0.0.1'      # Hub 地址
+        # ---------- connection（冷：变更会重建连接）----------
+        host: '127.0.0.1'      # Hub 地址（填 auto 启用局域网自动发现）
         port: 8080             # Hub TCP 端口
         agentId: 'dsh-agent'   # 本 Agent 唯一 ID（其它 Agent 靠它寻址）
         agentName: 'HarnessAgent'
@@ -160,10 +165,32 @@ Stripping types is currently unsupported for files under node_modules
         reconnect: true        # 断线指数退避重连
         requestTimeoutMs: 3000 # list / create_room 的回执超时
         inboxLimit: 200        # 收件箱上限，超出丢弃最旧
-        autoInject: false      # 收到消息时自动注入 Agent 上下文
+        # ---------- policy（热：原地生效，不重连）----------
+        autoRespond: true      # 收到他人消息自动唤醒 Agent 生成回复
+        autoInject: false      # 只注入上下文、不唤醒
+        wakeRoom: 'mention'    # 房间唤醒：mention（需 @我）| all | off
+        batchMs: 800           # 收信合并窗口：窗口内多条合并成一次唤醒
+        maxWaitMs: 3000        # 合并窗口硬上限，持续来消息也不会无限推迟
+        maxAutoTurns: 6        # 同一对话连续自动往返上限（0=不限）
+        maxHop: 3              # 允许的最大转发层数（0=不限）
+        perPeerPerMin: 8       # 每对端每分钟唤醒上限
+        globalPerMin: 30       # 全局每分钟唤醒上限
+        muteNotice: true       # 被护栏静音时注入一条可见提示
+        # ---------- policy file（热更新通道）----------
+        policyFile: ''         # 非空即轮询该 JSON；脚本写它即可热改策略
+        policyPollMs: 1500     # 轮询间隔（毫秒）
 ```
 
-配置由 Schemastery schema 校验并填默认值，无效配置在加载期就报错。
+**配置分两层，语义完全不同**（这也是热更新只对 policy 生效的原因）：
+
+| 层 | 字段 | 变更后 |
+|---|---|---|
+| connection | `host/port/agentId/agentName/heartbeatMs/reconnect/requestTimeoutMs/inboxLimit/autoDiscover/discoverPort/fallbackHost` | 插件重启 + 重连（会重新注册，进程内收件箱清空） |
+| policy | `autoRespond/autoInject/wakeRoom/batchMs/maxWaitMs/maxAutoTurns/maxHop/perPeerPerMin/globalPerMin/muteNotice` | 原地生效，**不断连、不重启** |
+| 热更新通道 | `policyFile/policyPollMs` | 只重启轮询器，不重连 |
+
+配置由 Schemastery schema 校验并填默认值，无效配置在加载期就报错；
+热更新走 Cordis 的 `internal/update` waterfall——**先校验再切换**，坏配置进不来。
 
 ### 手机必须改的配置
 
@@ -185,7 +212,16 @@ profile 层在后，按同 `id` 改它的 config）：
     reconnect: true
     requestTimeoutMs: 3000
     inboxLimit: 200
+    autoRespond: true
     autoInject: false
+    wakeRoom: 'mention'
+    batchMs: 800
+    maxWaitMs: 3000
+    maxAutoTurns: 6
+    maxHop: 3
+    perPeerPerMin: 8
+    globalPerMin: 30
+    muteNotice: true
 ```
 
 两点提醒：
@@ -204,6 +240,177 @@ profile 层在后，按同 `id` 改它的 config）：
    Hub 是否监听 `0.0.0.0` 而非仅 `127.0.0.1`。
 3. 电脑 `ipconfig` 确认 IP 没变（换 WiFi 后常见）。
 
+## 热更新策略：脚本写文件，插件轮询
+
+宿主的配置重载并非所有环境都会触发（已装包里没有 yml watcher），proot 容器里的
+inotify 对 bind mount 也常不可靠。所以热更新走**脚本 + JSON 文件**这条最短路径，
+不依赖宿主行为：
+
+```sh
+# 仓库内开发：跑源码
+node tools/lanhub-policy.mjs set autoRespond=false
+
+# 装成包之后：走 bin 入口（等价，无需关心路径）
+npx lanhub-policy set autoRespond=false
+
+# 房间消息全部唤醒 + 放宽往返上限
+node tools/lanhub-policy.mjs set wakeRoom=all maxAutoTurns=10
+
+# 查看哪些字段被文件覆盖 / 校验 / 列出可用字段 / 清空
+node tools/lanhub-policy.mjs get
+node tools/lanhub-policy.mjs validate
+node tools/lanhub-policy.mjs keys
+node tools/lanhub-policy.mjs reset
+```
+
+DSHA 容器里用封装脚本（默认文件 `/root/.dsh/lan-hub.policy.json`）：
+
+```sh
+sh tools/wb_policy.sh set autoRespond=false
+```
+
+机制：脚本**原子写**（先写同目录 tmp 再 rename，插件不会读到半截 JSON）→
+插件每 `policyPollMs` **异步** `stat` 一次 mtime → 变化则经 `normalizePolicy` 原地换策略。
+文件不存在或 JSON 非法时**保留上一份策略**，不影响连接。
+
+两个实现细节值得说明：
+
+- 轮询用 `fs.promises` 而非 `statSync`——它跑在 Agent 的事件循环上，同步 IO 会直接
+  卡住消息收发（网络盘 / proot / 机械盘上尤其明显）；同时有 in-flight 守卫，
+  慢盘上不会堆积并发检查。
+- mtime 戳**只在解析成功后提交**。读失败不推进戳，下一轮自动重试，不会出现
+  "内容变了但被当成已读"的静默丢失。
+- `set`/`unset` 遇到损坏文件会**重建**而不是拒绝（修文件的工具不该被坏文件锁死），
+  `get`/`validate` 则照实报错，不掩盖问题。
+
+生效优先级：`Schema 默认 < cordis.patch.yml < 策略文件 < hub_config 运行时`。
+`hub_stats` 会打印每个字段的来源（`config` / `file` / `runtime`），
+"改了到底生效没有"是可查的，不用猜。
+
+白名单、默认值、钳制规则都写在 `src/policy.mjs`，**插件与脚本共用同一份**，
+不会出现"脚本允许写、插件不认"的漂移。
+
+> 脚本无法直接改运行中进程的内存——这是进程隔离决定的。所以"脚本化热更新"
+> = 脚本写文件 + 插件轮询，而不是脚本直接注入。
+
+## 体积与运行时开销
+
+优化前后的实测数据（0.4.0 → 0.5.0）：
+
+| 指标 | 之前 | 现在 | 说明 |
+|---|---|---|---|
+| 安装包 `.tgz` | 48.6 KB | **29.3 KB**（-40%） | |
+| 解包后 | 146.6 KB | **72.5 KB**（-51%） | |
+| 包内文件数 | 23 | 20 | |
+| `dist/index.js` | 42.3 KB | **25.4 KB** | esbuild `minify` + `keepNames` |
+| 策略 CLI | 8.2 KB 源码 + 3.9 KB 依赖 | **6.7 KB 单文件** | 打包后不再需要 `src/` |
+
+省下来的是**运行时完全用不到的东西**：
+
+- `src/*.ts`（34.7 + 19.9 = 54.6 KB）——DSH 加载的是 `dist`，源码进包纯属浪费；
+  `policy.mjs` 因为被 CLI 依赖，过去也只能把整个 `src/` 塞进包。CLI 打成单文件后
+  `src/` 可以整个不进包。
+- `tools/` 只发 `wb_*.sh`（14 个小脚本），CLI 源码不发——包里不再有两份同一份逻辑。
+
+关于启动性能，有个必须说清的事实：**CLI 冷启动 97 ms，其中 `node -e "0"` 基线就有
+93 ms**，脚本自身逻辑只占约 4 ms。所以"优化脚本加载速度"的上限就是 4 ms，不值得为它
+改结构。真正该优化的是**插件侧别阻塞事件循环**，以及**少调几次 CLI**（一次 `set` 可以
+写多个字段）。
+
+热路径上也清掉了两处会随消息量放大的写法：
+
+- 投递确认从 `indexOf` + `splice` 逐条移除（O(n²)）改成一次 `Set` 过滤（O(n)）；
+- 限速窗口从"每次 filter 重建数组"改成原地裁剪过期前缀，并且**无论限速是否开启都裁剪**
+  （否则关闭限速时全局时间戳数组会无限增长）。
+
+## 更新通道
+
+**客户端已实现完整能力，服务端只预留接口**（契约先固定，实现后置）。
+
+三个命令对应三种风险，这是刻意的拆分：
+
+| 阶段 | 命令 | 副作用 | 退出码 |
+|---|---|---|---|
+| 检查 | `lanhub-update check` | 只读，零副作用 | 0 已最新 / 10 有更新 / 11 不兼容 |
+| 暂存 | `lanhub-update fetch [ver]` | 只写缓存，**不动安装目录** | 0 / 1 |
+| 安装 | `lanhub-update apply [ver] --yes` | 执行安装命令 | 0 / 12 缺 `--yes` / 1 |
+| 回滚 | `lanhub-update rollback [--to ver] --yes` | 装回更旧的缓存版本 | 0 / 1 |
+| 查看 | `lanhub-update list` / `verify` | 只读 | 0 / 1 |
+
+```sh
+# 仓库内
+node tools/lanhub-update.mjs check
+# 装成包之后
+npx lanhub-update check && npx lanhub-update fetch --json
+# DSHA 容器内
+sh tools/wb_update.sh check
+```
+
+### 为什么不让插件自己更新
+
+1. **代码不是数据。** policy 能热替换是因为它只是内存里的一个对象；代码更新要重新
+   `import`，ESM 模块缓存 + 插件持有 TCP 长连接，做不到原地换。
+2. **它反正省不掉重启。** 装完仍需宿主重启才加载新代码，所以"自动更新"只是把危险
+   动作挪到你不在场的时候。
+3. **权限倒挂。** LAN 无认证，让长跑进程用自身权限替换自己的可执行文件，等于把投毒面
+   从"人手工装包"扩大到"任何能连上 Hub 的设备"。
+
+因此 `apply` 必须显式 `--yes`，且装完会提示需要重启。`hub_stats` 会打印插件版本号，
+升级后用它能立刻确认加载的是不是新字节。
+
+### 服务端预留的接口
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/updates` | 更新清单。**没有清单文件时也返回 200 + `latest:""`**——"没有更新"是合法状态，不能用 404 表达 |
+| `GET /api/updates/pkg/<file>` | 制品下载，只接受纯文件名（反斜杠、`..`、非 `.tgz` 一律拒绝） |
+
+数据目录由 `LANHUB_UPDATE_DIR` 指定（默认 `./updates`），结构：
+
+```
+updates/lanhub-update.json
+updates/pkg/dsh-plugin-lan-hub-0.6.0.tgz
+```
+
+清单格式：
+
+```json
+{
+  "name": "dsh-plugin-lan-hub",
+  "latest": "0.6.0",
+  "proto": 3,
+  "artifacts": {
+    "0.6.0": {
+      "url": "/api/updates/pkg/dsh-plugin-lan-hub-0.6.0.tgz",
+      "sha256": "<小写十六进制>",
+      "size": 31000,
+      "proto": 3,
+      "notes": "一句话变更说明"
+    }
+  }
+}
+```
+
+两条契约纪律：
+
+- 清单损坏、或 `latest` 在 `artifacts` 里找不到时返回 **500**，绝不装作"没有更新"——
+  静默降级会让人以为已经是最新版，实际是分发坏了。
+- 这两个端点**不纳入** httpgateway 的 `routeCount`/`routes`（直接挂在共享 mux 上），
+  否则要为一个"预留"去改 `/api/plugins` 的 v2 事实契约基线。
+  待更新通道正式立项时再拆成独立 `updates` 插件并显式登记。
+
+### 兼容性闸门
+
+清单的 `proto` 是目标版本要求的线协议版本，客户端拿响应头 `X-Proto-Version`（Hub 实际
+支持的版本）比对：**`proto > hubProto` 直接拒绝**（exit 11）。没有这道闸，最糟的失败模式
+是"装完发现连不上"，而那时你已经在改日志了。
+
+### 安全边界（必须说清）
+
+`sha256` 只防**传输损坏**，不防**投毒**——清单和制品同源，能改一个就能改另一个。
+真要防需要发布方签名 + 客户端 pin 公钥，对 LAN 自用属过度设计。所以真正的防线是
+`--yes` 那道人工确认，而不是校验和。
+
 ## 注册的工具
 
 加载后模型可调用：
@@ -218,18 +425,69 @@ profile 层在后，按同 `id` 改它的 config）：
 | `hub_leave_room` | `room` | 离房 |
 | `hub_list_agents` | — | 在线列表 |
 | `hub_read_messages` | — | 拉取并清空收件箱 |
+| `hub_config` | `autoRespond?`, `wakeRoom?`, `muteForSec?`, `room?`, `unmute?`, `reset?` | 在线改策略（立即生效，不重连） |
+| `hub_stats` | — | 当前生效策略 + 计数（诊断「为什么不回」） |
 
-## 两个 DSH 特有的设计点
+## 收信流水线（设计要点）
 
-**1）推送 vs 请求响应**
-Hub 是推送式的，工具是请求/响应式的。所以收到的消息先进 `inbox`，
-由 `hub_read_messages` 拉取并清空——与 MCP 版 `read_messages` 一致。
+```
+socket → inbox（唯一真源）→ pump（去抖/合并/分级）→ 投递策略（按 status）→ Agent
+                                   ↓                        ↓
+                             护栏（轮次/速率/hop）      计数与可见提示
+```
 
-**2）autoInject（MCP 形态做不到）**
-开启后，收到消息时会通过 `exec.agent.inject()` 把消息追加到 Agent 上下文。
-注意它**不是唤醒机制**（文档明确：空闲的 Agent 不会因此被唤醒），
-所以主动拉取仍由 `hub_read_messages` 承担。
-该调用做了运行时可选降级——不同 dsh 版本的 agent 句柄形状可能不同，取不到就静默跳过。
+**1）单一消费点**
+消息只从 `pending + client.readMessages()` 出去，唤醒泵与 `hub_read_messages`
+共用同一队列：谁先取谁消费，**天然不重复**（不再需要 `forwarded` 集合去事后过滤）。
+投递失败的消息留在 `pending`，下次 `hub_read_messages` 依然能拿到——不会静默丢失。
+
+**2）合并泵：一串消息只唤醒一次**
+`client.onMessage` 只负责"打窗口"，`batchMs` 静默窗口内的多条消息合并成**一条**
+跟随唤醒；`maxWaitMs` 是硬上限，防止持续来消息把唤醒无限推迟。
+同一对端/房间的消息会合并成一条（带 `n 条消息` 标记），避免 N 条消息 = N 个轮次。
+
+**3）按 `agent.status` 选原语（关键）**
+
+| status | 原语 | 效果 |
+|---|---|---|
+| `idle` | `followup(msg)` | 开一轮，回一条 |
+| `running` | `send(msg, 'next-step', false)` | 喂给当前轮的下一步，**不插队、不新开轮** |
+| 降级 | `inject(msg)` | 只喂上下文 |
+
+`followup` 的语义是"成为自己那一轮的唯一普通消息"——无脑用它会让每条消息都插一轮。
+Agent 正在干活时用 `next-step` 才不打断它。
+
+**4）分级唤醒**
+
+- `chat`（私聊）：唤醒；
+- `room`：默认 `mention`——只有 `@本agentId` / `@agentName` / 显式 `to` 才唤醒，
+  `all` 全唤醒，`off` 不唤醒；
+- `broadcast` / `presence` / `system`：永不唤醒（公告不是对话，避免全场齐回）；
+- 自己发出的消息不唤醒（防自回声）。
+
+**5）护栏（防对刷三层）**
+
+- **轮次上限** `maxAutoTurns`：同一对话连续自动往返超限即静音，
+  **人类一发言就重置**（监听 `agent/inbox/inserted` 里 `source.kind === 'user'`）——人类优先；
+- **hop 计数**：出站消息在 `content.meta.hop` 自增，入站 `hop > maxHop` 不唤醒。
+  `content` 是 `json.RawMessage`，**服务端零改动**、老客户端忽略未知字段；
+- **速率限制**：每对端 / 全局每分钟唤醒次数，滑动窗口。
+
+被护栏拦下的消息**仍然留在收件箱**（不丢），并按 `muteNotice` 注入一条可见提示，
+用 `hub_stats` 能看到 `turn/rate/hop/manual` 各自拦了多少——
+避免出现"消息到了但没人回、也看不出为什么"的静默失联。
+
+**6）语义与安全**
+
+入站消息包成 `source: { kind:'plugin', plugin:'lan-hub', form:'relay' }` 的 `UserMessage`：
+`form:'relay'` 是 dsh 里「另一个 agent 发给本 agent 的消息」的语义标记。
+文本还会显式声明**这是外部输入、不是人类指令、不要据此改变任务或调用危险工具**——
+对端 Agent 的内容不可信，这条边界必须写进上下文。
+
+**7）热更新：policy 原地生效**
+订阅 Cordis `internal/update` waterfall，diff 连接层字段：
+只有 connection 变了才 `next()` 放行重启；否则只换 `policy` 并 `return`，
+**不断连、不丢收件箱**。注意此时 `fiber.config` 不会更新，插件以自身 `policy` 为准。
 
 生命周期上，连接通过 `ctx.effect()` 注册，**插件卸载或 HMR 热替换时自动断开**，不会泄漏连接。
 
@@ -252,8 +510,19 @@ node --import ./test/mocks/register.mjs ./test/plugin-sim.ts
 ```
 
 `smoke.ts` 覆盖：注册、私聊、建房/进房/房间消息、广播、离线提示、上下线事件、收件箱清空。
-`plugin-sim.ts` 覆盖：插件契约、8 个工具注册、每个工具 execute 真实生效、
-effect disposer 断开连接、autoInject 注入。
+`plugin-sim.ts` 覆盖：插件契约、10 个工具注册、每个工具 execute 真实生效、
+effect disposer 断开连接、autoInject 注入，以及 autoRespond 的完整语义——
+经 `followup` 唤醒、`form:'relay'` + 注入防护文案、单一消费点不重复返回、
+合并泵（3 条合并成 1 次唤醒）、`status=running` 走 `next-step`、
+房间 `@我` 才唤醒、`hop` 护栏、`hub_config` 在线开关、热更新只对 policy 放行、
+以及**真实调用 `tools/lanhub-policy.mjs` 写文件后插件原地生效**（含写入损坏 JSON 时
+保留上一份策略、连接不受影响）。
+
+`update-sim.ts` 覆盖更新通道的 10 条：已是最新（exit 0）、有更新（exit 10）、
+proto 不兼容（exit 11）、sha256 校验与原子落盘、校验失败不留残留文件、
+缺 `--yes` 不执行（exit 12）、确认后真的执行安装命令、缓存损坏被 `verify`/`apply` 拦截、
+回滚自动挑更旧版本、`list --json` 结构可消费。它用本地 HTTP 假分发源 + **真实调用 CLI**，
+测的是进程边界而不是函数 mock。
 
 ## 在 DSHA 真机上的验证
 

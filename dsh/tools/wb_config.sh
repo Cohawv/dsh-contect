@@ -39,7 +39,18 @@ LOG=/sdcard/wbconfig.log
     reconnect: true
     requestTimeoutMs: 3000
     inboxLimit: 200
+    autoRespond: true
     autoInject: false
+    wakeRoom: 'mention'
+    batchMs: 800
+    maxWaitMs: 3000
+    maxAutoTurns: 6
+    maxHop: 3
+    perPeerPerMin: 8
+    globalPerMin: 30
+    muteNotice: true
+    policyFile: '/root/.dsh/lan-hub.policy.json'
+    policyPollMs: 1500
 PATCH_EOF
   echo "appended"
 

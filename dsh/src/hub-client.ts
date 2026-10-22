@@ -92,6 +92,11 @@ const DISCOVER_ATTEMPTS = 2
 /** 两次发现尝试之间的间隔 */
 const DISCOVER_RETRY_GAP_MS = 1200
 
+/** 把可选 meta 合并进 content；无 meta 时保持原结构，避免无谓字段 */
+function withMeta(content: Record<string, any>, meta?: Record<string, any>): Record<string, any> {
+  return meta && Object.keys(meta).length > 0 ? { ...content, meta } : content
+}
+
 export class HubClient {
   private readonly host: string
   private readonly port: number
@@ -313,16 +318,21 @@ export class HubClient {
 
   // ---------- 发送类（fire-and-forget，服务端保证 seq 有序） ----------
 
-  sendTo(to: string, text: string): void {
-    this.sendRaw({ type: 'chat', from: this.agentId, to, content: { text } })
+  /**
+   * `meta` 是随消息透传的可选元数据（如 `hop` 转发层数）。
+   * 服务端 content 是 RawMessage，原样转发；老客户端忽略未知字段，
+   * 因此新增 meta 无需协议升级（符合 envelope.go「只增不改」铁律）。
+   */
+  sendTo(to: string, text: string, meta?: Record<string, any>): void {
+    this.sendRaw({ type: 'chat', from: this.agentId, to, content: withMeta({ text }, meta) })
   }
 
-  sendRoom(roomId: string, text: string): void {
-    this.sendRaw({ type: 'room', from: this.agentId, roomId, content: { text } })
+  sendRoom(roomId: string, text: string, meta?: Record<string, any>): void {
+    this.sendRaw({ type: 'room', from: this.agentId, roomId, content: withMeta({ text }, meta) })
   }
 
-  broadcast(text: string): void {
-    this.sendRaw({ type: 'broadcast', from: this.agentId, content: { text } })
+  broadcast(text: string, meta?: Record<string, any>): void {
+    this.sendRaw({ type: 'broadcast', from: this.agentId, content: withMeta({ text }, meta) })
   }
 
   joinRoom(roomId: string): void {

@@ -2,10 +2,15 @@
 #
 # 注意：patch 的 config 是「整块替换」而非深合并，
 # 因此这里列出全部字段；只想改某一项时，其余项请保留默认值。
+#
+# 字段分两层：
+#   connection —— 变更会重建连接（重连 + 重新注册，进程内收件箱清空）
+#   policy     —— 变更原地生效，不断连、不重启
 - insert:
     - id: lan-hub
       name: dsh-plugin-lan-hub
       config:
+        # ---------- connection（冷）----------
         host: '127.0.0.1'
         port: 8080
         agentId: 'dsh-agent'
@@ -14,4 +19,17 @@
         reconnect: true
         requestTimeoutMs: 3000
         inboxLimit: 200
+        # ---------- policy（热）----------
+        autoRespond: true
         autoInject: false
+        wakeRoom: 'mention'
+        batchMs: 800
+        maxWaitMs: 3000
+        maxAutoTurns: 6
+        maxHop: 3
+        perPeerPerMin: 8
+        globalPerMin: 30
+        muteNotice: true
+        # ---------- policy file（热更新通道，见 tools/lanhub-policy.mjs）----------
+        policyFile: ''         # 非空即轮询该 JSON 文件；脚本写它即可热改策略
+        policyPollMs: 1500
