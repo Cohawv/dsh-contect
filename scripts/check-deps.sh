@@ -22,6 +22,9 @@ check internal/protocol 'lan-agent-hub/internal/(core|transport|adapter|discover
 check internal/core     'lan-agent-hub/internal/(transport|adapter|discovery)'     'core 不依赖传输/适配/发现层'
 check internal/transport 'lan-agent-hub/internal/(core|adapter|discovery)'        'transport 不依赖业务/适配/发现层'
 check internal/discovery 'lan-agent-hub/internal/(core|transport|adapter|protocol)' 'discovery 是叶子包'
+# V2 新增：插件化边界守卫
+check internal/core     'lan-agent-hub/internal/(plugin|plugins)' 'core 不依赖 plugin/plugins（插件不可反向污染内核）'
+check internal/plugin   'lan-agent-hub/internal/plugins'          'plugin（框架）不依赖 plugins（框架与具体插件解耦）'
 
 if [ "$fail" -ne 0 ]; then
   echo

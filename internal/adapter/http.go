@@ -18,11 +18,12 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// StartHTTP 启动 REST 网关，复用同一套 core 逻辑。
-// 注意：HTTP 是无连接的请求-响应式接入，没有 Session 概念，
-// 因此这里直接调用内核方法；离线提示等需要回执的能力仅在长连接形态下提供。
+// NewMux 构造 REST 网关的路由表（*http.ServeMux），注册全部 /api/* 端点与内置控制台。
+//
+// 抽离自 StartHTTP，便于契约测试用 httptest 直接挂载真实 handler 而不真正监听端口。
+// 端点路径、响应字段、回执文案与历史版本完全一致（本版本零行为变更）。
 // disco 可为 nil（关闭自动发现时），此时 /api/discover 返回 404。
-func StartHTTP(addr string, hub *core.Hub, disco *discovery.Service) error {
+func NewMux(hub *core.Hub, disco *discovery.Service) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/discover", func(w http.ResponseWriter, r *http.Request) {
@@ -154,5 +155,13 @@ func StartHTTP(addr string, hub *core.Hub, disco *discovery.Service) error {
 	// 挂载内置控制台（静态资源，由 web.go 通过 //go:embed 嵌入，零外部依赖）。
 	registerWeb(mux)
 
-	return http.ListenAndServe(addr, mux)
+	return mux
+}
+
+// StartHTTP 启动 REST 网关，复用同一套 core 逻辑。
+// 注意：HTTP 是无连接的请求-响应式接入，没有 Session 概念，
+// 因此这里直接调用内核方法；离线提示等需要回执的能力仅在长连接形态下提供。
+// disco 可为 nil（关闭自动发现时），此时 /api/discover 返回 404。
+func StartHTTP(addr string, hub *core.Hub, disco *discovery.Service) error {
+	return http.ListenAndServe(addr, NewMux(hub, disco))
 }

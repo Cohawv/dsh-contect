@@ -1,0 +1,11 @@
+# 统一以 LF 存储与检出，避免 Windows 上 CRLF 自动转换产生噪音 diff，
+# 保证「cmd/hub/main.go 零改动」等契约断言在不同平台都稳定可判定。
+* text=auto eol=lf
+
+# 二进制资源不纳入文本归一化
+*.exe binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.tgz binary

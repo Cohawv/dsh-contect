@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sort"
 	"sync"
 	"time"
 
@@ -58,21 +59,39 @@ func (r *Registry) Unbind(id string) {
 	delete(r.agents, id)
 }
 
+// Get 返回在线 Agent 的快照副本。
+// 值拷贝 + Caps 切片深拷贝一层，因此调用方持有/修改副本不会影响在线表。
+// 注意：Sess 字段保留在副本中——core 内部（notifyUndelivered、Router 的 DeliverTo/
+// BroadcastAll）仍依赖它来实际下发；对外暴露由 plugin.AgentInfo（不含 Sess）负责。
 func (r *Registry) Get(id string) (*Agent, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	a, ok := r.agents[id]
-	return a, ok
+	if !ok {
+		return nil, false
+	}
+	return copyAgent(a), true
 }
 
+// All 返回所有在线 Agent 的副本切片，按 ID 升序排列（稳定，便于断言与控制台展示）。
+// 每个副本同样深拷贝 Caps，避免调用方改动影响在线表。
 func (r *Registry) All() []*Agent {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]*Agent, 0, len(r.agents))
 	for _, a := range r.agents {
-		out = append(out, a)
+		out = append(out, copyAgent(a))
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// copyAgent 深拷贝一个 Agent（值拷贝 + Caps 切片一层深拷贝）。
+// Sess 接口值原样保留（接口内部引用不变），因此副本仍可 Deliver。
+func copyAgent(a *Agent) *Agent {
+	cp := *a
+	cp.Caps = append([]string(nil), a.Caps...)
+	return &cp
 }
 
 // Touch 刷新心跳时间。
