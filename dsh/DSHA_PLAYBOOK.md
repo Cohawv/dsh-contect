@@ -309,6 +309,8 @@ node -e "fetch('http://127.0.0.1:8081/api/agents').then(r=>r.text()).then(t=>con
 | 18 | 配了 `host: auto`，日志报 `discovery timeout`，最后靠 fallback 连上 | ① 发现超时默认 **2000ms**，本网段 254 个单播扫描来不及（每包还要 ARP）② `fallbackHost` 留空会退回 `127.0.0.1`，在手机上指向手机自己 | 超时提到 **5000ms**、扫描在 400ms 后启动；`fallbackHost` 显式填 Hub 局域网 IP。成功的标志是日志出现 `discovered hub at <ip>:<port> (auto)` |
 | 19 | 两台手机都连上 Hub，但只剩一台在线、另一台被反复顶掉 | 两台 `agentId` 相同（都叫 `phone-agent`），Hub 按 id 注册，后到的覆盖先到的 | **一机一个 agentId**（如 `phone-agent` / `huawei-agent`），`agentName` 同步区分 |
 | 20 | 偶尔启动时日志出现 `discovery failed: discovery timeout`，但同一个网络下重启一次又好了 | **启动早期**网卡/路由/省电策略的瞬时未就绪，单次发现超时；功能上靠 fallback 仍能连上，但看起来像报错 | 0.1.2 起自动**重试 2 次**（间隔 1.2s）再兜底；失败日志带诊断 `ifaces=N, sent=M, recv=K`：`ifaces=0` 即网卡还没就绪，属瞬时问题，**不必处理** |
+| 21 | 日志警告 `dsh: warning: 1 entry did not activate` + `dsh-mesh-fleet: TypeError: invalid mesh-fleet config: expected an object` | mesh-fleet 自带 patch 写的是 `config: ${{config}}`，用户 patch 里没有该条目 → 占位符替换成**字符串**；而 `resolveConfig` 只接受对象/`undefined`/`null` | 在 `cordis.patch.yml` 追加 `- id: dsh-mesh-fleet` / `name: dsh-mesh-fleet` / `config: {}`，重启后应出现 `插件加载完成：dsh-mesh-fleet`。**注意**：它导致 mesh-fleet 的 11 个工具不注册，但**不是**工作台卡死的原因 |
+| 22 | **整个 DSHA 界面点哪都没反应**，画面停在最后一帧（还能滚动、内容偶尔还会增加），发消息/切会话都无效 | dsh web 的**本地监听 `127.0.0.1:3080` 被一条挂死的请求堵死**，后续请求全部排队不返回；页面数据全走 3080，所以交互全死。同进程的 `*:3081`（局域网）完全正常，因此**不是进程崩了**。触发点：打开「工作台」页面必然复现（真机两台各复现 2 次） | **区分方法**：`ss -ltn` 看 3080/3081 都在监听 → 设备内 `nc 127.0.0.1 3081` 秒回 401、`nc 127.0.0.1 3080` 一个字节不回 = 就是本条。**恢复**：DSHA「停止 → 启动」（或强杀 App 重开）；重启后只要不点「进入工作台」，3080 长时间稳定 |
 
 ---
 
