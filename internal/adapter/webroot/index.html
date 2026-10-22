@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LAN Agent Hub · 控制台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2300f0ff' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Ccircle cx='4' cy='4' r='2'/%3E%3Ccircle cx='20' cy='4' r='2'/%3E%3Ccircle cx='4' cy='20' r='2'/%3E%3Ccircle cx='20' cy='20' r='2'/%3E%3Cpath d='M6 5.5 9.7 10M17.3 10 21 5.5M6 18.5 9.7 14M17.3 14 21 18.5'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- 侧边导航 -->
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand__mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="22" height="22">
+            <circle cx="12" cy="12" r="3"></circle>
+            <circle cx="4" cy="4" r="2"></circle>
+            <circle cx="20" cy="4" r="2"></circle>
+            <circle cx="4" cy="20" r="2"></circle>
+            <circle cx="20" cy="20" r="2"></circle>
+            <path d="M6 5.5 9.7 10M17.3 10 21 5.5M6 18.5 9.7 14M17.3 14 21 18.5"></path>
+          </svg>
+        </span>
+        <span class="brand__text">LAN Agent Hub</span>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <button class="nav__item is-active" data-view="overview" type="button">
+          <span class="nav__icon">▦</span><span class="nav__label">概览</span>
+        </button>
+        <button class="nav__item" data-view="agents" type="button">
+          <span class="nav__icon">☻</span><span class="nav__label">在线 Agent</span>
+        </button>
+        <button class="nav__item" data-view="rooms" type="button">
+          <span class="nav__icon">⌬</span><span class="nav__label">聊天室</span>
+        </button>
+        <button class="nav__item" data-view="messaging" type="button">
+          <span class="nav__icon">✉</span><span class="nav__label">发送消息</span>
+        </button>
+        <button class="nav__item" data-view="about" type="button">
+          <span class="nav__icon">⚙</span><span class="nav__label">服务信息</span>
+        </button>
+      </nav>
+      <div class="sidebar__foot">
+        <span class="muted">v<span id="foot-proto">—</span> · 零依赖控制台</span>
+      </div>
+    </aside>
+
+    <!-- 主区域 -->
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 class="page-title" id="page-title">概览</h1>
+          <p class="page-sub" id="page-sub">局域网多 Agent 通信中枢运行状态</p>
+        </div>
+        <div class="topbar__actions">
+          <span class="status-pill" id="conn-pill" data-state="loading">
+            <span class="status-pill__dot"></span>
+            <span class="status-pill__text">连接中…</span>
+          </span>
+          <label class="switch" title="自动刷新（每 5 秒）">
+            <input type="checkbox" id="auto-refresh" />
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="switch__label">自动刷新</span>
+          </label>
+          <button class="btn btn--ghost" id="refresh-btn" type="button">
+            <span class="btn__icon" aria-hidden="true">↻</span> 刷新
+          </button>
+        </div>
+      </header>
+
+      <!-- 概览 -->
+      <section class="view is-active" data-view="overview">
+        <div class="stat-grid" id="stat-grid">
+          <div class="stat-card skeleton"><div class="skeleton-line"></div></div>
+          <div class="stat-card skeleton"><div class="skeleton-line"></div></div>
+          <div class="stat-card skeleton"><div class="skeleton-line"></div></div>
+          <div class="stat-card skeleton"><div class="skeleton-line"></div></div>
+        </div>
+        <div class="card">
+          <div class="card__head">
+            <h2>快速操作</h2>
+          </div>
+          <div class="card__body quick-grid">
+            <button class="btn btn--primary" data-goto="agents" type="button">查看在线 Agent</button>
+            <button class="btn btn--primary" data-goto="rooms" type="button">管理聊天室</button>
+            <button class="btn btn--primary" data-goto="messaging" type="button">发送一条消息</button>
+            <button class="btn btn--ghost" data-goto="about" type="button">查看服务信息</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 在线 Agent -->
+      <section class="view" data-view="agents" hidden>
+        <div class="card">
+          <div class="card__head">
+            <h2>在线 Agent <span class="count-badge" id="agents-count">0</span></h2>
+            <div class="card__tools">
+              <input class="input input--search" id="agents-search" type="search" placeholder="筛选 ID / 名称…" aria-label="筛选 Agent" />
+            </div>
+          </div>
+          <div class="card__body">
+            <div class="table-wrap" id="agents-table-wrap">
+              <table class="table" id="agents-table">
+                <thead>
+                  <tr>
+                    <th>ID</th><th>名称</th><th>协议</th><th>能力 (caps)</th><th>最近活跃</th>
+                  </tr>
+                </thead>
+                <tbody id="agents-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 聊天室 -->
+      <section class="view" data-view="rooms" hidden>
+        <div class="card">
+          <div class="card__head"><h2>我的身份</h2></div>
+          <div class="card__body">
+            <form class="form--inline" novalidate>
+              <div class="field">
+                <label class="label" for="my-id">我的 Agent ID</label>
+                <input class="input" id="my-id" type="text" placeholder="用于加入 / 离开房间" />
+              </div>
+              <p class="hint">填写后，下方每个聊天室的「加入 / 离开」按钮即可使用，并自动记忆。</p>
+            </form>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card__head"><h2>创建聊天室</h2></div>
+          <div class="card__body">
+            <form class="form form--inline" id="create-room-form" novalidate>
+              <div class="field">
+                <label class="label" for="room-name">房间名称 *</label>
+                <input class="input" id="room-name" name="name" type="text" placeholder="例如：运维值班" required />
+              </div>
+              <div class="field field--grow">
+                <label class="label" for="room-members">初始成员（可选，逗号分隔 ID）</label>
+                <input class="input" id="room-members" name="members" type="text" placeholder="agentA, agentB" />
+              </div>
+              <div class="field field--action">
+                <button class="btn btn--primary" type="submit" id="create-room-btn">创建</button>
+              </div>
+            </form>
+          </div>
+        </div>
+        <div class="room-grid" id="room-grid">
+          <div class="skeleton skeleton-card"></div>
+        </div>
+      </section>
+
+      <!-- 发送消息 -->
+      <section class="view" data-view="messaging" hidden>
+        <div class="card">
+          <div class="card__head"><h2>点对点消息</h2></div>
+          <div class="card__body">
+            <form class="form" id="send-direct-form" novalidate>
+              <div class="form-row">
+                <div class="field">
+                  <label class="label" for="d-from">发送方 ID *</label>
+                  <input class="input" id="d-from" name="from" type="text" placeholder="本端 Agent ID" required />
+                </div>
+                <div class="field">
+                  <label class="label" for="d-to">接收方 ID *</label>
+                  <input class="input" id="d-to" name="to" type="text" placeholder="目标 Agent ID" required />
+                </div>
+              </div>
+              <div class="field">
+                <label class="label" for="d-text">消息内容 *</label>
+                <textarea class="input input--area" id="d-text" name="text" rows="3" placeholder="输入要发送的文本…" required></textarea>
+              </div>
+              <div class="form-actions">
+                <button class="btn btn--primary" type="submit" id="send-direct-btn">发送</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card__head"><h2>房间消息</h2></div>
+          <div class="card__body">
+            <form class="form" id="send-room-form" novalidate>
+              <div class="form-row">
+                <div class="field">
+                  <label class="label" for="r-from">发送方 ID *</label>
+                  <input class="input" id="r-from" name="from" type="text" placeholder="本端 Agent ID" required />
+                </div>
+                <div class="field">
+                  <label class="label" for="r-room">房间 ID *</label>
+                  <input class="input" id="r-room" name="roomId" type="text" placeholder="room-xxxxxxxx" required />
+                </div>
+              </div>
+              <div class="field">
+                <label class="label" for="r-text">消息内容 *</label>
+                <textarea class="input input--area" id="r-text" name="text" rows="3" placeholder="输入要发送的文本…" required></textarea>
+              </div>
+              <div class="form-actions">
+                <button class="btn btn--primary" type="submit" id="send-room-btn">发送到房间</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card__head"><h2>全员广播</h2></div>
+          <div class="card__body">
+            <form class="form" id="broadcast-form" novalidate>
+              <div class="form-row">
+                <div class="field">
+                  <label class="label" for="b-from">发送方 ID *</label>
+                  <input class="input" id="b-from" name="from" type="text" placeholder="本端 Agent ID" required />
+                </div>
+              </div>
+              <div class="field">
+                <label class="label" for="b-text">广播内容 *</label>
+                <textarea class="input input--area" id="b-text" name="text" rows="3" placeholder="向所有在线 Agent 广播…" required></textarea>
+              </div>
+              <div class="form-actions">
+                <button class="btn btn--primary" type="submit" id="broadcast-btn">广播</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- 服务信息 -->
+      <section class="view" data-view="about" hidden>
+        <div class="card">
+          <div class="card__head"><h2>服务状态</h2></div>
+          <div class="card__body">
+            <dl class="kv" id="about-kv">
+              <div class="skeleton skeleton-line"></div>
+            </dl>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card__head"><h2>接入端点</h2></div>
+          <div class="card__body">
+            <ul class="endpoint-list">
+              <li><code>TCP :8080</code><span class="muted">NDJSON 长连接（Agent 接入）</span></li>
+              <li><code>HTTP :8081</code><span class="muted">REST 网关 + 本控制台</span></li>
+              <li><code>UDP :8082</code><span class="muted">局域网自动发现（Beacon）</span></li>
+            </ul>
+            <p class="hint">可用 REST 接口：<code>/api/status</code> · <code>/api/agents</code> · <code>/api/rooms</code> · <code>/api/send</code> · <code>/api/room</code> · <code>/api/broadcast</code> · <code>/api/create_room</code> · <code>/api/join</code> · <code>/api/leave</code> · <code>/api/discover</code></p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 全局反馈 -->
+  <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

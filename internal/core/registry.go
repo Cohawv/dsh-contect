@@ -118,6 +118,9 @@ func (r *Registry) listAgents(detailed bool) []map[string]any {
 	for _, a := range r.agents {
 		item := map[string]any{"id": a.ID, "name": a.Name}
 		if detailed {
+			if a.LastSeen > 0 {
+				item["lastSeen"] = a.LastSeen
+			}
 			if len(a.Caps) > 0 {
 				item["caps"] = a.Caps
 			}

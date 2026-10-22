@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"lan-agent-hub/internal/core"
 	"lan-agent-hub/internal/discovery"
@@ -41,6 +42,32 @@ func StartHTTP(addr string, hub *core.Hub, disco *discovery.Service) error {
 		writeJSON(w, map[string]any{"agents": hub.ListAgentsDetailed()})
 	})
 
+	// 控制台状态总览：协议版本、暴露端口、在线/房间计数、发现服务开关。
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, map[string]any{
+			"proto":      protocol.ProtoCurrent,
+			"tcpPort":    hub.TCPPort,
+			"httpPort":   hub.HTTPPort,
+			"agentCount": len(hub.ListAgentsDetailed()),
+			"roomCount":  len(hub.Rooms.List()),
+			"discovery":  disco != nil,
+			"serverTime": time.Now().UnixMilli(),
+		})
+	})
+
+	// 房间列表（含成员），供控制台房间视图展示。
+	mux.HandleFunc("/api/rooms", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, map[string]any{"rooms": hub.Rooms.List()})
+	})
+
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		var p struct {
 			From string `json:"from"`
@@ -67,6 +94,20 @@ func StartHTTP(addr string, hub *core.Hub, disco *discovery.Service) error {
 			return
 		}
 		hub.Router.Route(protocol.NewEnvelope(protocol.TypeRoom, p.From, "", p.RoomID,
+			map[string]string{"text": p.Text}))
+		writeJSON(w, map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/api/broadcast", func(w http.ResponseWriter, r *http.Request) {
+		var p struct {
+			From string `json:"from"`
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.Text == "" {
+			http.Error(w, "need from/text", http.StatusBadRequest)
+			return
+		}
+		hub.Router.Route(protocol.NewEnvelope(protocol.TypeBroadcast, p.From, "", "",
 			map[string]string{"text": p.Text}))
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
@@ -109,6 +150,9 @@ func StartHTTP(addr string, hub *core.Hub, disco *discovery.Service) error {
 		hub.Rooms.Leave(p.RoomID, p.From)
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
+
+	// 挂载内置控制台（静态资源，由 web.go 通过 //go:embed 嵌入，零外部依赖）。
+	registerWeb(mux)
 
 	return http.ListenAndServe(addr, mux)
 }

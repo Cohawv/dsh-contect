@@ -52,6 +52,27 @@ func (s *RoomService) Leave(roomID, agentID string) {
 	}
 }
 
+// List 返回所有房间的快照（含成员），供 HTTP 网关 / 控制台展示用。
+// 与 Members 一样返回副本，避免调用方持有内部 map。
+func (s *RoomService) List() []map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]map[string]any, 0, len(s.rooms))
+	for _, r := range s.rooms {
+		members := make([]string, 0, len(r.Members))
+		for m := range r.Members {
+			members = append(members, m)
+		}
+		out = append(out, map[string]any{
+			"id":          r.ID,
+			"name":        r.Name,
+			"memberCount": len(members),
+			"members":     members,
+		})
+	}
+	return out
+}
+
 // Members 返回房间成员快照（副本，避免调用方持有内部 map）。
 func (s *RoomService) Members(roomID string) []string {
 	s.mu.RLock()
