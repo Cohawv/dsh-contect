@@ -50,6 +50,10 @@ func NewHub() *Hub {
 		}
 	})
 
+	// V5：把总线注入两个发布方，使 room.changed / msg.routed 有真实来源。
+	rooms.SetBus(bus)
+	router.SetBus(bus)
+
 	return &Hub{
 		Registry:    reg,
 		Rooms:       rooms,

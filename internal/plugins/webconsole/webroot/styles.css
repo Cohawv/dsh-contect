@@ -524,6 +524,114 @@ code {
   }
 }
 
+/* =====================================================================
+   V5 新增：连接药丸两态、指标卡与趋势、日志视图
+   —— 全部复用既有令牌（配色/间距/圆角），不引入任何外部样式或图表库。
+   ===================================================================== */
+
+/* 连接状态药丸：重连中（黄）/ 已降级轮询（灰蓝） */
+.status-pill[data-state="connecting"] {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 40%, transparent);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+}
+.status-pill[data-state="connecting"] .status-pill__dot {
+  background: var(--warning);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+.status-pill[data-state="polling"] {
+  color: var(--text-muted);
+  border-color: var(--border-strong);
+  background: var(--surface-3);
+}
+.status-pill[data-state="polling"] .status-pill__dot {
+  background: var(--text-muted);
+}
+
+/* 指标卡：比 stat-card 更紧凑，6 个并排 */
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+.metric-card {
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+.metric-card__label { color: var(--text-muted); font-size: var(--fs-xs); }
+.metric-card__value {
+  font-size: var(--fs-xl); font-weight: 700; margin: 2px 0;
+  font-variant-numeric: tabular-nums; color: var(--accent);
+}
+.metric-card__sub { font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); }
+
+/* 趋势图：原生 SVG（折线 + 面积 + 网格），由 app.js 直接生成 path */
+.trend { border-top: 1px dashed var(--border); padding-top: var(--sp-3); }
+.trend__head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--sp-3); margin-bottom: var(--sp-2);
+}
+.trend__title { font-size: var(--fs-sm); color: var(--text-muted); font-weight: 600; }
+.trend__legend { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); }
+.trend__dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.trend__svg { width: 100%; height: 120px; display: block; }
+.trend__grid line { stroke: var(--border); stroke-width: 1; stroke-dasharray: 4 6; }
+.trend__line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.trend__area { fill: var(--accent-soft); stroke: none; }
+.trend__dots circle { fill: var(--accent); }
+.trend__axis {
+  display: flex; justify-content: space-between;
+  font-size: var(--fs-xs); color: var(--text-faint);
+  font-family: var(--font-mono); margin-top: 2px;
+}
+
+/* 日志视图：等宽、可滚、行内级别徽标（error 红 / warn 黄 / info 灰） */
+.log-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+}
+.log-row {
+  display: grid;
+  grid-template-columns: 78px 62px 1fr;
+  gap: var(--sp-2);
+  align-items: baseline;
+  padding: 4px var(--sp-3);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  cursor: copy;
+  transition: background var(--t-fast);
+}
+.log-row:last-child { border-bottom: none; }
+.log-row:hover { background: var(--surface-3); }
+.log-row__time { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.log-row__msg { white-space: pre-wrap; word-break: break-word; color: var(--text); }
+.log-badge {
+  display: inline-block; text-align: center;
+  padding: 0 6px; border-radius: var(--r-sm);
+  font-size: var(--fs-xs); font-weight: 700; text-transform: uppercase;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: var(--surface-3);
+}
+.log-badge--error { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.log-badge--warn  { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); background: color-mix(in srgb, var(--warning) 12%, transparent); }
+.log-badge--info  { color: var(--text-muted); }
+.log-row--error .log-row__msg { color: color-mix(in srgb, var(--danger) 80%, var(--text)); }
+.log-row--warn .log-row__msg { color: color-mix(in srgb, var(--warning) 75%, var(--text)); }
+
+/* 窄屏下的下拉与日志行 */
+.select--sm { padding: 6px 10px; font-size: var(--fs-sm); }
+@media (max-width: 640px) {
+  .log-row { grid-template-columns: 66px 54px 1fr; }
+}
+
 /* ===================== 响应式 ===================== */
 @media (max-width: 960px) {
   .app { grid-template-columns: 1fr; }

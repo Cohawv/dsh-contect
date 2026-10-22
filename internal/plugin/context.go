@@ -68,6 +68,9 @@ type Context struct {
 	hub     any            // 业务内核实体（*core.Hub），框架侧为 any
 	owner   string         // 当前插件名（用于冲突报错点名）
 	gate    *gate          // 本插件的路由闸门（运行期停用后其端点立即 404）
+	// sink 是框架的事件发布出口（BuildContext 后只读）。
+	// 为 nil 时（单测直连）观测类事件静默丢弃，路由本身照常工作。
+	sink EventSink
 }
 
 // newContext 构造 Context；view/pub 为 nil 时退化为空实现；
@@ -118,7 +121,24 @@ func (c *Context) Owner() string { return c.owner }
 //
 // 注意：必须使用命名返回值 err，否则 defer 里的 recover 只能吞掉 panic 而无法回传错误，
 // 调用方会误以为注册成功（历史上正是这个写法导致 panic 被静默）。
+//
+// V5：注册成功的路由默认参与访问观测（发布 protocol.TopicHTTPRequest，供 metrics 计数）。
+// 探针类端点用 RegisterHTTPUnobserved 注册，避免高频探针把请求计数刷成噪声。
 func (c *Context) RegisterHTTP(pattern string, h http.HandlerFunc) (err error) {
+	return c.register(pattern, h, true)
+}
+
+// RegisterHTTPUnobserved 注册一条**不参与访问观测**的路由（探针 /healthz、/readyz 等）。
+//
+// 语义与 RegisterHTTP 完全一致（冲突预检、归属记账、启停闸门），
+// 唯一区别是请求进来时不发布 http.request 事件——
+// 让 /metrics 里的 hub_http_requests_total 反映真实业务流量，而不是监控自身的噪声。
+func (c *Context) RegisterHTTPUnobserved(pattern string, h http.HandlerFunc) (err error) {
+	return c.register(pattern, h, false)
+}
+
+// register 是 RegisterHTTP / RegisterHTTPUnobserved 的共同实现。
+func (c *Context) register(pattern string, h http.HandlerFunc, observed bool) (err error) {
 	if c.routes == nil || c.mux == nil {
 		return fmt.Errorf("plugin %q: context has no shared mux (BuildContext not called?)", c.owner)
 	}
@@ -144,13 +164,18 @@ func (c *Context) RegisterHTTP(pattern string, h http.HandlerFunc) (err error) {
 	}()
 
 	g := c.gate
-	handler := h
+	sink := c.sink
 	c.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 		if g != nil && !g.enabled() {
 			http.NotFound(w, r)
 			return
 		}
-		handler(w, r)
+		// 观测在 handler 之前发布：不包装 ResponseWriter，因此 SSE 的
+		// http.Flusher 断言与长连接行为完全不受影响。
+		if observed && sink != nil {
+			sink.Publish(protocol.TopicHTTPRequest, HTTPRequest{Path: pattern, Method: r.Method})
+		}
+		h(w, r)
 	})
 	// 注册成功后才记账：panic 时走不到这里，影子表不会留下幽灵路由。
 	c.routes.set(pattern, entry)

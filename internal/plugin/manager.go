@@ -114,11 +114,56 @@ type Manager struct {
 	// 超时的 Stop 协程仍在跑，若此时又 Init 同一个实例（进程级单例），
 	// 两边会并发操作同一份 listener/协程状态。唯一的解锁方式：显式 Reload。
 	blocked map[string]string // Name → 阻断原因
+
+	// sink 是事件发布出口（V5）：由 SetEventBus 在装配期注入，
+	// 用于发布 plugin.state（启停）与 http.request（访问计数）。
+	// 为 nil 时静默不发布，框架行为与 V4 完全一致。
+	sink EventSink
+
+	// logFan 是接管的 log 输出分发器（V5）：仅当存在实现 LogSink 的插件时才装上。
+	// 为 nil 表示未接管 log（行为与 V4 逐字节一致）。
+	logFan *logFanout
 }
 
 // NewManager 从全局注册表构建管理器（生产用法）。
 func NewManager() *Manager {
 	return newManagerFrom(All())
+}
+
+// NewManagerWith 以**显式插件列表**构建管理器（V5，供测试与定制部署）。
+//
+// 与 NewManager 的唯一差别是插件集合的来源：不读全局注册表。
+// 这让测试可以只装配「自己关心的那几个插件」，
+// 而不必为了一个端点把整个二进制的能力清单都拉起来。
+func NewManagerWith(plugins []Plugin) *Manager {
+	return newManagerFrom(plugins)
+}
+
+// SetEventBus 注入事件总线（V5）。传 nil 表示不发布任何框架事件。
+//
+// 参数类型是窄接口 EventSink 而非 *core.EventBus：框架绝不能 import internal/core，
+// 而 *core.EventBus 恰好满足 Publish(topic string, payload any)。
+// 应在 InitAll 之前调用（生产由 cmd/hub/main.go 完成）。
+func (m *Manager) SetEventBus(sink EventSink) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sink = sink
+}
+
+// eventSink 返回事件出口（未注入时为 nil）。
+func (m *Manager) eventSink() EventSink {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.sink
+}
+
+// publish 发布一条框架事件；未注入总线时静默（与 V4 行为一致）。
+//
+// 调用点必须保证**不在持有 m.mu 时**调用（订阅方可能回头读管理器快照）。
+func (m *Manager) publish(topic string, payload any) {
+	if sink := m.eventSink(); sink != nil {
+		sink.Publish(topic, payload)
+	}
 }
 
 // newManagerFrom 以显式插件列表构建管理器，供测试注入（避免依赖全局注册表状态）。
@@ -209,6 +254,8 @@ func (m *Manager) BuildContext(hub any) error {
 	// 把管理器自身放进共享 KV：plugininfo 通过 ManagerFromContext 取用。
 	// 框架仍然不知道 plugininfo 的存在（依赖方向保持 plugin ← plugins）。
 	m.shared.Store(sharedKeyManager, m)
+	// V5：有插件实现了 LogSink 就接管 log 输出（额外副本，原落盘行为不变）。
+	m.installLogFanout()
 	return nil
 }
 
@@ -386,6 +433,23 @@ func (m *Manager) setState(name string, st State, errMsg string) {
 
 	// 闸门与状态同步：装配完成（initialized）或运行中才放行路由。
 	g.set(stateGateOn(st))
+
+	// V5：发布 plugin.state（在解锁之后发布，订阅方可以自由回读管理器快照）。
+	// 状态机是插件生命周期的唯一事实来源，因此这里是**唯一**的发布点——
+	// 启停 / 重载 / 失败 / 回滚都会自动带上事件，不会漏。
+	ev := StateEventPayload{Name: name, State: st, Prev: from, Error: errMsg, At: now}
+	m.publish(TopicState, ev)
+	// 细分 topic 与聚合 topic 同时发布：TopicState 覆盖每一次迁移（控制台用），
+	// TopicStarted/Stopped/Failed 只表达"进入某态"（给需要精确语义的订阅者用）。
+	// 两者都不改变任何既有行为，只是新增事件源——死契约检查因此可以是空黑名单。
+	switch st {
+	case StateRunning:
+		m.publish(TopicStarted, ev)
+	case StateStopped:
+		m.publish(TopicStopped, ev)
+	case StateFailed:
+		m.publish(TopicFailed, ev)
+	}
 }
 
 // markEnabledAt 记录「启用时间」（Init 成功即刻）。
@@ -1108,8 +1172,11 @@ func (m *Manager) newContextFor(p Plugin) *Context {
 	name := p.Meta().Name
 	m.mu.RLock()
 	g := m.gates[name]
+	sink := m.sink
 	m.mu.RUnlock()
-	return newContext(m.view, m.pub, m.optionsFor(p), name, m.mux, m.routes, m.shared, m.hub, g)
+	c := newContext(m.view, m.pub, m.optionsFor(p), name, m.mux, m.routes, m.shared, m.hub, g)
+	c.sink = sink // 只读字段：BuildContext 后不再变，无需再加锁
+	return c
 }
 
 // markBlocked 记录「该插件在 Stop 超时后不得再被装配」（F5）。

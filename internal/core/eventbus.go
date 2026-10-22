@@ -131,10 +131,19 @@ func (b *EventBus) SubscriberCount(topic string) int {
 // Publish 派发事件。
 //   - 同步订阅者：就地执行（注册顺序），单个 panic 不影响其它订阅者；
 //   - 异步订阅者：非阻塞入队，队列满则丢弃并计数，绝不阻塞发布方。
+//
+// V5 热路径优化：无订阅者时直接返回（只做一次 map 查找，不分配拷贝切片）。
+// 这让「默认无人订阅的 msg.routed / http.request」在消息热路径上的额外开销
+// 降到一次 RLock + map 查询——这是 router 可以无条件发布的原因。
 func (b *EventBus) Publish(topic string, payload any) {
 	b.mu.RLock()
-	hs := make([]subEntry, len(b.subs[topic]))
-	copy(hs, b.subs[topic])
+	subs := b.subs[topic]
+	if len(subs) == 0 {
+		b.mu.RUnlock()
+		return
+	}
+	hs := make([]subEntry, len(subs))
+	copy(hs, subs)
 	b.mu.RUnlock()
 
 	for _, e := range hs {

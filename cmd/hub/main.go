@@ -40,6 +40,9 @@ func main() {
 
 	// 让 /api/manifest 的版本与 -version 输出一致。
 	plugininfo.SetHubVersion(version)
+	// V5：健康详情（/api/health/detail）报的 version 来自框架侧副本，
+	// 与上面是同一个字符串（两处都不允许自己去猜版本号）。
+	plugin.SetVersion(version)
 
 	if *showVersion {
 		fmt.Printf("lan-agent-hub %s\n", version)
@@ -85,6 +88,10 @@ func main() {
 	mgr := plugin.NewManager()
 	mgr.SetConfigPath(cfgPath, *configReadOnly)
 	mgr.ApplyConfig(enabled, options)
+	// V5：把事件总线交给框架。此后插件启停会发布 plugin.state、
+	// 每次 HTTP 请求会发布 http.request —— 实时推送与指标因此有数据源。
+	// 必须在 InitAll 之前注入，否则启动阶段的状态迁移不会产生事件。
+	mgr.SetEventBus(hub.Bus)
 
 	if err := mgr.BuildContext(hub); err != nil {
 		log.Fatalf("build context: %v", err)

@@ -76,7 +76,7 @@
     }, ttl);
   }
 
-  /* ---------------- 连接状态药丸 ---------------- */
+  /* ---------------- 连接状态药丸（三态：已连接 SSE / 重连中 / 已降级轮询） ---------------- */
   const connPill = $('#conn-pill');
   function setConn(state, text) {
     connPill.setAttribute('data-state', state);
@@ -90,6 +90,7 @@
     rooms:     ['聊天室', '创建、加入与管理聊天室'],
     messaging: ['发送消息', '向 Agent / 房间发送或广播消息'],
     plugins:   ['插件', '运行期查看与启停内置能力（必需插件与被依赖插件受保护）'],
+    logs:      ['日志', '服务端日志环形缓冲（实时增量 + 级别过滤 + 导出）'],
     settings:  ['设置', '由插件配置声明自动生成的表单，改完即存'],
     about:     ['服务信息', 'Hub 协议版本与接入端点'],
   };
@@ -115,12 +116,15 @@
     if (!keepHash && (location.hash || '').replace(/^#/, '') !== name) {
       location.hash = name; // 深链：刷新后仍停在当前视图
     }
-    if (name === 'overview') loadStatus(true);
+    if (name === 'overview') { loadStatus(true); loadMetrics(true); }
     if (name === 'agents') loadAgents();
     if (name === 'rooms') loadRooms();
     if (name === 'plugins') loadPlugins(true);
+    if (name === 'logs') loadLogs(true);
     if (name === 'settings') { loadPlugins(true); loadSettings(true); }
     if (name === 'about') renderAbout();
+    // 离开日志视图时断开日志流：不在看的连接不该占着服务端名额。
+    if (name !== 'logs') closeLogStream();
   }
 
   /* ---------------- 概览 + 状态 ---------------- */
@@ -133,7 +137,8 @@
       return;
     }
     lastStatus = r.data;
-    setConn('online', '已连接');
+    // 药丸优先表达「实时通道」的状态：SSE 已连上时不要被一次成功的 REST 调用覆盖成"已连接"。
+    if (realtime.state !== 'open') setConn('online', '已连接');
     $('#foot-proto').textContent = r.data.proto;
     renderStatCards(r.data);
     if ($('.view[data-view="about"]').classList.contains('is-active')) renderAbout();
@@ -227,6 +232,7 @@
 
   /* ---------------- 聊天室 ---------------- */
   let roomsLoaded = false;
+  let roomsCache = [];
   async function loadRooms() {
     const grid = $('#room-grid');
     if (!roomsLoaded) grid.innerHTML = '<div class="skeleton skeleton-card"></div>';
@@ -237,7 +243,8 @@
       return;
     }
     roomsLoaded = true;
-    renderRooms(r.data.rooms || []);
+    roomsCache = (r.data.rooms || []);
+    renderRooms(roomsCache);
   }
   function renderRooms(rooms) {
     const grid = $('#room-grid');
@@ -783,6 +790,444 @@
     toast('已导出当前配置副本', 'success');
   }
 
+  /* =====================================================================
+     V5 ① 实时通道（SSE）：顶栏三态药丸 + 增量更新 + 全量对账 + 自动降级
+     ---------------------------------------------------------------------
+     设计要点（对应 V5 验收 1/2/10）：
+     - 用浏览器原生 EventSource，零依赖；断线重连由浏览器负责；
+     - 重连成功（open）后**再拉一次全量快照**对账：增量 + 全量兜底，不追求强一致；
+     - 连续失败或环境不支持 EventSource → 自动降级为 5 秒轮询，并在药丸上明说；
+     - 增量只消费事件里的最小字段（如 agentId），明细字段靠一次防抖全量补齐，
+       避免"事件载荷随界面需求膨胀"。
+     ===================================================================== */
+  const SSE_TOPICS = [
+    'agent.online',   // Agent 上线（表格行即时插入）
+    'agent.offline',  // Agent 下线（表格行即时移除）
+    'room.changed',   // 房间变化（房间卡片刷新）
+    'plugin.state',   // 插件启停（插件/设置视图徽标更新）
+    'stats.tick',     // 在线数/房间数低频兜底（概览数字滚动）
+  ].join(',');
+
+  const realtime = {
+    es: null,
+    state: 'idle',      // idle | connecting | open | polling
+    failures: 0,
+    pollTimer: null,
+    degradedNotified: false,
+  };
+  const MAX_SSE_FAILURES = 3;
+
+  function startRealtime() {
+    if (typeof EventSource === 'undefined') {
+      degradeToPolling('当前浏览器不支持 EventSource');
+      return;
+    }
+    stopPolling();
+    realtime.state = 'connecting';
+    setConn('connecting', '重连中…');
+
+    let es;
+    try {
+      es = new EventSource('/api/stream?topics=' + encodeURIComponent(SSE_TOPICS));
+    } catch (e) {
+      degradeToPolling('无法创建 EventSource：' + (e.message || e));
+      return;
+    }
+    realtime.es = es;
+
+    es.addEventListener('open', () => {
+      realtime.failures = 0;
+      realtime.state = 'open';
+      setConn('online', '已连接（SSE）');
+      // 全量对账：断线期间可能漏事件，重连后拉一次快照把状态拉回真实值。
+      resyncAll();
+    });
+
+    es.addEventListener('error', () => {
+      if (realtime.state === 'open') {
+        // 已经连上后断开：浏览器会自动重连，先如实显示"重连中"。
+        realtime.state = 'connecting';
+        setConn('connecting', '重连中…');
+      }
+      realtime.failures++;
+      if (realtime.failures >= MAX_SSE_FAILURES || es.readyState === 2 /* CLOSED */) {
+        degradeToPolling('实时连接连续失败');
+      }
+    });
+
+    es.addEventListener('agent.online', (e) => applyAgentEvent(e, true));
+    es.addEventListener('agent.offline', (e) => applyAgentEvent(e, false));
+    es.addEventListener('room.changed', applyRoomEvent);
+    es.addEventListener('plugin.state', applyPluginStateEvent);
+    es.addEventListener('stats.tick', applyStatsTick);
+  }
+
+  // resyncAll 重连后对账：把所有列表拉一遍（不阻塞界面，失败静默）。
+  function resyncAll() {
+    loadStatus(true);
+    if (activeView === 'agents') loadAgents();
+    if (activeView === 'rooms') loadRooms();
+    if (activeView === 'plugins' || activeView === 'settings') loadPlugins(true);
+    if (activeView === 'overview') loadMetrics(true);
+  }
+
+  // degradeToPolling 降级为 5 秒轮询（并在药丸上说明原因，不静默降级）。
+  function degradeToPolling(reason) {
+    if (realtime.state === 'polling') return;
+    if (realtime.es) {
+      try { realtime.es.close(); } catch (_) { /* 忽略 */ }
+      realtime.es = null;
+    }
+    realtime.state = 'polling';
+    setConn('polling', '已降级轮询');
+    connPill.title = '实时连接不可用（' + reason + '），已切换为每 5 秒轮询';
+    if (!realtime.degradedNotified) {
+      realtime.degradedNotified = true;
+      toast('实时连接不可用（' + reason + '），已切换为 5 秒轮询', 'info');
+    }
+    startPolling();
+  }
+
+  function startPolling() {
+    stopPolling();
+    realtime.pollTimer = setInterval(() => {
+      loadStatus(true);
+      if (activeView === 'agents') loadAgents();
+      if (activeView === 'rooms') loadRooms();
+      if (activeView === 'plugins') loadPlugins(true);
+      if (activeView === 'overview') loadMetrics(true);
+    }, 5000);
+  }
+
+  function stopPolling() {
+    if (realtime.pollTimer) {
+      clearInterval(realtime.pollTimer);
+      realtime.pollTimer = null;
+    }
+  }
+
+  // ---- 增量应用（全部只改缓存 + 局部重渲染，不整页刷新） ----
+
+  // applyAgentEvent 处理 agent.online / agent.offline（载荷是 agentId 字符串）。
+  function applyAgentEvent(e, online) {
+    let id = null;
+    try { id = JSON.parse(e.data); } catch (_) { return; }
+    if (typeof id !== 'string' || !id) return;
+
+    if (online) {
+      if (!agentsCache.some((a) => a.id === id)) {
+        agentsCache.push({ id: id, name: '' });
+        if (activeView === 'agents') renderAgents();
+        // 事件只带 id：明细（name/caps/proto）靠一次防抖全量补齐。
+        scheduleAgentsResync();
+      }
+      if (lastStatus) {
+        lastStatus.agentCount = agentsCache.length;
+        renderStatCards(lastStatus);
+      }
+    } else {
+      const before = agentsCache.length;
+      agentsCache = agentsCache.filter((a) => a.id !== id);
+      if (agentsCache.length !== before && activeView === 'agents') renderAgents();
+      if (lastStatus) {
+        lastStatus.agentCount = agentsCache.length;
+        renderStatCards(lastStatus);
+      }
+    }
+  }
+
+  let agentsResyncTimer = null;
+  function scheduleAgentsResync() {
+    if (agentsResyncTimer) return;
+    agentsResyncTimer = setTimeout(() => {
+      agentsResyncTimer = null;
+      loadAgents();
+    }, 400);
+  }
+
+  // applyRoomEvent 处理 room.changed（载荷是完整房间快照，幂等）。
+  function applyRoomEvent(e) {
+    let p = null;
+    try { p = JSON.parse(e.data); } catch (_) { return; }
+    const room = p && p.room;
+    if (!room || !room.id) return;
+    const idx = roomsCache.findIndex((r) => r.id === room.id);
+    if (idx >= 0) roomsCache[idx] = room;
+    else roomsCache.push(room);
+    roomsLoaded = true;
+    if (activeView === 'rooms') renderRooms(roomsCache);
+    if (lastStatus) {
+      lastStatus.roomCount = roomsCache.length;
+      renderStatCards(lastStatus);
+    }
+  }
+
+  // applyPluginStateEvent 处理 plugin.state（插件徽标即时更新）。
+  function applyPluginStateEvent(e) {
+    let p = null;
+    try { p = JSON.parse(e.data); } catch (_) { return; }
+    if (!p || !p.name || !pluginsCache) return;
+    const list = pluginsCache.plugins || [];
+    const row = list.find((x) => x.name === p.name);
+    if (!row) {
+      // 未知插件（例如本视图负载是旧快照）：拉一次全量。
+      loadPlugins(true);
+      return;
+    }
+    row.state = p.state;
+    row.error = p.error || '';
+    row.stateChangedAt = p.at || row.stateChangedAt;
+    recomputePluginLists();
+    if (activeView === 'plugins') renderPlugins();
+    if (activeView === 'settings') renderSettings();
+  }
+
+  // recomputePluginLists 由插件数组重算 running/disabled/failed 三个派生列表。
+  function recomputePluginLists() {
+    if (!pluginsCache) return;
+    const running = [];
+    const disabled = [];
+    const failed = [];
+    (pluginsCache.plugins || []).forEach((p) => {
+      if (p.state === 'disabled' || p.state === 'stopped') disabled.push(p.name);
+      else {
+        running.push(p.name);
+        if (p.state === 'failed') failed.push(p.name);
+      }
+    });
+    pluginsCache.running = running;
+    pluginsCache.disabled = disabled;
+    pluginsCache.failed = failed;
+  }
+
+  // applyStatsTick 处理 stats.tick（在线数/房间数的低频兜底）。
+  function applyStatsTick(e) {
+    let p = null;
+    try { p = JSON.parse(e.data); } catch (_) { return; }
+    if (!p || !lastStatus) return;
+    if (typeof p.agentCount === 'number') lastStatus.agentCount = p.agentCount;
+    if (typeof p.roomCount === 'number') lastStatus.roomCount = p.roomCount;
+    renderStatCards(lastStatus);
+  }
+
+  /* =====================================================================
+     V5 ③ 概览指标卡与趋势（原生 SVG + CSS，零图表库）
+     ===================================================================== */
+  async function loadMetrics(silent) {
+    const r = await api('GET', '/api/metrics/summary');
+    if (!r.ok) {
+      if (!silent) toast('指标加载失败：' + r.error, 'error');
+      return;
+    }
+    renderMetrics(r.data);
+  }
+
+  function fmtDuration(ms) {
+    if (!ms || ms < 0) return '—';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + ' 秒';
+    if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+    return Math.floor(s / 3600) + ' 时 ' + Math.floor((s % 3600) / 60) + ' 分';
+  }
+
+  function renderMetrics(m) {
+    const grid = $('#metrics-cards');
+    if (!grid || !m) return;
+
+    const cards = [
+      { label: '在线 Agent', value: m.agentsOnline, sub: 'hub_agents_online' },
+      { label: '房间数', value: m.rooms, sub: 'hub_rooms' },
+      { label: '累计消息', value: m.messagesTotal, sub: 'hub_messages_total' },
+      { label: '消息速率', value: (m.messagesPerSecond || 0).toFixed(2), sub: '条 / 秒（最近窗口）' },
+      { label: 'SSE 连接', value: m.sseClients, sub: 'hub_sse_clients' },
+      { label: '运行时长', value: fmtDuration(m.uptimeMs), sub: 'metrics 插件' },
+    ];
+    grid.innerHTML = cards.map((c) =>
+      '<div class="metric-card">' +
+        '<div class="metric-card__label">' + esc(c.label) + '</div>' +
+        '<div class="metric-card__value">' + esc(c.value) + '</div>' +
+        '<div class="metric-card__sub">' + esc(c.sub) + '</div>' +
+      '</div>'
+    ).join('');
+
+    const updated = $('#metrics-updated');
+    if (updated) updated.textContent = '采样间隔 ' + Math.round((m.intervalMs || 0) / 1000) + ' 秒';
+
+    renderTrend(m.samples || []);
+  }
+
+  // renderTrend 用原生 SVG 画一条折线 + 面积（不引图表库）。
+  function renderTrend(samples) {
+    const svg = $('#trend-svg');
+    const axis = $('#trend-axis');
+    if (!svg) return;
+    if (!samples.length) {
+      svg.innerHTML = '';
+      if (axis) axis.innerHTML = '<span>暂无采样点</span>';
+      return;
+    }
+
+    const W = 600, H = 120, PAD = 6;
+    const values = samples.map((s) => (s.agentsOnline || 0));
+    const maxV = Math.max(1, Math.max.apply(null, values));
+    const step = values.length > 1 ? (W - PAD * 2) / (values.length - 1) : 0;
+
+    const pts = values.map((v, i) => {
+      const x = PAD + i * step;
+      const y = H - PAD - (v / maxV) * (H - PAD * 2);
+      return [x, y];
+    });
+    const line = pts.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
+    const area = pts.length
+      ? 'M' + pts[0][0].toFixed(1) + ',' + (H - PAD) + ' L' + line.split(' ').join(' L') +
+        ' L' + pts[pts.length - 1][0].toFixed(1) + ',' + (H - PAD) + ' Z'
+      : '';
+
+    const dots = pts.map((p) =>
+      '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="2.5" />').join('');
+    const grid = [0, 0.5, 1].map((f) =>
+      '<line x1="0" x2="' + W + '" y1="' + (PAD + f * (H - PAD * 2)).toFixed(1) +
+      '" y2="' + (PAD + f * (H - PAD * 2)).toFixed(1) + '" />').join('');
+
+    svg.innerHTML =
+      '<g class="trend__grid">' + grid + '</g>' +
+      (area ? '<path class="trend__area" d="' + area + '" />' : '') +
+      '<polyline class="trend__line" points="' + line + '" />' +
+      '<g class="trend__dots">' + dots + '</g>';
+
+    if (axis) {
+      const first = samples[0] || {};
+      const last = samples[samples.length - 1] || {};
+      axis.innerHTML =
+        '<span>' + esc(fmtClock(first.ts)) + '</span>' +
+        '<span>峰值 ' + esc(maxV) + '</span>' +
+        '<span>' + esc(fmtClock(last.ts)) + '</span>';
+    }
+  }
+
+  function fmtClock(ms) {
+    if (!ms) return '—';
+    const d = new Date(ms);
+    return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) +
+      ':' + ('0' + d.getSeconds()).slice(-2);
+  }
+
+  /* =====================================================================
+     V5 ① 日志视图（/api/logs 全量 + /api/logs/stream 增量）
+     ===================================================================== */
+  const logState = {
+    entries: [],
+    seen: {},
+    paused: false,
+    level: '',
+    es: null,
+    limit: 200,
+    maxRows: 1000,
+  };
+
+  const levelLabel = { error: 'error', warn: 'warn', info: 'info' };
+
+  async function loadLogs(openStream) {
+    const list = $('#log-list');
+    const r = await api('GET', '/api/logs?limit=' + logState.limit +
+      (logState.level ? '&level=' + encodeURIComponent(logState.level) : ''));
+    if (!r.ok) {
+      if (list) {
+        list.innerHTML = '<div class="error-banner">日志加载失败：' + esc(r.error) +
+          '（logview 插件可能未启用）</div>';
+      }
+      return;
+    }
+    logState.entries = [];
+    logState.seen = {};
+    (r.data.entries || []).forEach(addLogEntry);
+    renderLogs();
+    if (openStream !== false) openLogStream();
+  }
+
+  function openLogStream() {
+    if (typeof EventSource === 'undefined') return;
+    if (logState.es) {
+      try { logState.es.close(); } catch (_) { /* 忽略 */ }
+      logState.es = null;
+    }
+    const url = '/api/logs/stream' + (logState.level ? '?level=' + encodeURIComponent(logState.level) : '');
+    let es;
+    try { es = new EventSource(url); } catch (_) { return; }
+    logState.es = es;
+    es.addEventListener('log', (e) => {
+      let entry = null;
+      try { entry = JSON.parse(e.data); } catch (_) { return; }
+      if (!entry) return;
+      addLogEntry(entry);
+      renderLogs();
+    });
+  }
+
+  function closeLogStream() {
+    if (logState.es) {
+      try { logState.es.close(); } catch (_) { /* 忽略 */ }
+      logState.es = null;
+    }
+  }
+
+  function addLogEntry(entry) {
+    if (!entry || entry.seq == null) return;
+    if (logState.seen[entry.seq]) return; // 补发与实时可能有重叠：按 seq 去重
+    logState.seen[entry.seq] = true;
+    logState.entries.push(entry);
+    if (logState.entries.length > logState.maxRows) {
+      const dropped = logState.entries.splice(0, logState.entries.length - logState.maxRows);
+      dropped.forEach((d) => { delete logState.seen[d.seq]; });
+    }
+  }
+
+  function renderLogs() {
+    const list = $('#log-list');
+    if (!list) return;
+    const count = $('#logs-count');
+    if (count) count.textContent = logState.entries.length;
+
+    if (!logState.entries.length) {
+      list.innerHTML = '<div class="empty-state">' +
+        '<div class="empty-state__icon">≡</div>' +
+        '<div class="empty-state__title">缓冲里还没有日志</div>' +
+        '<div class="empty-state__text">日志会在服务端产生时实时推送过来。</div></div>';
+      return;
+    }
+
+    const rows = logState.entries.map((e) => {
+      const lv = levelLabel[e.level] || 'info';
+      return '<div class="log-row log-row--' + esc(lv) + '" data-log="' + esc(e.seq) + '" title="点击复制">' +
+        '<span class="log-row__time">' + esc(fmtClock(e.ts)) + '</span>' +
+        '<span class="log-badge log-badge--' + esc(lv) + '">' + esc(lv) + '</span>' +
+        '<span class="log-row__msg">' + esc(e.msg) + '</span>' +
+      '</div>';
+    }).join('');
+    list.innerHTML = rows;
+
+    if (!logState.paused) list.scrollTop = list.scrollHeight;
+  }
+
+  function exportLogs() {
+    if (!logState.entries.length) {
+      toast('当前没有可导出的日志', 'info');
+      return;
+    }
+    const text = logState.entries.map((e) =>
+      '[' + new Date(e.ts).toLocaleString('zh-CN') + '] ' + (e.level || 'info') + ' ' + e.msg
+    ).join('\n');
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'lan-agent-hub-logs.txt';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+    toast('已导出 ' + logState.entries.length + ' 行日志', 'success');
+  }
+
   /* ---------------- 初始化事件 ---------------- */
   function init() {
     // 导航 + 深链
@@ -802,7 +1247,9 @@
       if (activeView === 'agents') loadAgents();
       if (activeView === 'rooms') loadRooms();
       if (activeView === 'plugins') loadPlugins(false);
+      if (activeView === 'logs') loadLogs(true);
       if (activeView === 'settings') loadSettings(false);
+      if (activeView === 'overview') loadMetrics(true);
     });
     let refreshTimer = null;
     $('#auto-refresh').addEventListener('change', (e) => {
@@ -812,12 +1259,50 @@
           if (activeView === 'agents') loadAgents();
           if (activeView === 'rooms') loadRooms();
           if (activeView === 'plugins') loadPlugins(true);
+          if (activeView === 'overview') loadMetrics(true);
         }, 5000);
         toast('已开启自动刷新（5 秒）', 'info');
       } else if (refreshTimer) {
         clearInterval(refreshTimer); refreshTimer = null;
       }
     });
+
+    // 日志视图：级别过滤 / 暂停滚动 / 导出 / 清空 / 点击复制
+    const levelSel = $('#logs-level');
+    if (levelSel) {
+      levelSel.addEventListener('change', () => {
+        logState.level = levelSel.value;
+        loadLogs(true); // 级别变化需要重取缓冲（服务端按级别过滤）+ 重开流
+      });
+    }
+    const pauseBox = $('#logs-pause');
+    if (pauseBox) {
+      pauseBox.addEventListener('change', () => {
+        logState.paused = pauseBox.checked;
+        if (!logState.paused) renderLogs();
+      });
+    }
+    const exportBtn = $('#logs-export');
+    if (exportBtn) exportBtn.addEventListener('click', exportLogs);
+    const clearBtn = $('#logs-clear');
+    if (clearBtn) {
+      clearBtn.addEventListener('click', () => {
+        logState.entries = [];
+        logState.seen = {};
+        renderLogs();
+        toast('已清空视图（服务端缓冲不受影响）', 'info');
+      });
+    }
+    const logList = $('#log-list');
+    if (logList) {
+      logList.addEventListener('click', (e) => {
+        const row = e.target.closest('.log-row');
+        if (!row) return;
+        const msg = row.querySelector('.log-row__msg');
+        const text = msg ? msg.textContent : row.textContent;
+        copyText(text);
+      });
+    }
 
     // 插件视图：开关 / 全部重载
     $('#plugins-tbody').addEventListener('change', (e) => {
@@ -909,17 +1394,29 @@
       const t = e.target.closest('.copyable');
       if (!t) return;
       const text = t.getAttribute('data-copy') || t.textContent.trim();
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(text).then(() => toast('已复制：' + text, 'info'))
-          .catch(() => toast('复制失败', 'error'));
-      }
+      copyText(text);
     });
 
     // 首次加载：恢复 hash 指向的视图（刷新后保持位置）
     loadAgents();
     setView(viewFromHash(), true);
     loadStatus(false);
+    loadMetrics(true);
     startPluginsPolling();
+    // 实时通道：连上就用推送，连不上自动降级轮询（药丸三态可见）。
+    startRealtime();
+  }
+
+  // copyText 统一复制入口（剪贴板不可用时明确提示，而不是静默失败）。
+  function copyText(text) {
+    if (!text) return;
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text)
+        .then(() => toast('已复制：' + String(text).slice(0, 60), 'info'))
+        .catch(() => toast('复制失败（浏览器拒绝剪贴板访问）', 'error'));
+      return;
+    }
+    toast('当前浏览器不支持剪贴板 API', 'error');
   }
 
   if (document.readyState === 'loading') {
