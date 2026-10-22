@@ -5,6 +5,7 @@ import Schema from "@deepseek-ai/schemastery";
 // src/hub-client.ts
 import net from "node:net";
 import dgram from "node:dgram";
+import os from "node:os";
 var DEFAULT_HEARTBEAT_MS = 15e3;
 var DEFAULT_REQUEST_TIMEOUT_MS = 3e3;
 var DEFAULT_INBOX_LIMIT = 200;
@@ -136,34 +137,43 @@ var HubClient = class {
   discover() {
     return new Promise((resolve, reject) => {
       const sock = dgram.createSocket("udp4");
-      const timeout = setTimeout(() => {
+      let done = false;
+      let scanTimer = null;
+      const finish = (err, val) => {
+        if (done) return;
+        done = true;
+        if (scanTimer) clearTimeout(scanTimer);
         try {
           sock.close();
         } catch {
         }
-        reject(new Error("discovery timeout"));
-      }, DEFAULT_DISCOVER_TIMEOUT_MS);
+        if (err) reject(err);
+        else resolve(val);
+      };
+      const timeout = setTimeout(() => finish(new Error("discovery timeout")), DEFAULT_DISCOVER_TIMEOUT_MS);
+      const subs = [];
+      const ifs = os.networkInterfaces();
+      for (const name2 of Object.keys(ifs)) {
+        for (const it of ifs[name2] || []) {
+          if (!it || it.family !== "IPv4" || it.internal) continue;
+          const ip = it.address.split(".").map(Number);
+          if (ip.length !== 4 || ip.some((n) => !Number.isFinite(n))) continue;
+          subs.push({ self: it.address, prefix: ip[0] + "." + ip[1] + "." + ip[2] });
+        }
+      }
       sock.on("message", (msg, rinfo) => {
         try {
           const b = JSON.parse(msg.toString("utf8"));
           if (b && b.type === "_lanhub_beacon" && typeof b.tcpPort === "number") {
             clearTimeout(timeout);
-            try {
-              sock.close();
-            } catch {
-            }
-            resolve({ host: rinfo.address, port: b.tcpPort });
+            finish(null, { host: rinfo.address, port: b.tcpPort });
           }
         } catch {
         }
       });
       sock.on("error", (e) => {
         clearTimeout(timeout);
-        try {
-          sock.close();
-        } catch {
-        }
-        reject(e);
+        finish(e);
       });
       sock.bind(() => {
         try {
@@ -171,16 +181,25 @@ var HubClient = class {
         } catch {
         }
         const q = Buffer.from(JSON.stringify({ type: "_lanhub_query" }));
-        sock.send(q, 0, q.length, this.discoverPort, "255.255.255.255", (err) => {
-          if (err) {
-            clearTimeout(timeout);
-            try {
-              sock.close();
-            } catch {
-            }
-            reject(err);
+        const sendTo = (ip) => {
+          try {
+            sock.send(q, 0, q.length, this.discoverPort, ip, () => {
+            });
+          } catch {
           }
-        });
+        };
+        sendTo("255.255.255.255");
+        for (const x of subs) sendTo(x.prefix + ".255");
+        scanTimer = setTimeout(() => {
+          if (done) return;
+          for (const x of subs) {
+            for (let i = 1; i <= 254; i++) {
+              const ip = x.prefix + "." + i;
+              if (ip === x.self) continue;
+              sendTo(ip);
+            }
+          }
+        }, Math.min(800, Math.max(300, Math.floor(DEFAULT_DISCOVER_TIMEOUT_MS / 3))));
       });
     });
   }

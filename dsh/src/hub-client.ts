@@ -13,6 +13,7 @@
 
 import net from 'node:net'
 import dgram from 'node:dgram'
+import os from 'node:os'
 
 /** 统一的消息信封，与服务端 protocol.go 的 Envelope 一一对应 */
 export interface Envelope {
@@ -223,38 +224,62 @@ export class HubClient {
   private discover(): Promise<DiscoveredHub> {
     return new Promise((resolve, reject) => {
       const sock = dgram.createSocket('udp4')
-      const timeout = setTimeout(() => {
+      let done = false
+      let scanTimer: ReturnType<typeof setTimeout> | null = null
+      const finish = (err: Error | null, val?: DiscoveredHub) => {
+        if (done) return
+        done = true
+        if (scanTimer) clearTimeout(scanTimer)
         try { sock.close() } catch { /* ignore */ }
-        reject(new Error('discovery timeout'))
-      }, DEFAULT_DISCOVER_TIMEOUT_MS)
+        if (err) reject(err)
+        else resolve(val as DiscoveredHub)
+      }
+      const timeout = setTimeout(() => finish(new Error('discovery timeout')), DEFAULT_DISCOVER_TIMEOUT_MS)
+
+      // 取本机所有非内部 IPv4 网卡的 /24 前缀，用于定向广播与兜底扫描
+      const subs: Array<{ self: string; prefix: string }> = []
+      const ifs = os.networkInterfaces()
+      for (const name of Object.keys(ifs)) {
+        for (const it of (ifs[name] || [])) {
+          if (!it || it.family !== 'IPv4' || it.internal) continue
+          const ip = it.address.split('.').map(Number)
+          if (ip.length !== 4 || ip.some((n) => !Number.isFinite(n))) continue
+          subs.push({ self: it.address, prefix: ip[0] + '.' + ip[1] + '.' + ip[2] })
+        }
+      }
 
       sock.on('message', (msg, rinfo) => {
         try {
           const b = JSON.parse(msg.toString('utf8'))
           if (b && b.type === '_lanhub_beacon' && typeof b.tcpPort === 'number') {
             clearTimeout(timeout)
-            try { sock.close() } catch { /* ignore */ }
-            resolve({ host: rinfo.address, port: b.tcpPort })
+            finish(null, { host: rinfo.address, port: b.tcpPort })
           }
         } catch {
           /* 非法帧忽略，继续等 */
         }
       })
-      sock.on('error', (e) => {
-        clearTimeout(timeout)
-        try { sock.close() } catch { /* ignore */ }
-        reject(e)
-      })
+      sock.on('error', (e) => { clearTimeout(timeout); finish(e) })
       sock.bind(() => {
         try { sock.setBroadcast(true) } catch { /* ignore */ }
         const q = Buffer.from(JSON.stringify({ type: '_lanhub_query' }))
-        sock.send(q, 0, q.length, this.discoverPort, '255.255.255.255', (err) => {
-          if (err) {
-            clearTimeout(timeout)
-            try { sock.close() } catch { /* ignore */ }
-            reject(err)
+        const sendTo = (ip: string) => {
+          try { sock.send(q, 0, q.length, this.discoverPort, ip, () => {}) } catch { /* ignore */ }
+        }
+        // 阶段1：全网广播 + 各网卡定向广播（AP 允许广播时最快命中）
+        sendTo('255.255.255.255')
+        for (const x of subs) sendTo(x.prefix + '.255')
+        // 阶段2：广播被 AP 过滤时，本网段 /24 单播扫描兜底，确保 host=auto 在真机可用
+        scanTimer = setTimeout(() => {
+          if (done) return
+          for (const x of subs) {
+            for (let i = 1; i <= 254; i++) {
+              const ip = x.prefix + '.' + i
+              if (ip === x.self) continue
+              sendTo(ip)
+            }
           }
-        })
+        }, Math.min(800, Math.max(300, Math.floor(DEFAULT_DISCOVER_TIMEOUT_MS / 3))))
       })
     })
   }

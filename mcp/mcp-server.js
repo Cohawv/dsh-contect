@@ -15,37 +15,69 @@ const net = require('net');
 const http = require('http');
 const crypto = require('crypto');
 const dgram = require('dgram');
+const os = require('os');
+
+// 取本机所有非内部 IPv4 网卡的 /24 前缀，用于定向广播与兜底扫描
+function localIPv4Subnets() {
+  const out = [];
+  const ifs = os.networkInterfaces();
+  for (const name of Object.keys(ifs)) {
+    for (const it of (ifs[name] || [])) {
+      if (!it || it.family !== 'IPv4' || it.internal) continue;
+      const ip = it.address.split('.').map(Number);
+      if (ip.length !== 4 || ip.some((n) => !Number.isFinite(n))) continue;
+      out.push({ self: it.address, prefix: ip[0] + '.' + ip[1] + '.' + ip[2] });
+    }
+  }
+  return out;
+}
 
 // 局域网自动发现：向广播地址发 query，服务端单播回 beacon（含 Hub IP 与端口）
+// 真机实测：部分 Wi-Fi/AP 会过滤 255.255.255.255 与子网定向广播，
+// 故增加「本网段 /24 单播扫描」兜底，确保无广播环境下的 host=auto 也能发现 Hub。
 const DISCOVER_PORT = parseInt(process.env.HUB_DISCOVER_PORT || '8082', 10);
 function discoverHub(timeoutMs, port) {
   return new Promise((resolve, reject) => {
     const s = dgram.createSocket('udp4');
-    const t = setTimeout(() => {
+    let done = false;
+    let scanTimer = null;
+    const finish = (err, val) => {
+      if (done) return;
+      done = true;
+      if (scanTimer) clearTimeout(scanTimer);
       try { s.close(); } catch (e) { /* ignore */ }
-      reject(new Error('discovery timeout'));
-    }, timeoutMs);
+      if (err) reject(err); else resolve(val);
+    };
+    const t = setTimeout(() => finish(new Error('discovery timeout')), timeoutMs);
     s.on('message', (msg, rinfo) => {
       try {
         const b = JSON.parse(msg.toString());
         if (b && b.type === '_lanhub_beacon' && typeof b.tcpPort === 'number') {
           clearTimeout(t);
-          try { s.close(); } catch (e) { /* ignore */ }
-          resolve({ host: rinfo.address, port: b.tcpPort });
+          finish(null, { host: rinfo.address, port: b.tcpPort });
         }
       } catch (e) { /* 非法帧忽略 */ }
     });
-    s.on('error', (e) => {
-      clearTimeout(t);
-      try { s.close(); } catch (_) { /* ignore */ }
-      reject(e);
-    });
+    s.on('error', (e) => { clearTimeout(t); finish(e); });
     s.bind(() => {
       try { s.setBroadcast(true); } catch (e) { /* ignore */ }
       const q = Buffer.from(JSON.stringify({ type: '_lanhub_query' }));
-      s.send(q, 0, q.length, port, '255.255.255.255', (err) => {
-        if (err) { clearTimeout(t); try { s.close(); } catch (_) { /* ignore */ } reject(err); }
-      });
+      const subs = localIPv4Subnets();
+      const sendTo = (ip) => { try { s.send(q, 0, q.length, port, ip, () => {}); } catch (e) { /* ignore */ } };
+      // 阶段1：全网广播 + 各网卡定向广播
+      sendTo('255.255.255.255');
+      for (const x of subs) sendTo(x.prefix + '.255');
+      // 阶段2：广播被 AP 过滤时，本网段 /24 单播扫描兜底
+      scanTimer = setTimeout(() => {
+        if (done) return;
+        for (const x of subs) {
+          for (let i = 1; i <= 254; i++) {
+            const ip = x.prefix + '.' + i;
+            if (ip === x.self) continue;
+            sendTo(ip);
+          }
+        }
+      }, Math.min(800, Math.max(300, Math.floor(timeoutMs / 3))));
     });
   });
 }
