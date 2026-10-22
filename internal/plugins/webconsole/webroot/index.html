@@ -37,8 +37,14 @@
         <button class="nav__item" data-view="messaging" type="button">
           <span class="nav__icon">✉</span><span class="nav__label">发送消息</span>
         </button>
+        <button class="nav__item" data-view="plugins" type="button">
+          <span class="nav__icon">▤</span><span class="nav__label">插件</span>
+        </button>
+        <button class="nav__item" data-view="settings" type="button">
+          <span class="nav__icon">⚙</span><span class="nav__label">设置</span>
+        </button>
         <button class="nav__item" data-view="about" type="button">
-          <span class="nav__icon">⚙</span><span class="nav__label">服务信息</span>
+          <span class="nav__icon">ℹ</span><span class="nav__label">服务信息</span>
         </button>
       </nav>
       <div class="sidebar__foot">
@@ -225,6 +231,65 @@
         </div>
       </section>
 
+      <!-- 插件管理 -->
+      <section class="view" data-view="plugins" hidden>
+        <div class="card">
+          <div class="card__head">
+            <h2>插件 <span class="count-badge" id="plugins-count">0</span></h2>
+            <div class="card__tools">
+              <span class="muted" id="plugins-summary">—</span>
+              <button class="btn btn--ghost" id="plugins-reload" type="button">
+                <span class="btn__icon" aria-hidden="true">↻</span> 全部重载
+              </button>
+            </div>
+          </div>
+          <div class="card__body">
+            <div id="plugins-alert"></div>
+            <div class="table-wrap">
+              <table class="table table--plugins" id="plugins-table">
+                <thead>
+                  <tr>
+                    <th>启用</th><th>名称</th><th>版本</th><th>状态</th>
+                    <th>用途</th><th>依赖</th><th>路由</th><th>启停</th>
+                  </tr>
+                </thead>
+                <tbody id="plugins-tbody">
+                  <tr class="skeleton"><td colspan="8"><div class="skeleton-line"></div></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="hint">
+              插件快照每 10 秒自动刷新。停用某插件后它的端点会立即返回 404（可随时再启用，无需重启进程）。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 插件设置（表单由 /api/settings 的 schema 自动生成） -->
+      <section class="view" data-view="settings" hidden>
+        <div class="card">
+          <div class="card__head">
+            <h2>插件设置</h2>
+            <div class="card__tools">
+              <button class="btn btn--ghost" id="settings-export" type="button">导出当前配置</button>
+              <button class="btn btn--ghost" id="settings-reload" type="button">重新载入</button>
+              <button class="btn btn--primary" id="settings-save" type="button">保存设置</button>
+            </div>
+          </div>
+          <div class="card__body">
+            <p class="hint">
+              配置文件：<code id="settings-path">—</code> · 版本 <span id="settings-version">—</span>
+              · 表单由各插件的配置声明自动生成，无需为插件写前端代码。
+            </p>
+            <div id="settings-stale"></div>
+            <div id="settings-alert"></div>
+            <div id="settings-form" class="settings">
+              <div class="skeleton skeleton-card"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- 服务信息 -->
       <section class="view" data-view="about" hidden>
         <div class="card">
@@ -243,7 +308,8 @@
               <li><code>HTTP :8081</code><span class="muted">REST 网关 + 本控制台</span></li>
               <li><code>UDP :8082</code><span class="muted">局域网自动发现（Beacon）</span></li>
             </ul>
-            <p class="hint">可用 REST 接口：<code>/api/status</code> · <code>/api/agents</code> · <code>/api/rooms</code> · <code>/api/send</code> · <code>/api/room</code> · <code>/api/broadcast</code> · <code>/api/create_room</code> · <code>/api/join</code> · <code>/api/leave</code> · <code>/api/discover</code></p>
+            <p class="hint">可用 REST 接口：<code>/api/status</code> · <code>/api/agents</code> · <code>/api/rooms</code> · <code>/api/send</code> · <code>/api/room</code> · <code>/api/broadcast</code> · <code>/api/create_room</code> · <code>/api/join</code> · <code>/api/leave</code> · <code>/api/discover</code> · <code>/api/plugins</code> · <code>/api/settings</code> · <code>/api/manifest</code></p>
+            <p class="hint">插件信息请用 <code>/api/status?features=plugins</code> 显式索取（默认响应保持 7 个字段不变，老客户端零感知）。</p>
           </div>
         </div>
       </section>

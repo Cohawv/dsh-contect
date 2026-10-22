@@ -14,14 +14,15 @@ import (
 
 	"lan-agent-hub/internal/core"
 	"lan-agent-hub/internal/plugin"
+	"lan-agent-hub/internal/plugins/plugininfo"
 
-	_ "lan-agent-hub/cmd/hub/plugins" // 功能总清单：blank import 6 个内置插件
+	_ "lan-agent-hub/cmd/hub/plugins" // 功能总清单：blank import 内置插件（含 plugininfo）
 )
 
 // version 由构建时通过 -ldflags "-X main.version=..." 注入；默认值用于本地开发。
 var version = "dev"
 
-// main 只做装配：解析 flag → 建 hub → 注册/构建插件 → 启动 → 等信号 → 优雅停机。
+// main 只做装配：解析 flag → 加载配置 → 建 hub → 注册/构建插件 → 启动 → 等信号 → 优雅停机。
 func main() {
 	initLogging()
 	addr := flag.String("addr", ":8080", "hub TCP listen address, e.g. :8080 or 0.0.0.0:8080")
@@ -33,7 +34,12 @@ func main() {
 	openBrowserFlag := flag.Bool("open", true, "auto-open the web dashboard in the default browser on start")
 	white := flag.String("plugin", "", "comma-separated plugin whitelist; empty = all enabled")
 	black := flag.String("disable-plugin", "", "comma-separated plugin blacklist")
+	configFlag := flag.String("config", "", "path to hub.json (default: next to the executable, else in the working directory)")
+	configReadOnly := flag.Bool("config-readonly", false, "read-only mode: never write hub.json or its changelog")
 	flag.Parse()
+
+	// 让 /api/manifest 的版本与 -version 输出一致。
+	plugininfo.SetHubVersion(version)
 
 	if *showVersion {
 		fmt.Printf("lan-agent-hub %s\n", version)
@@ -45,17 +51,39 @@ func main() {
 		return
 	}
 
+	// ① 配置文件：读取（缺失则视为全默认），非只读模式且首次运行时生成模板。
+	cfgPath := resolveConfigPath(*configFlag)
+	store := plugin.NewStore(cfgPath)
+	fileCfg, existed, err := store.LoadOrTemplate()
+	if err != nil {
+		log.Fatalf("加载配置 %q 失败: %v", cfgPath, err)
+	}
+	if !existed {
+		if *configReadOnly {
+			log.Printf("配置文件 %q 不存在（只读模式，不生成）", cfgPath)
+		} else if err := store.SaveWithVersion(fileCfg, 0); err != nil {
+			log.Printf("生成默认配置 %q 失败（继续使用内存默认值）: %v", cfgPath, err)
+		} else {
+			log.Printf("已生成默认配置模板: %s", cfgPath)
+		}
+	}
+	log.Printf("配置文件: %s (readOnly=%t)", cfgPath, *configReadOnly)
+
 	hub := core.NewHub()
 	hub.TCPPort, hub.HTTPPort = portOf(*addr), portOf(*httpAddr)
 
-	mgr := plugin.NewManager()
-	enabled := applyToggles(*white, *black)
-	options := map[string]map[string]any{
+	// ② 合并配置：CLI 显式参数 > hub.json > Meta.DefaultOn/选项默认值。
+	enabled, options := configToMaps(fileCfg)
+	applyToggles(enabled, *white, *black)
+	mergeOptions(options, map[string]map[string]any{
 		"tcpgateway":  {"addr": *addr},
 		"httpgateway": {"httpAddr": *httpAddr},
 		"discovery":   {"bindAddr": *discoverAddr, "hubName": *hubName, "noDiscovery": *noDiscovery},
 		"autobrowser": {"open": *openBrowserFlag},
-	}
+	})
+
+	mgr := plugin.NewManager()
+	mgr.SetConfigPath(cfgPath, *configReadOnly)
 	mgr.ApplyConfig(enabled, options)
 
 	if err := mgr.BuildContext(hub); err != nil {
@@ -88,14 +116,76 @@ func main() {
 	log.Printf("停机摘要: %s", mgr.Summary())
 }
 
-// applyToggles 根据白/黑名单计算每个插件的启用状态（缺省走 Meta.DefaultOn）。
-func applyToggles(white, black string) map[string]bool {
-	enabled := map[string]bool{}
+// resolveConfigPath 决定 hub.json 的路径。
+//
+// 优先级：显式 -config > exe 同目录已存在的 hub.json > 工作目录已存在的 hub.json >
+// exe 同目录（不存在则在首次运行时按此路径生成模板）。
+func resolveConfigPath(explicit string) string {
+	if strings.TrimSpace(explicit) != "" {
+		return explicit
+	}
+	const name = "hub.json"
+	exe, err := os.Executable()
+	if err != nil {
+		return name
+	}
+	candidate := filepath.Join(filepath.Dir(exe), name)
+	if _, statErr := os.Stat(candidate); statErr == nil {
+		return candidate
+	}
+	if wd, wdErr := os.Getwd(); wdErr == nil {
+		inWd := filepath.Join(wd, name)
+		if _, statErr := os.Stat(inWd); statErr == nil {
+			return inWd
+		}
+	}
+	return candidate
+}
+
+// configToMaps 把文件配置展开成「每插件启用状态 + 配置项」两张表。
+// 未在文件中出现的插件走 Meta.DefaultOn 与空选项（再由 mergeOptions 补 CLI 值）。
+func configToMaps(cfg plugin.Config) (enabled map[string]bool, options map[string]map[string]any) {
+	enabled = make(map[string]bool, len(plugin.All()))
+	options = make(map[string]map[string]any, len(plugin.All()))
+	for _, p := range plugin.All() {
+		name := p.Meta().Name
+		enabled[name] = p.Meta().DefaultOn
+		options[name] = map[string]any{}
+	}
+	for name, pc := range cfg.Plugins {
+		if _, known := enabled[name]; !known {
+			continue // 文件里有、二进制里没有的插件（例如手工删掉 import）：忽略
+		}
+		enabled[name] = pc.Enabled
+		for k, v := range pc.Options {
+			options[name][k] = v
+		}
+	}
+	return enabled, options
+}
+
+// mergeOptions 把 CLI 提供的配置项合并进 options（CLI 优先），不引入新插件键。
+func mergeOptions(options, override map[string]map[string]any) {
+	for name, opts := range override {
+		if _, ok := options[name]; !ok {
+			options[name] = map[string]any{}
+		}
+		for k, v := range opts {
+			options[name][k] = v
+		}
+	}
+}
+
+// applyToggles 根据白/黑名单就地修改启用状态（缺省走配置文件/Meta.DefaultOn）。
+func applyToggles(enabled map[string]bool, white, black string) {
 	whiteSet := splitList(white)
 	blackSet := splitList(black)
 	for _, p := range plugin.All() {
 		name := p.Meta().Name
-		on := p.Meta().DefaultOn
+		on, ok := enabled[name]
+		if !ok {
+			on = p.Meta().DefaultOn
+		}
 		if len(whiteSet) > 0 {
 			on = whiteSet[name]
 		}
@@ -104,7 +194,6 @@ func applyToggles(white, black string) map[string]bool {
 		}
 		enabled[name] = on
 	}
-	return enabled
 }
 
 // splitList 把逗号分隔的列表解析为集合（忽略空白项）。

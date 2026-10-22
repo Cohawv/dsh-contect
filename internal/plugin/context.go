@@ -53,27 +53,27 @@ type HubStats struct {
 
 // Context 是插件在 Init/Start 期间能拿到的全部上下文。
 //
-// V3 扩展点（相对 V2）：
-//   - 持有共享 *http.ServeMux 与影子路由表，插件经 RegisterHTTP 注册端点，
-//     由框架统一做冲突预检（不依赖 ServeMux 的 panic 行为）；
-//   - 持有共享 KV（跨插件交接运行时对象，如 discovery 服务、dashboard URL）；
-//   - 持有内核实体（any 形式），内置插件在 internal/plugins/* 自行类型断言取 *core.Hub。
+// V3 扩展点：共享 *http.ServeMux + 影子路由表（冲突预检）+ 跨插件共享 KV + 内核实体。
+// V4 扩展点：路由闸门（gate），使运行期启停能立即改变端点可达性，而无需注销路由。
 //
 // 关键安全点：本包（框架）不得 import internal/core——Context 只以 any 持有 hub，
 // 真正取出 *core.Hub 的逻辑在插件侧，框架本身永远看不到该具体类型。
 type Context struct {
-	view        HubView
-	pub         Publisher
-	options     map[string]any    // 本插件的合并后配置项
-	mux         *http.ServeMux    // 共享 mux：所有 HTTP 插件注册到它
-	routes      *sync.Map         // 影子路由表 pattern → 拥有者插件名（冲突预检）
-	shared      *sync.Map         // 跨插件共享 KV：key(string) → any
-	hub         any               // 业务内核实体（*core.Hub），框架侧为 any
-	owner       string            // 当前插件名（用于冲突报错点名）
+	view    HubView
+	pub     Publisher
+	options map[string]any // 本插件的合并后配置项
+	mux     *http.ServeMux // 共享 mux：所有 HTTP 插件注册到它
+	routes  *routeTable    // 影子路由表 pattern → 归属插件（冲突预检 + 归属查询）
+	shared  *sync.Map      // 跨插件共享 KV：key(string) → any
+	hub     any            // 业务内核实体（*core.Hub），框架侧为 any
+	owner   string         // 当前插件名（用于冲突报错点名）
+	gate    *gate          // 本插件的路由闸门（运行期停用后其端点立即 404）
 }
 
-// newContext 构造 Context；view/pub 为 nil 时退化为空实现（V2 未接入真实内核时可用）。
-func newContext(view HubView, pub Publisher, options map[string]any, owner string, mux *http.ServeMux, routes, shared *sync.Map, hub any) *Context {
+// newContext 构造 Context；view/pub 为 nil 时退化为空实现；
+// routes/gate 为 nil 时按「无闸门、无路由表」降级（单测直连场景）。
+func newContext(view HubView, pub Publisher, options map[string]any, owner string,
+	mux *http.ServeMux, routes *routeTable, shared *sync.Map, hub any, g *gate) *Context {
 	if view == nil {
 		view = emptyView{}
 	}
@@ -83,7 +83,10 @@ func newContext(view HubView, pub Publisher, options map[string]any, owner strin
 	if options == nil {
 		options = map[string]any{}
 	}
-	return &Context{view: view, pub: pub, options: options, owner: owner, mux: mux, routes: routes, shared: shared, hub: hub}
+	return &Context{
+		view: view, pub: pub, options: options, owner: owner,
+		mux: mux, routes: routes, shared: shared, hub: hub, gate: g,
+	}
 }
 
 // View 返回只读内核视图。
@@ -99,26 +102,58 @@ func (c *Context) Hub() any { return c.hub }
 // ServeMux 返回插件共享的 *http.ServeMux（所有 HTTP 端点注册到此）。
 func (c *Context) ServeMux() *http.ServeMux { return c.mux }
 
-// RegisterHTTP 把 pattern 注册到共享 mux，并做冲突预检。
+// Owner 返回当前插件的名字（用于日志与错误点名）。
+func (c *Context) Owner() string { return c.owner }
+
+// RegisterHTTP 把 pattern 注册到共享 mux，并做冲突预检 + 挂上运行期启停闸门。
 //
-// 先用影子表（routes）查重：若 pattern 已被占用，返回 error 并**点名冲突双方插件名**，
-// 绝不依赖 *http.ServeMux 对重复 pattern 的 panic 行为；
-// 再用 recover 兜底 ServeMux 的其它（意外）panic，转为 Init 错误由 Manager 隔离。
-func (c *Context) RegisterHTTP(pattern string, h http.HandlerFunc) error {
+// 规则：
+//  1. 若 pattern 已被**别的**插件占用 → 返回 error 并点名冲突双方（不依赖 ServeMux 的 panic）；
+//  2. 若 pattern 已被**自己**占用（运行期停用后重新 Init）→ 仅刷新影子表记录，不重复注册
+//     （ServeMux 无法重复注册同一 pattern，否则 panic）；
+//  3. 新注册的 handler 会套一层闸门：插件被停用/失败时直接 404，放行时行为与原 handler 完全一致；
+//  4. ServeMux 仍可能因为**绕过影子表**的占位（例如别处直接调用 ctx.ServeMux().HandleFunc）
+//     而 panic：此时 recover 把错误写回命名返回值，并且**不**在影子表里记账，
+//     避免留下「Routes() 报告了一条 mux 上并不存在的路由」这种幽灵记录。
+//
+// 注意：必须使用命名返回值 err，否则 defer 里的 recover 只能吞掉 panic 而无法回传错误，
+// 调用方会误以为注册成功（历史上正是这个写法导致 panic 被静默）。
+func (c *Context) RegisterHTTP(pattern string, h http.HandlerFunc) (err error) {
 	if c.routes == nil || c.mux == nil {
 		return fmt.Errorf("plugin %q: context has no shared mux (BuildContext not called?)", c.owner)
 	}
-	if prev, dup := c.routes.Load(pattern); dup {
-		return fmt.Errorf("route %q already registered by plugin %q (conflicts with %q)", pattern, prev.(string), c.owner)
+	if h == nil {
+		return fmt.Errorf("plugin %q: nil handler for route %q", c.owner, pattern)
 	}
-	c.routes.Store(pattern, c.owner)
+	entry := &routeEntry{owner: c.owner, pattern: pattern, gate: c.gate}
+	if prev, dup := c.routes.get(pattern); dup {
+		if prev.owner != c.owner {
+			return fmt.Errorf("route %q already registered by plugin %q (conflicts with %q)", pattern, prev.owner, c.owner)
+		}
+		// 同插件重复注册：运行期「停用 → 启用」会重新走一遍 Init，
+		// ServeMux 不允许重复 Handle 同一 pattern，因此只刷新归属记录。
+		c.routes.set(pattern, entry)
+		return nil
+	}
+
+	// 兜底 ServeMux 的意外 panic，转为 Init 错误由 Manager 隔离。
 	defer func() {
 		if r := recover(); r != nil {
-			// ServeMux 意外的 panic（理论上不会，因为已用影子表挡住重复 pattern）：转为错误。
-			_ = r
+			err = fmt.Errorf("plugin %q: RegisterHTTP(%q) panicked: %v", c.owner, pattern, r)
 		}
 	}()
-	c.mux.HandleFunc(pattern, h)
+
+	g := c.gate
+	handler := h
+	c.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		if g != nil && !g.enabled() {
+			http.NotFound(w, r)
+			return
+		}
+		handler(w, r)
+	})
+	// 注册成功后才记账：panic 时走不到这里，影子表不会留下幽灵路由。
+	c.routes.set(pattern, entry)
 	return nil
 }
 
@@ -195,15 +230,15 @@ func (c *Context) Duration(key string, def time.Duration) time.Duration {
 	return def
 }
 
-// emptyView 是 HubView 的空实现（V2 未接入真实内核时返回空快照）。
+// emptyView 是 HubView 的空实现（未接入真实内核时返回空快照）。
 type emptyView struct{}
 
 func (emptyView) Agents() []AgentInfo { return nil }
 func (emptyView) Rooms() []RoomInfo   { return nil }
 func (emptyView) Stats() HubStats     { return HubStats{} }
 
-// emptyPublisher 是 Publisher 的空实现（V2 未接入真实内核时静默成功）。
+// emptyPublisher 是 Publisher 的空实现（未接入真实内核时静默成功）。
 type emptyPublisher struct{}
 
-func (emptyPublisher) Send(protocol.Envelope) error    { return nil }
+func (emptyPublisher) Send(protocol.Envelope) error   { return nil }
 func (emptyPublisher) Broadcast(string, string) error { return nil }

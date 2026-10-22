@@ -5,60 +5,121 @@
 package autobrowser
 
 import (
+	"errors"
 	"log"
 	"os/exec"
 	"runtime"
+	"sync"
 	"time"
 
 	"lan-agent-hub/internal/plugin"
 )
 
 // AutoBrowser 是 autobrowser 插件实体。
+//
+// 为什么要加锁（F6）：StopAll（进程停机）**不持** Manager.opMu，而运行期的
+// Disable/Apply 持 opMu——两者可以同时进到本插件，出现「Stop 关 done」与
+// 「Start 重建 done」并发写同一字段。加一把小锁把 open/url/done 三个字段的读写收口。
 type AutoBrowser struct {
+	mu   sync.Mutex
 	open bool
 	url  string
+	done chan struct{} // Stop 时关闭：取消「延迟 400ms 打开浏览器」的协程
 }
 
 // Meta 声明插件元信息；依赖 httpgateway 以保证 dashboardURL 交接顺序。
 func (p *AutoBrowser) Meta() plugin.Meta {
 	return plugin.Meta{
 		Name:         "autobrowser",
-		Version:      "1.0.0",
+		Version:      "1.1.0",
 		Description:  "启动后在默认浏览器打开网页控制台",
 		DefaultOn:    true,
 		Dependencies: []string{"httpgateway"},
 	}
 }
 
+// Options 声明本插件的可配置项（控制台设置视图据此自动生成表单）。
+func (p *AutoBrowser) Options() []plugin.OptionDef {
+	return []plugin.OptionDef{
+		{
+			Key:         "open",
+			Type:        plugin.OptionBool,
+			Default:     true,
+			Description: "启动时自动打开浏览器（关闭后仍需手动访问控制台地址）",
+		},
+	}
+}
+
+// Apply 实现 plugin.Applier：open 只是一个「下次启动是否打开浏览器」的开关，
+// 本插件不持有 socket / 协程，因此热更新无需任何重建动作，语义上立即生效。
+func (p *AutoBrowser) Apply(options map[string]any) error {
+	if v, ok := options["open"]; ok {
+		open, isBool := v.(bool)
+		if !isBool {
+			return errors.New("autobrowser: open 选项应为布尔值")
+		}
+		p.mu.Lock()
+		p.open = open
+		p.mu.Unlock()
+	}
+	return nil
+}
+
 // Init 读取 open 开关与共享 KV 中的 dashboardURL。
 func (p *AutoBrowser) Init(ctx *plugin.Context) error {
-	p.open = ctx.Bool("open", true)
-	// 插件实例是进程级单例，先清掉上一次装配的残留 URL。
-	p.url = ""
 	// GetShared 返回 (any, bool)：先判存在，再做类型断言（缺失时保持空串 → Start 静默跳过）。
+	url := ""
 	if v, ok := ctx.GetShared("dashboardURL"); ok {
 		if u, ok := v.(string); ok {
-			p.url = u
+			url = u
 		}
 	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.open = ctx.Bool("open", true)
+	// 插件实例是进程级单例：先清掉上一次装配的残留。
+	p.url = url
+	// 每次装配换一个全新的取消信道——上一轮 Stop 关掉的那个不能复用。
+	p.done = make(chan struct{})
 	return nil
 }
 
 // Start 延迟后在默认浏览器打开控制台。
+// 延迟期间若插件被 Stop（done 关闭）则取消打开动作，避免「刚停服又弹出浏览器」。
 func (p *AutoBrowser) Start() error {
-	if !p.open || p.url == "" {
+	p.mu.Lock()
+	open, url, done := p.open, p.url, p.done
+	if done == nil { // 防御：未经 Init 直接被 Start（单测直连场景）
+		done = make(chan struct{})
+		p.done = done
+	}
+	p.mu.Unlock()
+
+	if !open || url == "" {
 		return nil
 	}
-	url := p.url
 	go func() {
-		time.Sleep(400 * time.Millisecond) // 等 HTTP 端口绑定完成
-		openBrowser(url)
+		select {
+		case <-time.After(400 * time.Millisecond): // 等 HTTP 端口绑定完成
+			openBrowser(url)
+		case <-done:
+			return
+		}
 	}()
 	return nil
 }
 
-// Stop 无副作用。
-func (p *AutoBrowser) Stop() error { return nil }
+// Stop 取消尚未触发的「打开浏览器」动作。
+func (p *AutoBrowser) Stop() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done != nil {
+		close(p.done)
+		p.done = nil
+	}
+	return nil
+}
 
 func init() {
 	plugin.Register(&AutoBrowser{})

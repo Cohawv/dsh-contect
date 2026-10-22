@@ -17,6 +17,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -48,7 +49,7 @@ type Options struct {
 	// BindAddr：监听与广播绑定的 UDP 地址，默认 ":8082"。
 	BindAddr string
 	// TCPPort / HTTPPort：要写入 Beacon 的 Hub 端口。
-	TCPPort int
+	TCPPort  int
 	HTTPPort int
 	// HubID / Name / Proto / Caps：Beacon 内容，由 cmd/hub 从 protocol 包注入。
 	HubID      string
@@ -70,6 +71,8 @@ type Service struct {
 	conn   *net.UDPConn
 	stop   chan struct{}
 	once   sync.Once
+	// intervalNs 原子保存当前广播周期（纳秒）：支持运行期热更新（V4 设置视图）。
+	intervalNs int64
 }
 
 // New 构造 Service（不立即监听）。
@@ -98,8 +101,28 @@ func New(o Options) *Service {
 			Proto:      o.Proto,
 			Caps:       o.Caps,
 		},
-		stop: make(chan struct{}),
+		stop:       make(chan struct{}),
+		intervalNs: int64(o.Interval),
 	}
+}
+
+// Interval 返回当前广播周期。
+func (s *Service) Interval() time.Duration {
+	n := atomic.LoadInt64(&s.intervalNs)
+	if n <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(n)
+}
+
+// SetInterval 热更新广播周期（下一轮即生效，无需重建 Service）。
+// 非正数被忽略并返回 false，避免把 ticker 打成忙循环。
+func (s *Service) SetInterval(d time.Duration) bool {
+	if d <= 0 {
+		return false
+	}
+	atomic.StoreInt64(&s.intervalNs, int64(d))
+	return true
 }
 
 // Start 开始广播并监听 Query。
@@ -157,15 +180,18 @@ func (s *Service) HandleQuery(payload []byte) (Beacon, bool) {
 }
 
 // broadcastLoop 周期广播。
+//
+// 用「一次性 Timer + 每轮重读周期」代替固定 Ticker：这样 SetInterval 的热更新
+// 在下一轮就能生效，而无需重建 Service / socket。
 func (s *Service) broadcastLoop() {
-	ticker := time.NewTicker(s.opts.Interval)
-	defer ticker.Stop()
 	s.broadcastOnce()
 	for {
+		timer := time.NewTimer(s.Interval())
 		select {
 		case <-s.stop:
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			s.broadcastOnce()
 		}
 	}

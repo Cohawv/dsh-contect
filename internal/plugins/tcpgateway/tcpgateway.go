@@ -34,11 +34,24 @@ type TCPGateway struct {
 func (p *TCPGateway) Meta() plugin.Meta {
 	return plugin.Meta{
 		Name:           "tcpgateway",
-		Version:        "1.0.0",
+		Version:        "1.1.0",
 		Description:    "TCP/NDJSON 长连接接入层，是所有客户端的连接入口",
 		DefaultOn:      true,
 		Required:       true,
 		RequiredReason: "它是连接入口，必须启用；若只需纯内核/HTTP 形态，请改用 -plugin 白名单并保留 tcpgateway",
+	}
+}
+
+// Options 声明本插件的可配置项（控制台设置视图据此自动生成表单）。
+// addr 需要重新绑定监听端口，故本插件不实现 Applier（改后标注 pendingRestart）。
+func (p *TCPGateway) Options() []plugin.OptionDef {
+	return []plugin.OptionDef{
+		{
+			Key:         "addr",
+			Type:        plugin.OptionString,
+			Default:     ":8080",
+			Description: "TCP 监听地址，形如 :8080 或 0.0.0.0:8080（改动需重启生效）",
+		},
 	}
 }
 
@@ -79,9 +92,10 @@ func (p *TCPGateway) serve(ctx context.Context) {
 		conn, err := p.ln.Accept()
 		if err != nil {
 			// 关闭 listener（Stop）或外部 cancel 都会使 Accept 返回错误；
-			// 优先看 ctx 是否已取消，避免把正常停机的错误当异常处理。
-			if ctx.Err() != nil {
-				return
+			// ctx 已取消说明是正常停机，静默退出；否则是真实故障（如 fd 耗尽），
+			// 必须打日志——历史上这里是两个 return，把错误静默丢弃了。
+			if ctx.Err() == nil {
+				log.Printf("tcpgateway: accept on %s failed: %v", p.addr, err)
 			}
 			return
 		}

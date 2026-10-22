@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"lan-agent-hub/internal/core"
@@ -35,6 +36,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 type HTTPGateway struct {
 	hub      *core.Hub
 	disco    *discovery.Service
+	mgr      *plugin.Manager // 框架管理器（V4：/api/status?features=plugins 需要）
 	mux      *http.ServeMux
 	httpAddr string
 	srv      *http.Server
@@ -44,9 +46,22 @@ type HTTPGateway struct {
 func (p *HTTPGateway) Meta() plugin.Meta {
 	return plugin.Meta{
 		Name:        "httpgateway",
-		Version:     "1.0.0",
+		Version:     "1.1.0",
 		Description: "REST/控制台 HTTP 网关，承载 11 个 /api 端点与控制台根 /",
 		DefaultOn:   true,
+	}
+}
+
+// Options 声明本插件的可配置项（控制台设置视图据此自动生成表单）。
+// httpAddr 需要重新绑定端口，故本插件不实现 Applier（改后标注 pendingRestart）。
+func (p *HTTPGateway) Options() []plugin.OptionDef {
+	return []plugin.OptionDef{
+		{
+			Key:         "httpAddr",
+			Type:        plugin.OptionString,
+			Default:     ":8081",
+			Description: "HTTP 监听地址，形如 :8081 或 0.0.0.0:8081（改动需重启插件生效）",
+		},
 	}
 }
 
@@ -60,9 +75,13 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 	p.hub = hub
 	p.mux = ctx.ServeMux()
 	p.httpAddr = ctx.String("httpAddr", ":8081")
-	// 插件实例是进程级单例（init 里 Register 的是同一个对象），先清掉上一次装配的残留，
+	// 插件实例是进程级单例，先清掉上一次装配的残留，
 	// 避免「上一次装配启用了 discovery、这一次禁用」时仍读到旧的 Service。
 	p.disco = nil
+	p.mgr = nil
+	if m, ok := plugin.ManagerFromContext(ctx); ok {
+		p.mgr = m
+	}
 	// GetShared 返回 (any, bool)：先判存在，再做类型断言。
 	// discovery 插件被禁用/被移除时共享 KV 无该键，p.disco 保持 nil → /api/discover 返回 404（与历史一致）。
 	if v, ok := ctx.GetShared("discovery"); ok {
@@ -81,7 +100,7 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 		if e := ctx.RegisterHTTP(pattern, h); e != nil {
 			regErr = e
 		}
-	}, hub, p.disco)
+	}, hub, p.disco, p.mgr)
 	return regErr
 }
 
@@ -125,6 +144,16 @@ func init() {
 	plugin.Register(&HTTPGateway{})
 }
 
+// SkipReload 实现 plugin.ReloadSkipper：本插件就是承载 /api/* 的 HTTP 服务。
+//
+// 全量重载会逐个 Stop→Init→Start，若在「处理 /api/plugins/reload 请求的过程中」Stop 自己，
+// 正在等待响应的客户端连接会被一起掐断（表现为 reload 请求超时）。
+// 因此这里显式声明「别重载我」，并把原因回传给调用方——而不是让请求静默超时。
+// 改 httpAddr 请用插件开关单独重启，或直接重启进程。
+func (p *HTTPGateway) SkipReload() (bool, string) {
+	return true, "本插件承载 /api/* 的 HTTP 服务，全量重载会中断当前请求；请用插件开关单独重启该插件，或重启进程"
+}
+
 // ---------------------------------------------------------------------------
 // 端点定义：registerRoutes 把 11 个端点逐一注册到给定 registrar。
 // registrar 在插件场景是 ctx.RegisterHTTP（带冲突预检），在测试/兼容场景是 mux.HandleFunc。
@@ -132,7 +161,9 @@ func init() {
 // ---------------------------------------------------------------------------
 
 // registerRoutes 应用全部 11 个网关路由到 registrar。
-func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub, disco *discovery.Service) {
+// mgr 为框架管理器：仅用于 /api/status?features=plugins 的插件汇总（为 nil 时该能力不可用，
+// 默认响应保持逐字节不变）。
+func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub, disco *discovery.Service, mgr *plugin.Manager) {
 	reg("/api/discover", func(w http.ResponseWriter, r *http.Request) {
 		if disco == nil {
 			http.Error(w, "discovery disabled", http.StatusNotFound)
@@ -151,12 +182,16 @@ func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub,
 	})
 
 	// 控制台状态总览：协议版本、暴露端口、在线/房间计数、发现服务开关。
+	//
+	// 契约纪律（V1 C6 / V4 ⑤）：默认响应的 7 个字段**一个不动**。
+	// 新增的插件信息必须通过 ?features=plugins 显式索取（沿用既有 features 协商机制），
+	// 这样老客户端零感知，golden 基线无需改动。
 	reg("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		writeJSON(w, map[string]any{
+		resp := map[string]any{
 			"proto":      protocol.ProtoCurrent,
 			"tcpPort":    hub.TCPPort,
 			"httpPort":   hub.HTTPPort,
@@ -164,7 +199,11 @@ func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub,
 			"roomCount":  len(hub.Rooms.List()),
 			"discovery":  disco != nil,
 			"serverTime": time.Now().UnixMilli(),
-		})
+		}
+		if mgr != nil && wantsFeature(r, "plugins") {
+			resp["plugins"] = pluginSummaryOf(mgr)
+		}
+		writeJSON(w, resp)
 	})
 
 	// 房间列表（含成员），供控制台房间视图展示。
@@ -263,10 +302,60 @@ func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub,
 // NewMux 构造 REST 网关路由表（仅 11 个 /api 端点，不含控制台根 /）。
 // 行为必须与历史 adapter.NewMux 的端点部分逐字节一致，以保证契约 golden 仍为绿。
 // 控制台根 / 由 webconsole 插件（或测试中的 webconsole.RegisterWeb）挂载。
+//
+// 注意：本函数不接入插件管理器，故 /api/status?features=plugins 在这条装配路径上不可用
+// （默认响应不受影响）。
 func NewMux(hub *core.Hub, disco *discovery.Service) *http.ServeMux {
 	mux := http.NewServeMux()
 	registerRoutes(func(pattern string, h http.HandlerFunc) {
 		mux.HandleFunc(pattern, h)
-	}, hub, disco)
+	}, hub, disco, nil)
 	return mux
+}
+
+// wantsFeature 判断请求是否通过 ?features=a,b 显式索取某个能力。
+// 沿用 V1 的 features 协商机制：不索取就绝不追加字段（契约护栏）。
+func wantsFeature(r *http.Request, name string) bool {
+	raw := r.URL.Query().Get("features")
+	if raw == "" {
+		return false
+	}
+	for _, part := range strings.Split(raw, ",") {
+		if strings.TrimSpace(part) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// pluginFailure 是一个失败插件的简短说明（failedPlugins 里带原因，便于肉眼判断）。
+type pluginFailure struct {
+	Name  string `json:"name"`
+	Error string `json:"error"`
+}
+
+// pluginSummary 是 /api/status?features=plugins 追加的插件汇总。
+type pluginSummary struct {
+	Count    int             `json:"count"`
+	Enabled  []string        `json:"enabled"`
+	Disabled []string        `json:"disabled"`
+	Failed   []pluginFailure `json:"failed"`
+}
+
+// pluginSummaryOf 由管理器快照生成插件汇总（顺序稳定，便于 golden 断言）。
+func pluginSummaryOf(mgr *plugin.Manager) pluginSummary {
+	out := pluginSummary{Enabled: []string{}, Disabled: []string{}, Failed: []pluginFailure{}}
+	for _, info := range mgr.Snapshot() {
+		out.Count++
+		switch info.State {
+		case plugin.StateDisabled:
+			out.Disabled = append(out.Disabled, info.Name)
+		case plugin.StateFailed:
+			out.Failed = append(out.Failed, pluginFailure{Name: info.Name, Error: info.Error})
+			out.Enabled = append(out.Enabled, info.Name)
+		default:
+			out.Enabled = append(out.Enabled, info.Name)
+		}
+	}
+	return out
 }
