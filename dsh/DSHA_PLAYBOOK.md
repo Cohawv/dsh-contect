@@ -308,6 +308,7 @@ node -e "fetch('http://127.0.0.1:8081/api/agents').then(r=>r.text()).then(t=>con
 | 17 | 改了插件代码，停止→启动后行为**没变**；`dist/index.js` 的 mtime 也不变 | **版本号没升**（仍旧 0.1.0），`dsh plugin add` 判定「依赖已满足」直接跳过，装的是旧包 | **改版本号**（0.1.0→0.1.1）并 `rm -rf /root/.dsh/profiles/web/node_modules/dsh-plugin-lan-hub` 后再 add；装完必须校验：`grep -c "<新代码里的特征串>" dist/index.js` |
 | 18 | 配了 `host: auto`，日志报 `discovery timeout`，最后靠 fallback 连上 | ① 发现超时默认 **2000ms**，本网段 254 个单播扫描来不及（每包还要 ARP）② `fallbackHost` 留空会退回 `127.0.0.1`，在手机上指向手机自己 | 超时提到 **5000ms**、扫描在 400ms 后启动；`fallbackHost` 显式填 Hub 局域网 IP。成功的标志是日志出现 `discovered hub at <ip>:<port> (auto)` |
 | 19 | 两台手机都连上 Hub，但只剩一台在线、另一台被反复顶掉 | 两台 `agentId` 相同（都叫 `phone-agent`），Hub 按 id 注册，后到的覆盖先到的 | **一机一个 agentId**（如 `phone-agent` / `huawei-agent`），`agentName` 同步区分 |
+| 20 | 偶尔启动时日志出现 `discovery failed: discovery timeout`，但同一个网络下重启一次又好了 | **启动早期**网卡/路由/省电策略的瞬时未就绪，单次发现超时；功能上靠 fallback 仍能连上，但看起来像报错 | 0.1.2 起自动**重试 2 次**（间隔 1.2s）再兜底；失败日志带诊断 `ifaces=N, sent=M, recv=K`：`ifaces=0` 即网卡还没就绪，属瞬时问题，**不必处理** |
 
 ---
 
@@ -460,7 +461,7 @@ hub_list_agents, hub_read_messages, hub_send, hub_send_room
 > 插件日志前缀是 `[lan-hub]`。容器里 `grep '\[lan-hub\]' /root/dsh-web.log`
 > 可完整看清连接生命周期（含退避间隔），是判断"断线还是没装好"的最快依据。
 
-### 13.1 `host: auto` 局域网自动发现（插件 0.1.1 起，已真机验证）
+### 13.1 `host: auto` 局域网自动发现（插件 0.1.1 起，已真机验证；0.1.2 起带重试与诊断）
 
 不用再填电脑 IP：把配置里的 `host` 设成 `auto`，插件会用 UDP 找 Hub。
 
@@ -497,6 +498,10 @@ hub_list_agents, hub_read_messages, hub_send, hub_send_room
 
 服务端交叉验证：`curl -s http://127.0.0.1:8081/api/agents` 应看到
 `{"id":"phone-agent","proto":3,"caps":[5 项全量]}`。
+
+> 若第一次尝试撞上瞬时未就绪，日志会多一行（**属正常自愈，不是故障**）：
+> `[lan-hub] discovery attempt 1/2 failed: discovery timeout (ifaces=1, sent=254, recv=0)`
+> 紧接着第二行就是 `discovered hub at ... (auto, attempt 2)`。
 
 > **多台手机**：每台必须用**不同 `agentId`**（`phone-agent` / `huawei-agent` …），
 > 否则在 Hub 上按 id 注册会互相顶掉，表现为「明明连上了却只剩一台在线」（坑 19）。

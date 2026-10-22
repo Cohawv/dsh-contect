@@ -87,6 +87,10 @@ const CLIENT_PROTO = 3
 const CLIENT_CAPS = ['structured-ack', 'heartbeat-negotiation', 'discovery', 'agent-caps', 'endpoints']
 const DEFAULT_DISCOVER_PORT = 8082
 const DEFAULT_DISCOVER_TIMEOUT_MS = 5000
+/** 发现失败重试次数：启动早期网卡未就绪时靠重试自愈（不必重启） */
+const DISCOVER_ATTEMPTS = 2
+/** 两次发现尝试之间的间隔 */
+const DISCOVER_RETRY_GAP_MS = 1200
 
 export class HubClient {
   private readonly host: string
@@ -166,13 +170,24 @@ export class HubClient {
     let host = this.host
     let port = this.port
     if (this.autoDiscover) {
-      try {
-        const found = await this.discover()
-        host = found.host
-        port = found.port
-        this.log(`[lan-hub] discovered hub at ${host}:${port} (auto)`)
-      } catch (e) {
-        this.log(`[lan-hub] discovery failed: ${(e as Error).message}, fallback ${this.fallbackHost}:${this.fallbackPort}`)
+      // 启动早期网卡/路由可能尚未就绪，单次失败不代表没有 Hub：重试一次再兜底
+      let lastErr: Error | null = null
+      for (let attempt = 1; attempt <= DISCOVER_ATTEMPTS; attempt++) {
+        try {
+          const found = await this.discover()
+          host = found.host
+          port = found.port
+          this.log(`[lan-hub] discovered hub at ${host}:${port} (auto${attempt > 1 ? `, attempt ${attempt}` : ''})`)
+          lastErr = null
+          break
+        } catch (e) {
+          lastErr = e as Error
+          this.log(`[lan-hub] discovery attempt ${attempt}/${DISCOVER_ATTEMPTS} failed: ${lastErr.message}`)
+          if (attempt < DISCOVER_ATTEMPTS) await new Promise((r) => setTimeout(r, DISCOVER_RETRY_GAP_MS))
+        }
+      }
+      if (lastErr) {
+        this.log(`[lan-hub] discovery failed, fallback ${this.fallbackHost}:${this.fallbackPort}`)
         host = this.fallbackHost
         port = this.fallbackPort
       }
@@ -227,6 +242,9 @@ export class HubClient {
       const sock = dgram.createSocket('udp4')
       let done = false
       let scanTimer: ReturnType<typeof setTimeout> | null = null
+      let sentCount = 0
+      let recvCount = 0
+      let subsCount = 0
       const finish = (err: Error | null, val?: DiscoveredHub) => {
         if (done) return
         done = true
@@ -235,7 +253,6 @@ export class HubClient {
         if (err) reject(err)
         else resolve(val as DiscoveredHub)
       }
-      const timeout = setTimeout(() => finish(new Error('discovery timeout')), DEFAULT_DISCOVER_TIMEOUT_MS)
 
       // 取本机所有非内部 IPv4 网卡的 /24 前缀，用于定向广播与兜底扫描
       const subs: Array<{ self: string; prefix: string }> = []
@@ -248,8 +265,16 @@ export class HubClient {
           subs.push({ self: it.address, prefix: ip[0] + '.' + ip[1] + '.' + ip[2] })
         }
       }
+      subsCount = subs.length
+
+      // 失败时带上诊断信息（网卡数/发包数/收包数）：启动早期网卡未就绪时 ifaces=0 可直接看出来
+      const timeout = setTimeout(
+        () => finish(new Error(`discovery timeout (ifaces=${subsCount}, sent=${sentCount}, recv=${recvCount})`)),
+        DEFAULT_DISCOVER_TIMEOUT_MS,
+      )
 
       sock.on('message', (msg, rinfo) => {
+        recvCount++
         try {
           const b = JSON.parse(msg.toString('utf8'))
           if (b && b.type === '_lanhub_beacon' && typeof b.tcpPort === 'number') {
@@ -265,6 +290,7 @@ export class HubClient {
         try { sock.setBroadcast(true) } catch { /* ignore */ }
         const q = Buffer.from(JSON.stringify({ type: '_lanhub_query' }))
         const sendTo = (ip: string) => {
+          sentCount++
           try { sock.send(q, 0, q.length, this.discoverPort, ip, () => {}) } catch { /* ignore */ }
         }
         // 阶段1：全网广播 + 各网卡定向广播（AP 允许广播时最快命中）

@@ -14,6 +14,8 @@ var CLIENT_PROTO = 3;
 var CLIENT_CAPS = ["structured-ack", "heartbeat-negotiation", "discovery", "agent-caps", "endpoints"];
 var DEFAULT_DISCOVER_PORT = 8082;
 var DEFAULT_DISCOVER_TIMEOUT_MS = 5e3;
+var DISCOVER_ATTEMPTS = 2;
+var DISCOVER_RETRY_GAP_MS = 1200;
 var HubClient = class {
   host;
   port;
@@ -85,13 +87,23 @@ var HubClient = class {
     let host = this.host;
     let port = this.port;
     if (this.autoDiscover) {
-      try {
-        const found = await this.discover();
-        host = found.host;
-        port = found.port;
-        this.log(`[lan-hub] discovered hub at ${host}:${port} (auto)`);
-      } catch (e) {
-        this.log(`[lan-hub] discovery failed: ${e.message}, fallback ${this.fallbackHost}:${this.fallbackPort}`);
+      let lastErr = null;
+      for (let attempt = 1; attempt <= DISCOVER_ATTEMPTS; attempt++) {
+        try {
+          const found = await this.discover();
+          host = found.host;
+          port = found.port;
+          this.log(`[lan-hub] discovered hub at ${host}:${port} (auto${attempt > 1 ? `, attempt ${attempt}` : ""})`);
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          this.log(`[lan-hub] discovery attempt ${attempt}/${DISCOVER_ATTEMPTS} failed: ${lastErr.message}`);
+          if (attempt < DISCOVER_ATTEMPTS) await new Promise((r) => setTimeout(r, DISCOVER_RETRY_GAP_MS));
+        }
+      }
+      if (lastErr) {
+        this.log(`[lan-hub] discovery failed, fallback ${this.fallbackHost}:${this.fallbackPort}`);
         host = this.fallbackHost;
         port = this.fallbackPort;
       }
@@ -140,6 +152,9 @@ var HubClient = class {
       const sock = dgram.createSocket("udp4");
       let done = false;
       let scanTimer = null;
+      let sentCount = 0;
+      let recvCount = 0;
+      let subsCount = 0;
       const finish = (err, val) => {
         if (done) return;
         done = true;
@@ -151,7 +166,6 @@ var HubClient = class {
         if (err) reject(err);
         else resolve(val);
       };
-      const timeout = setTimeout(() => finish(new Error("discovery timeout")), DEFAULT_DISCOVER_TIMEOUT_MS);
       const subs = [];
       const ifs = os.networkInterfaces();
       for (const name2 of Object.keys(ifs)) {
@@ -162,7 +176,13 @@ var HubClient = class {
           subs.push({ self: it.address, prefix: ip[0] + "." + ip[1] + "." + ip[2] });
         }
       }
+      subsCount = subs.length;
+      const timeout = setTimeout(
+        () => finish(new Error(`discovery timeout (ifaces=${subsCount}, sent=${sentCount}, recv=${recvCount})`)),
+        DEFAULT_DISCOVER_TIMEOUT_MS
+      );
       sock.on("message", (msg, rinfo) => {
+        recvCount++;
         try {
           const b = JSON.parse(msg.toString("utf8"));
           if (b && b.type === "_lanhub_beacon" && typeof b.tcpPort === "number") {
@@ -183,6 +203,7 @@ var HubClient = class {
         }
         const q = Buffer.from(JSON.stringify({ type: "_lanhub_query" }));
         const sendTo = (ip) => {
+          sentCount++;
           try {
             sock.send(q, 0, q.length, this.discoverPort, ip, () => {
             });
