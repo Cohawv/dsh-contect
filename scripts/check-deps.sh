@@ -26,6 +26,22 @@ check internal/discovery 'lan-agent-hub/internal/(core|transport|adapter|protoco
 check internal/core     'lan-agent-hub/internal/(plugin|plugins)' 'core 不依赖 plugin/plugins（插件不可反向污染内核）'
 check internal/plugin   'lan-agent-hub/internal/plugins'          'plugin（框架）不依赖 plugins（框架与具体插件解耦）'
 
+# V3 新增：adapter 已解散（能力迁入 internal/plugins/*），全仓库不得再出现其 import 路径。
+# 只匹配带引号的 import 字面量——注释里提到"历史 internal/adapter/xxx.go"是允许的（用于追溯来源）。
+echo
+echo "检查 internal/adapter 是否已彻底解散..."
+if [ -d internal/adapter ]; then
+  echo "FAIL  internal/adapter 目录仍存在（V3 要求已解散，能力应在 internal/plugins/*）"
+  fail=1
+elif hits=$(grep -rn '"lan-agent-hub/internal/adapter"' --include='*.go' . 2>/dev/null) && [ -n "$hits" ]; then
+  echo "FAIL  仍有 Go 源码 import lan-agent-hub/internal/adapter："
+  echo "$hits"
+  fail=1
+else
+  echo "OK    adapter 已解散（无目录、无 Go 引用）"
+fi
+
+
 if [ "$fail" -ne 0 ]; then
   echo
   echo "依赖方向违规。请修正 import，或更新 ARCHITECTURE.md 中的边界规则（需评审）。"

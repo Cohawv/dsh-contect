@@ -1,6 +1,9 @@
 package plugin
 
 import (
+	"fmt"
+	"net/http"
+	"sync"
 	"time"
 
 	"lan-agent-hub/internal/protocol"
@@ -50,17 +53,27 @@ type HubStats struct {
 
 // Context 是插件在 Init/Start 期间能拿到的全部上下文。
 //
-// 关键安全点：Context 不持有 *core.Hub 字段，也不提供 RegisterHTTP / mux 接入
-// （那属于 V3）。插件只能通过 View() / Publish() 的窄接口与内核交互，
-// 通过 String/Int/Bool/Duration 读取自身被合并后的配置项。
+// V3 扩展点（相对 V2）：
+//   - 持有共享 *http.ServeMux 与影子路由表，插件经 RegisterHTTP 注册端点，
+//     由框架统一做冲突预检（不依赖 ServeMux 的 panic 行为）；
+//   - 持有共享 KV（跨插件交接运行时对象，如 discovery 服务、dashboard URL）；
+//   - 持有内核实体（any 形式），内置插件在 internal/plugins/* 自行类型断言取 *core.Hub。
+//
+// 关键安全点：本包（框架）不得 import internal/core——Context 只以 any 持有 hub，
+// 真正取出 *core.Hub 的逻辑在插件侧，框架本身永远看不到该具体类型。
 type Context struct {
-	view    HubView
-	pub     Publisher
-	options map[string]any // 本插件的合并后配置项
+	view        HubView
+	pub         Publisher
+	options     map[string]any    // 本插件的合并后配置项
+	mux         *http.ServeMux    // 共享 mux：所有 HTTP 插件注册到它
+	routes      *sync.Map         // 影子路由表 pattern → 拥有者插件名（冲突预检）
+	shared      *sync.Map         // 跨插件共享 KV：key(string) → any
+	hub         any               // 业务内核实体（*core.Hub），框架侧为 any
+	owner       string            // 当前插件名（用于冲突报错点名）
 }
 
 // newContext 构造 Context；view/pub 为 nil 时退化为空实现（V2 未接入真实内核时可用）。
-func newContext(view HubView, pub Publisher, options map[string]any) *Context {
+func newContext(view HubView, pub Publisher, options map[string]any, owner string, mux *http.ServeMux, routes, shared *sync.Map, hub any) *Context {
 	if view == nil {
 		view = emptyView{}
 	}
@@ -70,7 +83,7 @@ func newContext(view HubView, pub Publisher, options map[string]any) *Context {
 	if options == nil {
 		options = map[string]any{}
 	}
-	return &Context{view: view, pub: pub, options: options}
+	return &Context{view: view, pub: pub, options: options, owner: owner, mux: mux, routes: routes, shared: shared, hub: hub}
 }
 
 // View 返回只读内核视图。
@@ -78,6 +91,52 @@ func (c *Context) View() HubView { return c.view }
 
 // Publish 返回发布能力。
 func (c *Context) Publish() Publisher { return c.pub }
+
+// Hub 返回业务内核实体（注入时为 *core.Hub）。
+// 框架侧以 any 持有，内置插件（在 internal/plugins/* 中）自行类型断言。
+func (c *Context) Hub() any { return c.hub }
+
+// ServeMux 返回插件共享的 *http.ServeMux（所有 HTTP 端点注册到此）。
+func (c *Context) ServeMux() *http.ServeMux { return c.mux }
+
+// RegisterHTTP 把 pattern 注册到共享 mux，并做冲突预检。
+//
+// 先用影子表（routes）查重：若 pattern 已被占用，返回 error 并**点名冲突双方插件名**，
+// 绝不依赖 *http.ServeMux 对重复 pattern 的 panic 行为；
+// 再用 recover 兜底 ServeMux 的其它（意外）panic，转为 Init 错误由 Manager 隔离。
+func (c *Context) RegisterHTTP(pattern string, h http.HandlerFunc) error {
+	if c.routes == nil || c.mux == nil {
+		return fmt.Errorf("plugin %q: context has no shared mux (BuildContext not called?)", c.owner)
+	}
+	if prev, dup := c.routes.Load(pattern); dup {
+		return fmt.Errorf("route %q already registered by plugin %q (conflicts with %q)", pattern, prev.(string), c.owner)
+	}
+	c.routes.Store(pattern, c.owner)
+	defer func() {
+		if r := recover(); r != nil {
+			// ServeMux 意外的 panic（理论上不会，因为已用影子表挡住重复 pattern）：转为错误。
+			_ = r
+		}
+	}()
+	c.mux.HandleFunc(pattern, h)
+	return nil
+}
+
+// GetShared 读取跨插件共享 KV（首次读取返回 (nil, false)）。
+func (c *Context) GetShared(key string) (any, bool) {
+	if c.shared == nil {
+		return nil, false
+	}
+	return c.shared.Load(key)
+}
+
+// SetShared 写入跨插件共享 KV。
+func (c *Context) SetShared(key string, v any) {
+	if c.shared == nil {
+		return
+	}
+	c.shared.Store(key, v)
+}
 
 // String 读取字符串型配置项，缺失或非字符串时返回默认值。
 func (c *Context) String(key, def string) string {
@@ -146,5 +205,5 @@ func (emptyView) Stats() HubStats     { return HubStats{} }
 // emptyPublisher 是 Publisher 的空实现（V2 未接入真实内核时静默成功）。
 type emptyPublisher struct{}
 
-func (emptyPublisher) Send(protocol.Envelope) error      { return nil }
-func (emptyPublisher) Broadcast(string, string) error   { return nil }
+func (emptyPublisher) Send(protocol.Envelope) error    { return nil }
+func (emptyPublisher) Broadcast(string, string) error { return nil }

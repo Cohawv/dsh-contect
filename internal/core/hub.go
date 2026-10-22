@@ -1,6 +1,8 @@
 package core
 
 import (
+	"context"
+	"sync"
 	"time"
 
 	"lan-agent-hub/internal/protocol"
@@ -23,6 +25,10 @@ type Hub struct {
 	// 服务端暴露的端口，注册回执在 cap: endpoints 下发给客户端（支持自动发现后的二次确认）
 	TCPPort  int
 	HTTPPort int
+
+	// 清扫观测字段（V3 新增，供 V5 metrics 使用）。
+	muSweep     sync.RWMutex
+	LastSweepAt int64 // 上次 SweepLoop 实际执行清理的时间戳（毫秒）
 }
 
 func NewHub() *Hub {
@@ -150,17 +156,31 @@ func (h *Hub) Unregister(id string) {
 	h.Bus.Publish(protocol.TopicAgentOffline, id)
 }
 
-// SweepLoop 定期清理心跳超时的连接。
-func (h *Hub) SweepLoop(interval time.Duration) {
+// SweepLoop 定期清理心跳超时的连接，可被外部通过 ctx 取消（V3 插件化开的可控口子）。
+// 调用方（sweeper 插件）应在 Stop 时 cancel 并等待本循环退出。
+func (h *Hub) SweepLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		for _, a := range h.Registry.Sweep(h.TimeoutMs) {
-			h.Rooms.Drop(a.ID)
-			h.Bus.Publish(protocol.TopicAgentOffline, a.ID)
-			if a.Sess != nil {
-				go func(s Session) { _ = s.Close() }(a.Sess)
-			}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.sweepOnce()
+		}
+	}
+}
+
+// sweepOnce 执行一次超时清理（抽出便于单测；core 的最小增量，不违反 C1）。
+func (h *Hub) sweepOnce() {
+	h.muSweep.Lock()
+	h.LastSweepAt = time.Now().UnixMilli()
+	h.muSweep.Unlock()
+	for _, a := range h.Registry.Sweep(h.TimeoutMs) {
+		h.Rooms.Drop(a.ID)
+		h.Bus.Publish(protocol.TopicAgentOffline, a.ID)
+		if a.Sess != nil {
+			go func(s Session) { _ = s.Close() }(a.Sess)
 		}
 	}
 }

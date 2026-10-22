@@ -2,7 +2,10 @@ package plugin
 
 import (
 	"fmt"
+	"net/http"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +29,10 @@ type Manager struct {
 	view    HubView             // 注入给插件的只读视图（V2 默认空实现）
 	pub     Publisher           // 注入给插件的发布能力（V2 默认空实现）
 	options map[string]map[string]any // Name → 合并后的配置项
+	mux     *http.ServeMux      // 共享 mux：BuildContext 时建立
+	routes  *sync.Map           // 影子路由表：pattern → 插件名（冲突预检）
+	shared  *sync.Map           // 跨插件共享 KV
+	hub     any                 // 业务内核实体（*core.Hub），框架侧为 any
 }
 
 // NewManager 从全局注册表构建管理器（生产用法）。
@@ -79,6 +86,40 @@ func (m *Manager) ApplyConfig(enabled map[string]bool, options map[string]map[st
 	for k, v := range options {
 		m.options[k] = v
 	}
+}
+
+// BuildContext 建立共享 mux、影子路由表与跨插件 KV，并注入业务内核实体。
+// 必须在 InitAll 之前调用；hub 通常为 *core.Hub，框架以 any 持有。
+// 重复调用安全：复用同一套共享结构，新 hub 覆盖旧值。
+func (m *Manager) BuildContext(hub any) error {
+	if m.mux == nil {
+		m.mux = http.NewServeMux()
+	}
+	if m.routes == nil {
+		m.routes = &sync.Map{}
+	}
+	if m.shared == nil {
+		m.shared = &sync.Map{}
+	}
+	m.hub = hub
+	return nil
+}
+
+// Routes 导出当前已注册的路由清单（pattern → 拥有者插件名），
+// 供 V4 的插件视图 / 排障使用。
+func (m *Manager) Routes() map[string]string {
+	out := make(map[string]string)
+	if m.routes != nil {
+		m.routes.Range(func(k, v any) bool {
+			if ks, ok := k.(string); ok {
+				if vs, ok := v.(string); ok {
+					out[ks] = vs
+				}
+			}
+			return true
+		})
+	}
+	return out
 }
 
 // isEnabled 返回插件是否启用：显式设置优先，否则默认启用（V2「全量启」）。
@@ -236,7 +277,11 @@ func (m *Manager) firstFailedDependency(p Plugin) string {
 func (m *Manager) StartAll() ([]Result, error) {
 	for _, p := range m.plugins {
 		if p.Meta().Required && !m.isEnabled(p) {
-			return nil, fmt.Errorf("required plugin %q is disabled/excluded; cannot start", p.Meta().Name)
+			reason := p.Meta().RequiredReason
+			if reason == "" {
+				reason = "它是必需插件，必须启用"
+			}
+			return nil, fmt.Errorf("缺少必需插件 %q，%s", p.Meta().Name, reason)
 		}
 	}
 
@@ -259,6 +304,12 @@ func (m *Manager) StartAll() ([]Result, error) {
 		if failedDep := m.firstFailedDependency(p); failedDep != "" {
 			info.State = StateFailed
 			info.Error = fmt.Sprintf("dependency %q failed or unavailable", failedDep)
+			results = append(results, Result{Name: name, State: StateFailed, Error: info.Error})
+			continue
+		}
+		// Init 阶段已失败的插件不再 Start：否则 safeStart 会把 StateFailed 覆盖为 Running，
+		// 掩盖「它其实没装配好」（典型场景：路由冲突导致 Init 返回 error）。
+		if info.State == StateFailed {
 			results = append(results, Result{Name: name, State: StateFailed, Error: info.Error})
 			continue
 		}
@@ -285,6 +336,20 @@ func (m *Manager) StartAll() ([]Result, error) {
 		results = append(results, Result{Name: name, State: StateFailed, Error: info.Error})
 	}
 
+	// 必需插件即使「被启用」也可能 Start 失败（典型：端口被占）。此时整体启动必须失败：
+	// 否则会打印"启动完成"、继续等信号，而实际没有任何连接入口（静默僵尸启动）。
+	// V2 是直接 log.Fatalf 退出，这里保持等价语义。
+	for _, p := range m.plugins {
+		if !p.Meta().Required || !m.isEnabled(p) {
+			continue
+		}
+		info := m.infos[p.Meta().Name]
+		if info.State != StateRunning {
+			return results, fmt.Errorf("必需插件 %q 启动失败（state=%s）: %s",
+				p.Meta().Name, info.State.String(), info.Error)
+		}
+	}
+
 	return results, nil
 }
 
@@ -305,7 +370,7 @@ func (m *Manager) StopAll() {
 // safeInit 调用 Init 并隔离 panic；成功置 StateInitialized，失败置 StateFailed。
 func (m *Manager) safeInit(p Plugin) {
 	info := m.infos[p.Meta().Name]
-	ctx := newContext(m.view, m.pub, m.optionsFor(p))
+	ctx := m.newContextFor(p)
 	defer func() {
 		if r := recover(); r != nil {
 			info.State = StateFailed
@@ -321,9 +386,25 @@ func (m *Manager) safeInit(p Plugin) {
 	info.EnabledAt = time.Now().UnixMilli()
 }
 
+// newContextFor 为插件构造带共享 mux/路由表/KV/hub 的 Context。
+// 若 BuildContext 未被调用（如单测），这里兜底建一套默认结构，保证 Context 可用。
+func (m *Manager) newContextFor(p Plugin) *Context {
+	if m.mux == nil {
+		m.mux = http.NewServeMux()
+	}
+	if m.routes == nil {
+		m.routes = &sync.Map{}
+	}
+	if m.shared == nil {
+		m.shared = &sync.Map{}
+	}
+	return newContext(m.view, m.pub, m.optionsFor(p), p.Meta().Name, m.mux, m.routes, m.shared, m.hub)
+}
+
 // safeStart 调用 Start 并隔离 panic；成功置 StateRunning，失败置 StateFailed。
 func (m *Manager) safeStart(p Plugin) {
 	info := m.infos[p.Meta().Name]
+	info.StartedAt = time.Now().UnixMilli()
 	defer func() {
 		if r := recover(); r != nil {
 			info.State = StateFailed
@@ -338,21 +419,37 @@ func (m *Manager) safeStart(p Plugin) {
 	info.State = StateRunning
 }
 
-// safeStop 调用 Stop 并隔离 panic；成功置 StateStopped，失败置 StateFailed。
+// stopTimeout 是「单个插件 Stop」的硬超时：超时记录为 Failed，但绝不阻塞整体停机。
+// 内置插件的 Stop 自身也已内建 5s 超时（tcpgateway 等待 Accept 退出、sweeper 等待循环退出、
+// httpgateway 的 Shutdown），这里是框架层的兜底，防止第三方插件写出永不返回的 Stop。
+// 声明为变量仅为便于单测缩短（生产不修改）。
+var stopTimeout = 5 * time.Second
+
+// safeStop 调用 Stop 并隔离 panic / 卡死；成功置 StateStopped，失败或超时置 StateFailed。
 func (m *Manager) safeStop(p Plugin) {
 	info := m.infos[p.Meta().Name]
-	defer func() {
-		if r := recover(); r != nil {
-			info.State = StateFailed
-			info.Error = fmt.Sprintf("Stop panicked: %v", r)
-		}
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("Stop panicked: %v", r)
+			}
+		}()
+		done <- p.Stop()
 	}()
-	if err := p.Stop(); err != nil {
+	select {
+	case err := <-done:
+		if err != nil {
+			info.State = StateFailed
+			info.Error = "Stop failed: " + err.Error()
+			return
+		}
+		info.State = StateStopped
+		info.StoppedAt = time.Now().UnixMilli()
+	case <-time.After(stopTimeout):
 		info.State = StateFailed
-		info.Error = "Stop failed: " + err.Error()
-		return
+		info.Error = fmt.Sprintf("Stop timed out after %s（已跳过，未阻塞整体停机）", stopTimeout)
 	}
-	info.State = StateStopped
 }
 
 // Infos 返回当前所有插件的运行时信息（按 Name 升序）。
@@ -363,4 +460,43 @@ func (m *Manager) Infos() []Info {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// Summary 返回停机摘要字符串：每行一个插件，含状态与耗时（已停止用 StoppedAt-StartedAt，
+// 仍在运行用 time.Since(StartedAt)）。便于「双击 EXE / 终端」场景下快速排障。
+func (m *Manager) Summary() string {
+	infos := m.Infos()
+	if len(infos) == 0 {
+		return "(无插件)"
+	}
+	var b strings.Builder
+	for i, info := range infos {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteByte('[')
+		b.WriteString(info.Name)
+		b.WriteByte(']')
+		b.WriteByte('=')
+		b.WriteString(info.State.String())
+		// 耗时
+		var d time.Duration
+		if info.StartedAt > 0 {
+			if info.StoppedAt > 0 {
+				d = time.Duration(info.StoppedAt-info.StartedAt) * time.Millisecond
+			} else if info.State == StateRunning {
+				d = time.Since(time.UnixMilli(info.StartedAt))
+			}
+		}
+		if d > 0 {
+			b.WriteByte('(')
+			b.WriteString(d.Round(time.Millisecond).String())
+			b.WriteByte(')')
+		}
+		if info.Error != "" {
+			b.WriteByte(':')
+			b.WriteString(info.Error)
+		}
+	}
+	return b.String()
 }

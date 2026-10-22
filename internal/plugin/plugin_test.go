@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakePlugin 是测试替身，不引入任何新依赖。
@@ -184,6 +185,139 @@ func TestPanicRecovered(t *testing.T) {
 	}
 	if m.infos["good"].State != StateInitialized {
 		t.Fatalf("good state = %v want initialized", m.infos["good"].State)
+	}
+}
+
+// TestStartSkippedAfterInitFailure 验证 Init 失败的插件不会被 Start 覆盖成 Running
+// （V3 新增：路由冲突等 Init 错误必须如实保留为 Failed，否则排障会被误导）。
+func TestStartSkippedAfterInitFailure(t *testing.T) {
+	startHit := 0
+	good := &fakePlugin{meta: Meta{Name: "good"}}
+	bad := &fakePlugin{meta: Meta{Name: "bad"}, initErr: errFakeInit, startHit: &startHit}
+	m := newManagerFrom([]Plugin{bad, good})
+	m.InitAll()
+	results, err := m.StartAll()
+	if err != nil {
+		t.Fatalf("unexpected fatal: %v", err)
+	}
+	if m.infos["bad"].State != StateFailed {
+		t.Fatalf("bad state = %v want failed (Init 失败后不应被 Start 覆盖)", m.infos["bad"].State)
+	}
+	if !contains(m.infos["bad"].Error, "Init failed") {
+		t.Fatalf("bad error %q should keep Init failure reason", m.infos["bad"].Error)
+	}
+	if startHit != 0 {
+		t.Fatalf("Init 失败的插件不应被 Start 调用，实际调用 %d 次", startHit)
+	}
+	if m.infos["good"].State != StateRunning {
+		t.Fatalf("good state = %v want running", m.infos["good"].State)
+	}
+	byName := map[string]Result{}
+	for _, r := range results {
+		byName[r.Name] = r
+	}
+	if byName["bad"].State != StateFailed {
+		t.Fatalf("result bad state = %v want failed", byName["bad"].State)
+	}
+}
+
+// errFakeInit 是 Init 失败的测试错误。
+var errFakeInit = &fakeErr{"boom-init"}
+
+// fakeErr 是最小的 error 实现（避免为测试引入外部依赖）。
+type fakeErr struct{ msg string }
+
+func (e *fakeErr) Error() string { return e.msg }
+
+// orderPlugin 按调用次序把 Init/Start/Stop 记进共享切片（验证 StopAll 逆序）。
+type orderPlugin struct {
+	meta Meta
+	log  *[]string
+}
+
+func (p *orderPlugin) Meta() Meta { return p.meta }
+
+func (p *orderPlugin) Init(*Context) error {
+	*p.log = append(*p.log, "init:"+p.meta.Name)
+	return nil
+}
+
+func (p *orderPlugin) Start() error {
+	*p.log = append(*p.log, "start:"+p.meta.Name)
+	return nil
+}
+
+func (p *orderPlugin) Stop() error {
+	*p.log = append(*p.log, "stop:"+p.meta.Name)
+	return nil
+}
+
+// hangPlugin 的 Stop 永不返回（验证框架层停机超时兜底）。
+type hangPlugin struct {
+	meta  Meta
+	block chan struct{}
+}
+
+func (p *hangPlugin) Meta() Meta          { return p.meta }
+func (p *hangPlugin) Init(*Context) error { return nil }
+func (p *hangPlugin) Start() error        { return nil }
+func (p *hangPlugin) Stop() error         { <-p.block; return nil }
+
+// TestStopAllReverseOrder 验证 StopAll 严格按启动的逆序停止（LIFO），
+// 保证「依赖方先停、被依赖者后停」。
+func TestStopAllReverseOrder(t *testing.T) {
+	var log []string
+	a := &orderPlugin{meta: Meta{Name: "aaa"}, log: &log}
+	b := &orderPlugin{meta: Meta{Name: "bbb", Dependencies: []string{"aaa"}}, log: &log}
+	c := &orderPlugin{meta: Meta{Name: "ccc"}, log: &log}
+	m := newManagerFrom([]Plugin{c, b, a})
+
+	m.InitAll()
+	if _, err := m.StartAll(); err != nil {
+		t.Fatalf("start err: %v", err)
+	}
+	m.StopAll()
+
+	want := []string{
+		"init:aaa", "init:bbb", "init:ccc",
+		"start:aaa", "start:bbb", "start:ccc",
+		"stop:ccc", "stop:bbb", "stop:aaa", // 逆序，且依赖 aaa 的 bbb 在 aaa 之前停
+	}
+	if !equalStrings(log, want) {
+		t.Fatalf("启停顺序 = %v\nwant %v", log, want)
+	}
+}
+
+// TestStopTimeoutDoesNotBlock 验证某个插件 Stop 卡死时，整体停机不被拖住（框架层 5s 兜底）。
+func TestStopTimeoutDoesNotBlock(t *testing.T) {
+	old := stopTimeout
+	stopTimeout = 50 * time.Millisecond
+	defer func() { stopTimeout = old }()
+
+	block := make(chan struct{})
+	defer close(block) // 循环结束后放行卡住的 goroutine，避免测试进程泄漏协程
+	hang := &hangPlugin{meta: Meta{Name: "hang"}, block: block}
+	good := &orderPlugin{meta: Meta{Name: "good"}, log: &[]string{}}
+
+	m := newManagerFrom([]Plugin{hang, good})
+	m.InitAll()
+	if _, err := m.StartAll(); err != nil {
+		t.Fatalf("start err: %v", err)
+	}
+
+	start := time.Now()
+	m.StopAll()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("StopAll 被卡死插件拖住 %v（应有 %s 超时兜底）", elapsed, stopTimeout)
+	}
+	if m.infos["hang"].State != StateFailed {
+		t.Fatalf("hang state = %v want failed", m.infos["hang"].State)
+	}
+	if !contains(m.infos["hang"].Error, "timed out") {
+		t.Fatalf("hang error %q 应说明超时", m.infos["hang"].Error)
+	}
+	if m.infos["good"].State != StateStopped {
+		t.Fatalf("good state = %v want stopped（一个插件卡死不应影响其它插件）", m.infos["good"].State)
 	}
 }
 

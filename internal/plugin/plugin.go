@@ -55,6 +55,9 @@ type Meta struct {
 	// Required 标记该插件为「必需」：一旦被白名单/CLI 排除（禁用），
 	// 整个启动必须失败并明确报错（审查 M5 新增）。
 	Required bool
+	// RequiredReason 是 Required=true 时启动失败给出的人可读原因，
+	// 解释「为什么这个插件不能少」；为空则回退到通用说明。
+	RequiredReason string
 }
 
 // Info 是插件的运行时信息快照。
@@ -63,6 +66,8 @@ type Info struct {
 	State     State // 当前生命周期状态
 	Error     string // 失败原因（StateFailed 时为人可读描述）
 	EnabledAt int64  // 启用时间戳（毫秒），未启用为 0
+	StartedAt int64  // 启动时间戳（毫秒），未启动为 0
+	StoppedAt int64  // 停止时间戳（毫秒），未停止为 0
 }
 
 // Plugin 是插件必须实现的接口。

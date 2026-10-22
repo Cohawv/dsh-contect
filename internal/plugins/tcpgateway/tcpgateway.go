@@ -1,0 +1,194 @@
+// Package tcpgateway 是 TCP/NDJSON 长连接接入层插件。
+//
+// 它把传输连接适配为业务内核能理解的 core.Session（session 实现），是所有客户端的
+// 连接入口（Meta.Required=true）。行为必须与历史 internal/adapter/tcp.go 逐字节一致，
+// 以保证长连接链路（注册 → 收发 → 下线事件）在插件化后仍然完整。
+package tcpgateway
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"lan-agent-hub/internal/core"
+	"lan-agent-hub/internal/plugin"
+	"lan-agent-hub/internal/protocol"
+	"lan-agent-hub/internal/transport"
+)
+
+const sendBufferSize = 256
+
+// TCPGateway 是 tcpgateway 插件实体。
+type TCPGateway struct {
+	addr   string
+	hub    *core.Hub
+	ln     transport.Listener
+	done   chan struct{}
+	cancel context.CancelFunc
+}
+
+// Meta 声明插件元信息。
+func (p *TCPGateway) Meta() plugin.Meta {
+	return plugin.Meta{
+		Name:           "tcpgateway",
+		Version:        "1.0.0",
+		Description:    "TCP/NDJSON 长连接接入层，是所有客户端的连接入口",
+		DefaultOn:      true,
+		Required:       true,
+		RequiredReason: "它是连接入口，必须启用；若只需纯内核/HTTP 形态，请改用 -plugin 白名单并保留 tcpgateway",
+	}
+}
+
+// Init 从 Context 取出内核与监听地址。
+func (p *TCPGateway) Init(ctx *plugin.Context) error {
+	hub, ok := ctx.Hub().(*core.Hub)
+	if !ok {
+		return errors.New("tcpgateway: missing *core.Hub in context")
+	}
+	p.hub = hub
+	p.addr = ctx.String("addr", ":8080")
+	return nil
+}
+
+// Start 监听 TCP 并启动 Accept 循环（阻塞于独立 goroutine）。
+func (p *TCPGateway) Start() error {
+	if p.hub == nil {
+		return errors.New("tcpgateway: hub not initialized")
+	}
+	codec := protocol.JSONLine{}
+	ln, err := transport.ListenTCP(p.addr, codec)
+	if err != nil {
+		return fmt.Errorf("tcpgateway listen %s: %w", p.addr, err)
+	}
+	p.ln = ln
+	p.done = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
+	go p.serve(ctx)
+	log.Printf("LAN Agent Hub TCP listening on %s (NDJSON)", p.addr)
+	return nil
+}
+
+// serve 接受连接并驱动读写循环。Stop 时关闭 listener 使 Accept 返回错误退出循环。
+func (p *TCPGateway) serve(ctx context.Context) {
+	defer close(p.done)
+	for {
+		conn, err := p.ln.Accept()
+		if err != nil {
+			// 关闭 listener（Stop）或外部 cancel 都会使 Accept 返回错误；
+			// 优先看 ctx 是否已取消，避免把正常停机的错误当异常处理。
+			if ctx.Err() != nil {
+				return
+			}
+			return
+		}
+		s := newSession(conn)
+		go s.writeLoop()
+		go s.readLoop(p.hub)
+	}
+}
+
+// Stop 关闭 listener 让 Accept 循环退出，并等待 serve 真正结束（最多 5s）。
+func (p *TCPGateway) Stop() error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	if p.ln != nil {
+		_ = p.ln.Close()
+	}
+	if p.done != nil {
+		select {
+		case <-p.done:
+		case <-time.After(5 * time.Second):
+			// 超时：记录但不阻塞整体停机
+			log.Printf("tcpgateway: serve loop did not exit within 5s")
+		}
+	}
+	return nil
+}
+
+func init() {
+	plugin.Register(&TCPGateway{})
+}
+
+// ---------------------------------------------------------------------------
+// 以下为 session 实现（原 adapter/tcp.go 的 TCP 会话逻辑，行为逐字节不变）。
+// ---------------------------------------------------------------------------
+
+// session 是 core.Session 的 TCP 实现。
+// 发送走独立写协程 + 有缓冲信道：业务层 Deliver 永不阻塞，缓冲满则丢弃（背压策略）。
+type session struct {
+	id     string
+	conn   transport.Conn
+	sendCh chan protocol.Envelope
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newSession(conn transport.Conn) *session {
+	return &session{
+		conn:   conn,
+		sendCh: make(chan protocol.Envelope, sendBufferSize),
+		closed: make(chan struct{}),
+	}
+}
+
+func (s *session) ID() string { return s.id }
+
+// Deliver 非阻塞下发；缓冲满则丢弃，连接已关闭时静默返回（不 panic）。
+func (s *session) Deliver(env protocol.Envelope) {
+	defer func() { _ = recover() }()
+	select {
+	case s.sendCh <- env:
+	case <-s.closed:
+	default:
+	}
+}
+
+func (s *session) Close() error {
+	s.once.Do(func() { close(s.closed) })
+	return s.conn.Close()
+}
+
+func (s *session) writeLoop() {
+	for {
+		select {
+		case env := <-s.sendCh:
+			if err := s.conn.Send(env); err != nil {
+				return
+			}
+		case <-s.closed:
+			return
+		}
+	}
+}
+
+// readLoop 读帧 → 交给业务内核；退出时摘除在线记录。
+func (s *session) readLoop(hub *core.Hub) {
+	defer func() {
+		hub.Unregister(s.id)
+		_ = s.Close()
+	}()
+	for {
+		env, err := s.conn.Recv()
+		if err != nil {
+			// 帧内容坏了是可恢复的：回执并继续，与历史行为一致
+			if errors.Is(err, transport.ErrBadFrame) {
+				s.Deliver(protocol.NewEnvelope(protocol.TypeSystem, "hub", s.id, "", map[string]any{
+					"text":   "bad json: " + err.Error(), // 旧契约，保留
+					"action": protocol.ActionError,
+					"code":   protocol.CodeBadJSON,
+				}))
+				continue
+			}
+			return
+		}
+		if env.Type == protocol.TypeRegister {
+			s.id = env.From
+		}
+		hub.HandleEnvelope(s, &env)
+	}
+}
