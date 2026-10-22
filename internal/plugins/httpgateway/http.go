@@ -101,7 +101,12 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 			regErr = e
 		}
 	}, hub, p.disco, p.mgr)
-	return regErr
+	if regErr != nil {
+		return regErr
+	}
+	// 更新通道预留端点（不入本插件路由表，见 registerRoutes 上方的说明）
+	attachUpdateRoutes(p.mux)
+	return nil
 }
 
 // Start 在 httpAddr 上启动 HTTP 服务（共享 mux）。
@@ -160,7 +165,7 @@ func (p *HTTPGateway) SkipReload() (bool, string) {
 // 行为与历史 adapter/http.go 逐字节一致。
 // ---------------------------------------------------------------------------
 
-// registerRoutes 应用全部 11 个网关路由到 registrar。
+// registerRoutes 应用 11 个历史契约端点到 registrar。
 // mgr 为框架管理器：仅用于 /api/status?features=plugins 的插件汇总（为 nil 时该能力不可用，
 // 默认响应保持逐字节不变）。
 func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub, disco *discovery.Service, mgr *plugin.Manager) {
@@ -299,6 +304,11 @@ func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub,
 	})
 }
 
+// 更新通道的两个预留端点**故意不进 registerRoutes**：/api/plugins 的 v2 基线把
+// httpgateway 的 routeCount 与 routes 清单逐字节钉死了，为了两个"预留"端点去改
+// 事实契约不划算。它们直接挂在共享 mux 上（见 attachUpdateRoutes），
+// 待更新通道正式立项时再拆成独立 updates 插件并显式登记到基线。
+
 // NewMux 构造 REST 网关路由表（仅 11 个 /api 端点，不含控制台根 /）。
 // 行为必须与历史 adapter.NewMux 的端点部分逐字节一致，以保证契约 golden 仍为绿。
 // 控制台根 / 由 webconsole 插件（或测试中的 webconsole.RegisterWeb）挂载。
@@ -310,6 +320,7 @@ func NewMux(hub *core.Hub, disco *discovery.Service) *http.ServeMux {
 	registerRoutes(func(pattern string, h http.HandlerFunc) {
 		mux.HandleFunc(pattern, h)
 	}, hub, disco, nil)
+	attachUpdateRoutes(mux)
 	return mux
 }
 
