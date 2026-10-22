@@ -77,7 +77,7 @@ function discoverHub(timeoutMs, port) {
             sendTo(ip);
           }
         }
-      }, Math.min(800, Math.max(300, Math.floor(timeoutMs / 3))));
+      }, 400);
     });
   });
 }
@@ -480,7 +480,7 @@ async function main() {
   let port = HUB_PORT;
   if (HUB_HOST === 'auto' || HUB_HOST === '') {
     try {
-      const f = await discoverHub(2000, DISCOVER_PORT);
+      const f = await discoverHub(5000, DISCOVER_PORT);
       host = f.host;
       port = f.port;
       process.stderr.write('[lan-hub-mcp] discovered hub at ' + host + ':' + port + '\n');

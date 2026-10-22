@@ -13,7 +13,7 @@ var DEFAULT_RECONNECT_MAX_MS = 3e4;
 var CLIENT_PROTO = 3;
 var CLIENT_CAPS = ["structured-ack", "heartbeat-negotiation", "discovery", "agent-caps", "endpoints"];
 var DEFAULT_DISCOVER_PORT = 8082;
-var DEFAULT_DISCOVER_TIMEOUT_MS = 2e3;
+var DEFAULT_DISCOVER_TIMEOUT_MS = 5e3;
 var HubClient = class {
   host;
   port;
@@ -89,6 +89,7 @@ var HubClient = class {
         const found = await this.discover();
         host = found.host;
         port = found.port;
+        this.log(`[lan-hub] discovered hub at ${host}:${port} (auto)`);
       } catch (e) {
         this.log(`[lan-hub] discovery failed: ${e.message}, fallback ${this.fallbackHost}:${this.fallbackPort}`);
         host = this.fallbackHost;
@@ -199,7 +200,7 @@ var HubClient = class {
               sendTo(ip);
             }
           }
-        }, Math.min(800, Math.max(300, Math.floor(DEFAULT_DISCOVER_TIMEOUT_MS / 3))));
+        }, 400);
       });
     });
   }
@@ -414,7 +415,9 @@ var Config = Schema.object({
   autoInject: Schema.boolean().default(false).description("\u6536\u5230\u6D88\u606F\u65F6\u81EA\u52A8\u6CE8\u5165 Agent \u4E0A\u4E0B\u6587"),
   /** 局域网自动发现：把 host 设为 "auto" 即启用，无需手动填 IP */
   autoDiscover: Schema.boolean().default(false).description("host \u4E3A auto \u65F6\u542F\u7528 UDP \u5C40\u57DF\u7F51\u81EA\u52A8\u53D1\u73B0"),
-  discoverPort: Schema.number().default(8082).description("Hub \u53D1\u73B0\u670D\u52A1 UDP \u7AEF\u53E3\uFF08\u4E0E\u670D\u52A1\u7AEF -discover \u4E00\u81F4\uFF09")
+  discoverPort: Schema.number().default(8082).description("Hub \u53D1\u73B0\u670D\u52A1 UDP \u7AEF\u53E3\uFF08\u4E0E\u670D\u52A1\u7AEF -discover \u4E00\u81F4\uFF09"),
+  /** 发现失败时的兜底地址；留空则用 127.0.0.1（手机上等于手机自己，建议显式填 Hub 局域网 IP） */
+  fallbackHost: Schema.string().default("").description("\u81EA\u52A8\u53D1\u73B0\u5931\u8D25\u65F6\u7684\u515C\u5E95 Hub \u5730\u5740")
 });
 function apply(ctx, config) {
   const client = new HubClient({
@@ -428,6 +431,8 @@ function apply(ctx, config) {
     inboxLimit: config.inboxLimit,
     autoDiscover: config.host === "auto" || config.autoDiscover,
     discoverPort: config.discoverPort,
+    fallbackHost: config.fallbackHost || "127.0.0.1",
+    fallbackPort: config.port,
     log: (m) => console.error(m)
   });
   ctx.effect(() => {

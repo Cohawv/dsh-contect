@@ -234,8 +234,12 @@ export DSH_HOME=/root/.dsh
   # 依赖源放容器内部，别依赖 /sdcard
   mkdir -p /root/local-plugins
   cp /sdcard/plugin.tgz /root/local-plugins/plugin.tgz
+  # 覆盖安装前必须删目录 + 升版本号，否则 pnpm 判定已满足会跳过（坑 17）
+  rm -rf /root/.dsh/profiles/web/node_modules/dsh-plugin-lan-hub
   cd /root/.dsh/profiles/web
   dsh plugin --profile web add /root/local-plugins/plugin.tgz 2>&1
+  # 校验真的换了：grep 一个只有新代码才有的字符串
+  grep -c "discovered hub at" /root/.dsh/profiles/web/node_modules/dsh-plugin-lan-hub/dist/index.js
 } > /sdcard/install.log 2>&1
 ```
 
@@ -292,6 +296,8 @@ node -e "fetch('http://127.0.0.1:8081/api/agents').then(r=>r.text()).then(t=>con
 | 14 | `npm pack` 包内缺文件 | `files` 字段未含 `dist` | `files` 加 `dist`；`test/` 不进包 |
 | 15 | 连通性测试永远返回 CONNECT_FAIL，但实际上是通的 | 用了 `(echo > /dev/tcp/...)`——**dash 不支持 `/dev/tcp`**（bash 专有） | 改用 `node -e "net.connect(...)"` 或 `nc -z -w3 ip port` |
 | 16 | DSHA 显示 READY，但 Hub 上看不到 phone-agent | 手机息屏 / App 进后台 → 网络被系统冻结，插件连接 `ETIMEDOUT` | **不用干预**：插件指数退避重连会自动恢复。核实：`grep '\[lan-hub\]' /root/dsh-web.log` |
+| 17 | 改了插件代码，停止→启动后行为**没变**；`dist/index.js` 的 mtime 也不变 | **版本号没升**（仍旧 0.1.0），`dsh plugin add` 判定「依赖已满足」直接跳过，装的是旧包 | **改版本号**（0.1.0→0.1.1）并 `rm -rf /root/.dsh/profiles/web/node_modules/dsh-plugin-lan-hub` 后再 add；装完必须校验：`grep -c "<新代码里的特征串>" dist/index.js` |
+| 18 | 配了 `host: auto`，日志报 `discovery timeout`，最后靠 fallback 连上 | ① 发现超时默认 **2000ms**，本网段 254 个单播扫描来不及（每包还要 ARP）② `fallbackHost` 留空会退回 `127.0.0.1`，在手机上指向手机自己 | 超时提到 **5000ms**、扫描在 400ms 后启动；`fallbackHost` 显式填 Hub 局域网 IP。成功的标志是日志出现 `discovered hub at <ip>:<port> (auto)` |
 
 ---
 
@@ -443,6 +449,44 @@ hub_list_agents, hub_read_messages, hub_send, hub_send_room
 
 > 插件日志前缀是 `[lan-hub]`。容器里 `grep '\[lan-hub\]' /root/dsh-web.log`
 > 可完整看清连接生命周期（含退避间隔），是判断"断线还是没装好"的最快依据。
+
+### 13.1 `host: auto` 局域网自动发现（插件 0.1.1 起，已真机验证）
+
+不用再填电脑 IP：把配置里的 `host` 设成 `auto`，插件会用 UDP 找 Hub。
+
+配置文件 `/root/.dsh/profiles/web/cordis.patch.yml`（**整块替换，字段要写全**）：
+
+```yaml
+- id: lan-hub
+  name: dsh-plugin-lan-hub
+  config:
+    host: 'auto'
+    port: 8080
+    agentId: 'phone-agent'
+    agentName: 'PhoneAgent'
+    heartbeatMs: 15000
+    reconnect: true
+    requestTimeoutMs: 3000
+    inboxLimit: 200
+    autoInject: false
+    autoDiscover: true
+    discoverPort: 8082
+    fallbackHost: '192.0.2.78'
+```
+
+发现策略（三级兜底）：`255.255.255.255` 广播 → 各网卡 `<prefix>.255` 定向广播 → 本网段 `/24` 单播扫描。
+部分 Wi-Fi 会过滤广播，靠第三级命中；`fallbackHost` 是最后保险。
+
+成功的日志长这样（**关键就是第一行**）：
+
+```
+[lan-hub] discovered hub at 192.0.2.78:8080 (auto)
+[lan-hub] connected to 192.0.2.78:8080 as phone-agent
+[lan-hub] negotiated proto=3 heartbeat=15000ms features=[structuredAck,heartbeat,discovery,agentCaps,endpoints]
+```
+
+服务端交叉验证：`curl -s http://127.0.0.1:8081/api/agents` 应看到
+`{"id":"phone-agent","proto":3,"caps":[5 项全量]}`。
 
 参考资料（PC 侧仓库，根 `D:/AI-Agent/vibe/Agent-core-contect`）：
 - `dsh/README.md` —— DSHA 安装章节、配置写法

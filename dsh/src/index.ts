@@ -44,6 +44,8 @@ export const Config: Schema<Config> = Schema.object({
   /** 局域网自动发现：把 host 设为 "auto" 即启用，无需手动填 IP */
   autoDiscover: Schema.boolean().default(false).description('host 为 auto 时启用 UDP 局域网自动发现'),
   discoverPort: Schema.number().default(8082).description('Hub 发现服务 UDP 端口（与服务端 -discover 一致）'),
+  /** 发现失败时的兜底地址；留空则用 127.0.0.1（手机上等于手机自己，建议显式填 Hub 局域网 IP） */
+  fallbackHost: Schema.string().default('').description('自动发现失败时的兜底 Hub 地址'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -58,6 +60,8 @@ export function apply(ctx: Context, config: Config) {
     inboxLimit: config.inboxLimit,
     autoDiscover: config.host === 'auto' || config.autoDiscover,
     discoverPort: config.discoverPort,
+    fallbackHost: config.fallbackHost || '127.0.0.1',
+    fallbackPort: config.port,
     log: (m) => console.error(m),
   })
 

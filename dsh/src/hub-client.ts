@@ -86,7 +86,7 @@ const CLIENT_PROTO = 3
  */
 const CLIENT_CAPS = ['structured-ack', 'heartbeat-negotiation', 'discovery', 'agent-caps', 'endpoints']
 const DEFAULT_DISCOVER_PORT = 8082
-const DEFAULT_DISCOVER_TIMEOUT_MS = 2000
+const DEFAULT_DISCOVER_TIMEOUT_MS = 5000
 
 export class HubClient {
   private readonly host: string
@@ -170,6 +170,7 @@ export class HubClient {
         const found = await this.discover()
         host = found.host
         port = found.port
+        this.log(`[lan-hub] discovered hub at ${host}:${port} (auto)`)
       } catch (e) {
         this.log(`[lan-hub] discovery failed: ${(e as Error).message}, fallback ${this.fallbackHost}:${this.fallbackPort}`)
         host = this.fallbackHost
@@ -279,7 +280,7 @@ export class HubClient {
               sendTo(ip)
             }
           }
-        }, Math.min(800, Math.max(300, Math.floor(DEFAULT_DISCOVER_TIMEOUT_MS / 3))))
+        }, 400)
       })
     })
   }
