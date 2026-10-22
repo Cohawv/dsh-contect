@@ -201,6 +201,15 @@ OUT=/sdcard/your.log
 终端页：  新建终端 (1020,602)   终端主体 (600,1400)
 ```
 
+**另一机型：华为 YAL-AL10（1080×2340，Android 10）** —— `uiautomator dump` 常报
+`ERROR: could not get idle state`（启动页日志区持续刷新导致），此时改为 `screencap` 截图目测坐标：
+
+```
+底部导航 4 个按钮：x≈130 / 400 / 670 / 944 ，y≈2272
+终端主体 (540,1400)   启动 DSHA (540,430)   停止 (760,700)
+换算：截图宽度 500px → 实际 1080，系数 2.16；截图高度 1030 → 2340，系数 2.27
+```
+
 ### 5.2 页面文本读取
 
 ```bash
@@ -298,6 +307,7 @@ node -e "fetch('http://127.0.0.1:8081/api/agents').then(r=>r.text()).then(t=>con
 | 16 | DSHA 显示 READY，但 Hub 上看不到 phone-agent | 手机息屏 / App 进后台 → 网络被系统冻结，插件连接 `ETIMEDOUT` | **不用干预**：插件指数退避重连会自动恢复。核实：`grep '\[lan-hub\]' /root/dsh-web.log` |
 | 17 | 改了插件代码，停止→启动后行为**没变**；`dist/index.js` 的 mtime 也不变 | **版本号没升**（仍旧 0.1.0），`dsh plugin add` 判定「依赖已满足」直接跳过，装的是旧包 | **改版本号**（0.1.0→0.1.1）并 `rm -rf /root/.dsh/profiles/web/node_modules/dsh-plugin-lan-hub` 后再 add；装完必须校验：`grep -c "<新代码里的特征串>" dist/index.js` |
 | 18 | 配了 `host: auto`，日志报 `discovery timeout`，最后靠 fallback 连上 | ① 发现超时默认 **2000ms**，本网段 254 个单播扫描来不及（每包还要 ARP）② `fallbackHost` 留空会退回 `127.0.0.1`，在手机上指向手机自己 | 超时提到 **5000ms**、扫描在 400ms 后启动；`fallbackHost` 显式填 Hub 局域网 IP。成功的标志是日志出现 `discovered hub at <ip>:<port> (auto)` |
+| 19 | 两台手机都连上 Hub，但只剩一台在线、另一台被反复顶掉 | 两台 `agentId` 相同（都叫 `phone-agent`），Hub 按 id 注册，后到的覆盖先到的 | **一机一个 agentId**（如 `phone-agent` / `huawei-agent`），`agentName` 同步区分 |
 
 ---
 
@@ -487,6 +497,12 @@ hub_list_agents, hub_read_messages, hub_send, hub_send_room
 
 服务端交叉验证：`curl -s http://127.0.0.1:8081/api/agents` 应看到
 `{"id":"phone-agent","proto":3,"caps":[5 项全量]}`。
+
+> **多台手机**：每台必须用**不同 `agentId`**（`phone-agent` / `huawei-agent` …），
+> 否则在 Hub 上按 id 注册会互相顶掉，表现为「明明连上了却只剩一台在线」（坑 19）。
+
+> **`dsh plugin add` 会触发插件热重载**：实测装完包 + 改完配置后，无需「停止→启动」，
+> 日志就直接出现新的 `discovered hub at ... (auto)`。若改的是 bundle 层或不生效，再走 §6.3。
 
 参考资料（PC 侧仓库，根 `D:/AI-Agent/vibe/Agent-core-contect`）：
 - `dsh/README.md` —— DSHA 安装章节、配置写法
