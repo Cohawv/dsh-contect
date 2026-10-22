@@ -49,8 +49,13 @@ node scripts/probe.js 8099 2 demo   # 协议探针：查看不同版本下的注
 | `internal/protocol` | 对外契约：Envelope、类型、版本协商、编解码 | 无（叶子包） |
 | `internal/core` | 业务内核：注册、路由、房间、上下线事件 | 仅 protocol |
 | `internal/transport` | 通信实现：NDJSON over TCP（可插拔换 WebSocket） | 仅 protocol |
-| `internal/adapter` | 把传输连接适配为业务 Session；HTTP 网关 | core + transport |
-| `cmd/hub` | 装配与启动 | 全部 |
+| `internal/plugin` | 插件框架：生命周期、拓扑排序、共享 mux、配置与插件可见窄接口 | protocol |
+| `internal/plugins/*` | 内置插件：tcpgateway / httpgateway / webconsole / discovery / sweeper / autobrowser … | plugin（+ 各自叶子依赖） |
+| `cmd/hub` | 装配与启动（`plugins.go` 收口内置插件清单） | 全部 |
+
+业务层通过 `core.Session` 接口下发消息，完全不感知 TCP / 序列化 / 连接管理。
+**所有能力都是插件**（V3 起）：原 `internal/adapter` 已解散，能力迁入 `internal/plugins/*`；
+新增能力只需新建插件目录 + `init()` 注册 + 在 `cmd/hub/plugins/plugins.go` 加一行 blank import。
 
 业务层通过 `core.Session` 接口下发消息，完全不感知 TCP / 序列化 / 连接管理。
 
