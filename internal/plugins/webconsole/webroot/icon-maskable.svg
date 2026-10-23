@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="LAN Agent Hub">
+  <title>LAN Agent Hub</title>
+  <!-- maskable：底色铺满整幅，图形收缩到中心约 60%（落在 80% 安全圆内），
+       保证被系统裁成圆角方形 / 圆形时不会缺角。 -->
+  <rect x="0" y="0" width="512" height="512" fill="#0b0e14" />
+  <g transform="translate(256 256) scale(0.6) translate(-256 -256)">
+    <g fill="none" stroke="#00f0ff" stroke-width="26" stroke-linecap="round">
+      <path d="M144 144 204 204" />
+      <path d="M368 144 308 204" />
+      <path d="M144 368 204 308" />
+      <path d="M368 368 308 308" />
+    </g>
+    <g fill="#00f0ff">
+      <circle cx="112" cy="112" r="46" />
+      <circle cx="400" cy="112" r="46" />
+      <circle cx="112" cy="400" r="46" />
+      <circle cx="400" cy="400" r="46" />
+    </g>
+    <circle cx="256" cy="256" r="74" fill="#00f0ff" />
+    <circle cx="256" cy="256" r="30" fill="#0b0e14" />
+  </g>
+</svg>

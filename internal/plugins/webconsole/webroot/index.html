@@ -3,11 +3,18 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>LAN Agent Hub · 控制台</title>
+  <title data-i18n="app.title">LAN Agent Hub · 控制台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2300f0ff' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Ccircle cx='4' cy='4' r='2'/%3E%3Ccircle cx='20' cy='4' r='2'/%3E%3Ccircle cx='4' cy='20' r='2'/%3E%3Ccircle cx='20' cy='20' r='2'/%3E%3Cpath d='M6 5.5 9.7 10M17.3 10 21 5.5M6 18.5 9.7 14M17.3 14 21 18.5'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="styles.css" />
+  <!-- V7 ③ PWA：可安装 / 离线可用（图标为 SVG，无二进制资源） -->
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#00f0ff" />
+  <link rel="apple-touch-icon" href="icon.svg" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 </head>
 <body>
+  <a class="skip-link" href="#main" data-i18n="a11y.skip">跳到主内容</a>
   <div class="app">
     <!-- 侧边导航 -->
     <aside class="sidebar">
@@ -26,31 +33,31 @@
       </div>
       <nav class="nav" aria-label="主导航">
         <button class="nav__item is-active" data-view="overview" type="button">
-          <span class="nav__icon">▦</span><span class="nav__label">概览</span>
+          <span class="nav__icon">▦</span><span class="nav__label" data-i18n="nav.overview">概览</span>
         </button>
         <button class="nav__item" data-view="agents" type="button">
-          <span class="nav__icon">☻</span><span class="nav__label">在线 Agent</span>
+          <span class="nav__icon">☻</span><span class="nav__label" data-i18n="nav.agents">在线 Agent</span>
         </button>
         <button class="nav__item" data-view="rooms" type="button">
-          <span class="nav__icon">⌬</span><span class="nav__label">聊天室</span>
+          <span class="nav__icon">⌬</span><span class="nav__label" data-i18n="nav.rooms">聊天室</span>
         </button>
         <button class="nav__item" data-view="messaging" type="button">
-          <span class="nav__icon">✉</span><span class="nav__label">发送消息</span>
+          <span class="nav__icon">✉</span><span class="nav__label" data-i18n="nav.messaging">发送消息</span>
         </button>
         <button class="nav__item" data-view="events" type="button">
-          <span class="nav__icon">⚡</span><span class="nav__label">事件流</span>
+          <span class="nav__icon">⚡</span><span class="nav__label" data-i18n="nav.events">事件流</span>
         </button>
         <button class="nav__item" data-view="plugins" type="button">
-          <span class="nav__icon">▤</span><span class="nav__label">插件</span>
+          <span class="nav__icon">▤</span><span class="nav__label" data-i18n="nav.plugins">插件</span>
         </button>
         <button class="nav__item" data-view="logs" type="button">
-          <span class="nav__icon">≡</span><span class="nav__label">日志</span>
+          <span class="nav__icon">≡</span><span class="nav__label" data-i18n="nav.logs">日志</span>
         </button>
         <button class="nav__item" data-view="settings" type="button">
-          <span class="nav__icon">⚙</span><span class="nav__label">设置</span>
+          <span class="nav__icon">⚙</span><span class="nav__label" data-i18n="nav.settings">设置</span>
         </button>
         <button class="nav__item" data-view="about" type="button">
-          <span class="nav__icon">ℹ</span><span class="nav__label">服务信息</span>
+          <span class="nav__icon">ℹ</span><span class="nav__label" data-i18n="nav.about">服务信息</span>
         </button>
       </nav>
       <div class="sidebar__foot">
@@ -59,17 +66,25 @@
     </aside>
 
     <!-- 主区域 -->
-    <main class="main">
+    <main class="main" id="main" tabindex="-1">
       <header class="topbar">
         <div>
-          <h1 class="page-title" id="page-title">概览</h1>
-          <p class="page-sub" id="page-sub">局域网多 Agent 通信中枢运行状态</p>
+          <h1 class="page-title" id="page-title" data-i18n="view.overview.title">概览</h1>
+          <p class="page-sub" id="page-sub" data-i18n="view.overview.sub">局域网多 Agent 通信中枢运行状态</p>
         </div>
         <div class="topbar__actions">
-          <span class="status-pill" id="conn-pill" data-state="connecting" aria-live="polite">
+          <span class="status-pill" id="conn-pill" data-state="connecting" role="status" aria-live="polite">
             <span class="status-pill__dot"></span>
-            <span class="status-pill__text">重连中</span>
+            <span class="status-pill__text" data-i18n="conn.reconnecting">重连中</span>
           </span>
+          <!-- V7 ④ i18n：语言下拉。选项由 /api/i18n/ 的清单动态构建，此处只留一个默认项兜底。 -->
+          <div class="lang">
+            <label class="sr-only" for="lang-select" data-i18n="i18n.switch">切换语言</label>
+            <select class="lang__select" id="lang-select" autocomplete="off">
+              <option value="zh-CN" data-i18n="i18n.lang.zh-CN">简体中文</option>
+            </select>
+            <span class="lang__missing muted" id="i18n-status" hidden></span>
+          </div>
           <button class="btn btn--ghost" id="cmdk-open" type="button" title="命令面板（Ctrl/⌘+K）">
             <span class="btn__icon" aria-hidden="true">⌘</span> 命令面板
             <kbd class="kbd">Ctrl K</kbd>
@@ -77,13 +92,13 @@
           <label class="switch" title="冻结面板：事件流与指标同时暂停（排查用）">
             <input type="checkbox" id="panel-freeze" />
             <span class="switch__track"><span class="switch__thumb"></span></span>
-            <span class="switch__label">冻结面板</span>
+            <span class="switch__label" data-i18n="topbar.freeze">冻结面板</span>
           </label>
           <span class="muted" id="freeze-hint"></span>
           <label class="switch" title="自动刷新（每 5 秒）">
             <input type="checkbox" id="auto-refresh" />
             <span class="switch__track"><span class="switch__thumb"></span></span>
-            <span class="switch__label">自动刷新</span>
+            <span class="switch__label" data-i18n="topbar.autoRefresh">自动刷新</span>
           </label>
           <button class="btn btn--ghost" id="refresh-btn" type="button">
             <span class="btn__icon" aria-hidden="true">↻</span> 刷新
@@ -101,9 +116,9 @@
         </div>
         <div class="card">
           <div class="card__head">
-            <h2>指标概览 <span class="muted" id="metrics-updated">—</span></h2>
+            <h2><span data-i18n="overview.metrics.title">指标概览</span> <span class="muted" id="metrics-updated">—</span></h2>
             <div class="card__tools">
-              <span class="muted">消息速率与在线数趋势（原生 SVG 绘制，零图表库）</span>
+              <span class="muted" data-i18n="overview.metrics.hint">消息速率与在线数趋势（原生 SVG 绘制，零图表库）</span>
             </div>
           </div>
           <div class="card__body">
@@ -112,7 +127,7 @@
             </div>
             <div class="trend">
               <div class="trend__head">
-                <span class="trend__title">在线 Agent 与消息速率趋势（最近 15 个采样点）</span>
+                <span class="trend__title" data-i18n="overview.trend.title">在线 Agent 与消息速率趋势（最近 15 个采样点）</span>
                 <span class="trend__legend">
                   <span class="trend__dot"></span>agents_online
                   <span class="trend__dot trend__dot--rate"></span>消息速率（条/秒）
@@ -125,14 +140,14 @@
         </div>
         <div class="card">
           <div class="card__head">
-            <h2>快速操作</h2>
+            <h2 data-i18n="overview.quick.title">快速操作</h2>
           </div>
           <div class="card__body quick-grid">
-            <button class="btn btn--primary" data-goto="agents" type="button">查看在线 Agent</button>
-            <button class="btn btn--primary" data-goto="rooms" type="button">管理聊天室</button>
-            <button class="btn btn--primary" data-goto="messaging" type="button">发送一条消息</button>
-            <button class="btn btn--ghost" data-goto="logs" type="button">查看服务端日志</button>
-            <button class="btn btn--ghost" data-goto="about" type="button">查看服务信息</button>
+            <button class="btn btn--primary" data-goto="agents" type="button" data-i18n="overview.quick.agents">查看在线 Agent</button>
+            <button class="btn btn--primary" data-goto="rooms" type="button" data-i18n="overview.quick.rooms">管理聊天室</button>
+            <button class="btn btn--primary" data-goto="messaging" type="button" data-i18n="overview.quick.messaging">发送一条消息</button>
+            <button class="btn btn--ghost" data-goto="logs" type="button" data-i18n="overview.quick.logs">查看服务端日志</button>
+            <button class="btn btn--ghost" data-goto="about" type="button" data-i18n="overview.quick.about">查看服务信息</button>
           </div>
         </div>
       </section>
@@ -141,17 +156,18 @@
       <section class="view" data-view="agents" hidden>
         <div class="card">
           <div class="card__head">
-            <h2>在线 Agent <span class="count-badge" id="agents-count">0</span></h2>
+            <h2><span data-i18n="agents.title">在线 Agent</span> <span class="count-badge" id="agents-count" aria-live="polite">0</span></h2>
             <div class="card__tools">
-              <input class="input input--search" id="agents-search" type="search" placeholder="筛选 ID / 名称…" aria-label="筛选 Agent" />
+              <input class="input input--search" id="agents-search" type="search" placeholder="筛选 ID / 名称…" data-i18n-placeholder="agents.search" aria-label="筛选 Agent" />
             </div>
           </div>
           <div class="card__body">
             <div class="table-wrap" id="agents-table-wrap">
               <table class="table" id="agents-table">
+                <caption class="sr-only">在线 Agent 列表（ID、名称、协议、能力、最近活跃、操作）</caption>
                 <thead>
                   <tr>
-                    <th>ID</th><th>名称</th><th>协议</th><th>能力 (caps)</th><th>最近活跃</th><th>操作</th>
+                    <th scope="col">ID</th><th scope="col" data-i18n="agents.th.name">名称</th><th scope="col" data-i18n="agents.th.proto">协议</th><th scope="col" data-i18n="agents.th.caps">能力 (caps)</th><th scope="col" data-i18n="agents.th.lastSeen">最近活跃</th><th scope="col" data-i18n="agents.th.action">操作</th>
                   </tr>
                 </thead>
                 <tbody id="agents-tbody"></tbody>
@@ -164,31 +180,31 @@
       <!-- 聊天室 -->
       <section class="view" data-view="rooms" hidden>
         <div class="card">
-          <div class="card__head"><h2>我的身份</h2></div>
+          <div class="card__head"><h2 data-i18n="rooms.identity.title">我的身份</h2></div>
           <div class="card__body">
             <form class="form--inline" novalidate>
               <div class="field">
-                <label class="label" for="my-id">我的 Agent ID</label>
-                <input class="input" id="my-id" type="text" placeholder="用于加入 / 离开房间" />
+                <label class="label" for="my-id" data-i18n="rooms.identity.label">我的 Agent ID</label>
+                <input class="input" id="my-id" type="text" placeholder="用于加入 / 离开房间" data-i18n-placeholder="rooms.identity.placeholder" />
               </div>
-              <p class="hint">填写后，下方每个聊天室的「加入 / 离开」按钮即可使用，并自动记忆。</p>
+              <p class="hint" data-i18n="rooms.identity.hint">填写后，下方每个聊天室的「加入 / 离开」按钮即可使用，并自动记忆。</p>
             </form>
           </div>
         </div>
         <div class="card">
-          <div class="card__head"><h2>创建聊天室</h2></div>
+          <div class="card__head"><h2 data-i18n="rooms.create.title">创建聊天室</h2></div>
           <div class="card__body">
             <form class="form form--inline" id="create-room-form" novalidate>
               <div class="field">
-                <label class="label" for="room-name">房间名称 *</label>
-                <input class="input" id="room-name" name="name" type="text" placeholder="例如：运维值班" required />
+                <label class="label" for="room-name" data-i18n="rooms.create.name">房间名称 *</label>
+                <input class="input" id="room-name" name="name" type="text" placeholder="例如：运维值班" data-i18n-placeholder="rooms.create.namePlaceholder" required />
               </div>
               <div class="field field--grow">
-                <label class="label" for="room-members">初始成员（可选，逗号分隔 ID）</label>
-                <input class="input" id="room-members" name="members" type="text" placeholder="agentA, agentB" />
+                <label class="label" for="room-members" data-i18n="rooms.create.members">初始成员（可选，逗号分隔 ID）</label>
+                <input class="input" id="room-members" name="members" type="text" placeholder="agentA, agentB" data-i18n-placeholder="rooms.create.membersPlaceholder" />
               </div>
               <div class="field field--action">
-                <button class="btn btn--primary" type="submit" id="create-room-btn">创建</button>
+                <button class="btn btn--primary" type="submit" id="create-room-btn" data-i18n="rooms.create.submit">创建</button>
               </div>
             </form>
           </div>
@@ -202,89 +218,89 @@
       <section class="view" data-view="messaging" hidden>
         <div class="card">
           <div class="card__head">
-            <h2>消息时间线 <span class="muted" id="inbox-id"></span></h2>
+            <h2><span data-i18n="msg.timeline.title">消息时间线</span> <span class="muted" id="inbox-id"></span></h2>
             <div class="card__tools">
               <span class="muted">按会话分组 · 最新在顶部 · 点击消息可复制 JSON（来自 <code>msg.content</code> 实时流）</span>
-              <button class="btn btn--ghost" id="inbox-clear" type="button">清空</button>
+              <button class="btn btn--ghost" id="inbox-clear" type="button" data-i18n="msg.clear">清空</button>
             </div>
           </div>
           <div class="card__body">
             <div class="inbox" id="inbox-list">
               <div class="empty-state">
                 <div class="empty-state__icon">✉</div>
-                <div class="empty-state__title">暂无消息</div>
-                <div class="empty-state__text">发送或接收的消息会出现在这里。先在「聊天室」里填写你的 Agent ID，发出的消息会标记为「我发出」，收到的会标记为「发给我 / 房间」。</div>
+                <div class="empty-state__title" data-i18n="msg.emptyTitle">暂无消息</div>
+                <div class="empty-state__text" data-i18n="msg.emptyText">发送或接收的消息会出现在这里。先在「聊天室」里填写你的 Agent ID，发出的消息会标记为「我发出」，收到的会标记为「发给我 / 房间」。</div>
               </div>
             </div>
           </div>
         </div>
 
         <div class="card">
-          <div class="card__head"><h2>点对点消息</h2></div>
+          <div class="card__head"><h2 data-i18n="msg.direct.title">点对点消息</h2></div>
           <div class="card__body">
             <form class="form" id="send-direct-form" novalidate>
               <div class="form-row">
                 <div class="field">
-                  <label class="label" for="d-from">发送方 ID *</label>
-                  <input class="input" id="d-from" name="from" type="text" placeholder="本端 Agent ID" required />
+                  <label class="label" for="d-from" data-i18n="msg.direct.from">发送方 ID *</label>
+                  <input class="input" id="d-from" name="from" type="text" placeholder="本端 Agent ID" data-i18n-placeholder="msg.direct.fromPlaceholder" required />
                 </div>
                 <div class="field">
-                  <label class="label" for="d-to">接收方 ID *</label>
-                  <input class="input" id="d-to" name="to" type="text" placeholder="目标 Agent ID" required />
+                  <label class="label" for="d-to" data-i18n="msg.direct.to">接收方 ID *</label>
+                  <input class="input" id="d-to" name="to" type="text" placeholder="目标 Agent ID" data-i18n-placeholder="msg.direct.toPlaceholder" required />
                 </div>
               </div>
               <div class="field">
-                <label class="label" for="d-text">消息内容 *</label>
-                <textarea class="input input--area" id="d-text" name="text" rows="3" placeholder="输入要发送的文本…" required></textarea>
+                <label class="label" for="d-text" data-i18n="msg.direct.text">消息内容 *</label>
+                <textarea class="input input--area" id="d-text" name="text" rows="3" placeholder="输入要发送的文本…" data-i18n-placeholder="msg.direct.textPlaceholder" required></textarea>
               </div>
               <div class="form-actions">
-                <button class="btn btn--primary" type="submit" id="send-direct-btn">发送</button>
+                <button class="btn btn--primary" type="submit" id="send-direct-btn" data-i18n="msg.direct.submit">发送</button>
               </div>
             </form>
           </div>
         </div>
 
         <div class="card">
-          <div class="card__head"><h2>房间消息</h2></div>
+          <div class="card__head"><h2 data-i18n="msg.roomMsg.title">房间消息</h2></div>
           <div class="card__body">
             <form class="form" id="send-room-form" novalidate>
               <div class="form-row">
                 <div class="field">
-                  <label class="label" for="r-from">发送方 ID *</label>
-                  <input class="input" id="r-from" name="from" type="text" placeholder="本端 Agent ID" required />
+                  <label class="label" for="r-from" data-i18n="msg.roomMsg.from">发送方 ID *</label>
+                  <input class="input" id="r-from" name="from" type="text" placeholder="本端 Agent ID" data-i18n-placeholder="msg.direct.fromPlaceholder" required />
                 </div>
                 <div class="field">
-                  <label class="label" for="r-room">房间 ID *</label>
-                  <input class="input" id="r-room" name="roomId" type="text" placeholder="room-xxxxxxxx" required />
+                  <label class="label" for="r-room" data-i18n="msg.roomMsg.room">房间 ID *</label>
+                  <input class="input" id="r-room" name="roomId" type="text" placeholder="room-xxxxxxxx" data-i18n-placeholder="msg.roomMsg.roomPlaceholder" required />
                 </div>
               </div>
               <div class="field">
-                <label class="label" for="r-text">消息内容 *</label>
-                <textarea class="input input--area" id="r-text" name="text" rows="3" placeholder="输入要发送的文本…" required></textarea>
+                <label class="label" for="r-text" data-i18n="msg.roomMsg.text">消息内容 *</label>
+                <textarea class="input input--area" id="r-text" name="text" rows="3" placeholder="输入要发送的文本…" data-i18n-placeholder="msg.roomMsg.textPlaceholder" required></textarea>
               </div>
               <div class="form-actions">
-                <button class="btn btn--primary" type="submit" id="send-room-btn">发送到房间</button>
+                <button class="btn btn--primary" type="submit" id="send-room-btn" data-i18n="msg.roomMsg.submit">发送到房间</button>
               </div>
             </form>
           </div>
         </div>
 
         <div class="card">
-          <div class="card__head"><h2>全员广播</h2></div>
+          <div class="card__head"><h2 data-i18n="msg.conv.broadcast">全员广播</h2></div>
           <div class="card__body">
             <form class="form" id="broadcast-form" novalidate>
               <div class="form-row">
                 <div class="field">
-                  <label class="label" for="b-from">发送方 ID *</label>
-                  <input class="input" id="b-from" name="from" type="text" placeholder="本端 Agent ID" required />
+                  <label class="label" for="b-from" data-i18n="msg.broadcast.from">发送方 ID *</label>
+                  <input class="input" id="b-from" name="from" type="text" placeholder="本端 Agent ID" data-i18n-placeholder="msg.direct.fromPlaceholder" required />
                 </div>
               </div>
               <div class="field">
-                <label class="label" for="b-text">广播内容 *</label>
-                <textarea class="input input--area" id="b-text" name="text" rows="3" placeholder="向所有在线 Agent 广播…" required></textarea>
+                <label class="label" for="b-text" data-i18n="msg.broadcast.text">广播内容 *</label>
+                <textarea class="input input--area" id="b-text" name="text" rows="3" placeholder="向所有在线 Agent 广播…" data-i18n-placeholder="msg.broadcast.textPlaceholder" required></textarea>
               </div>
               <div class="form-actions">
-                <button class="btn btn--primary" type="submit" id="broadcast-btn">广播</button>
+                <button class="btn btn--primary" type="submit" id="broadcast-btn" data-i18n="msg.broadcast.submit">广播</button>
               </div>
             </form>
           </div>
@@ -295,15 +311,15 @@
       <section class="view" data-view="events" hidden>
         <div class="card">
           <div class="card__head">
-            <h2>事件流 <span class="count-badge" id="events-count">0</span></h2>
+            <h2><span data-i18n="ev.title">事件流</span> <span class="count-badge" id="events-count" aria-live="polite">0</span></h2>
             <div class="card__tools">
               <span class="muted" id="events-buffered"></span>
               <label class="switch" title="暂停画面排查：暂停期间事件继续缓冲，恢复后补显，不漏一条">
                 <input type="checkbox" id="events-pause" />
                 <span class="switch__track"><span class="switch__thumb"></span></span>
-                <span class="switch__label">暂停</span>
+                <span class="switch__label" data-i18n="ev.pause">暂停</span>
               </label>
-              <button class="btn btn--ghost" id="events-clear" type="button">清空</button>
+              <button class="btn btn--ghost" id="events-clear" type="button" data-i18n="logs.clear">清空</button>
             </div>
           </div>
           <div class="card__body">
@@ -316,13 +332,13 @@
             <div class="ev-filters">
               <div class="ev-chips" id="event-type-filters" role="group" aria-label="事件类型过滤（可多选）"></div>
               <input class="input input--search" id="events-agent" type="search"
-                     placeholder="按 Agent 筛选…" aria-label="按 Agent 筛选事件" />
+                     placeholder="按 Agent 筛选…" aria-label="按 Agent 筛选事件" data-i18n-placeholder="ev.agentFilter" />
             </div>
             <div class="ev-list" id="event-list">
               <div class="empty-state">
                 <div class="empty-state__icon">⚡</div>
-                <div class="empty-state__title">等待事件…</div>
-                <div class="empty-state__text">实时事件会按时间倒序出现在这里。</div>
+                <div class="empty-state__title" data-i18n="ev.emptyWaiting">等待事件…</div>
+                <div class="empty-state__text" data-i18n="ev.emptyText">实时事件会按时间倒序出现在这里。</div>
               </div>
             </div>
           </div>
@@ -333,7 +349,7 @@
       <section class="view" data-view="plugins" hidden>
         <div class="card">
           <div class="card__head">
-            <h2>插件 <span class="count-badge" id="plugins-count">0</span></h2>
+            <h2><span data-i18n="plugins.title">插件</span> <span class="count-badge" id="plugins-count">0</span></h2>
             <div class="card__tools">
               <span class="muted" id="plugins-summary">—</span>
               <button class="btn btn--ghost" id="plugins-reload" type="button">
@@ -347,8 +363,8 @@
               <table class="table table--plugins" id="plugins-table">
                 <thead>
                   <tr>
-                    <th>启用</th><th>名称</th><th>版本</th><th>状态</th>
-                    <th>用途</th><th>依赖</th><th>路由</th><th>启停</th>
+                    <th scope="col" data-i18n="plugins.th.enabled">启用</th><th scope="col" data-i18n="rooms.create.name">名称</th><th scope="col" data-i18n="plugins.th.version">版本</th><th scope="col" data-i18n="plugins.th.state">状态</th>
+                    <th scope="col" data-i18n="plugins.th.usage">用途</th><th scope="col" data-i18n="plugins.th.deps">依赖</th><th scope="col" data-i18n="plugins.th.routes">路由</th><th scope="col" data-i18n="plugins.th.toggle">启停</th>
                   </tr>
                 </thead>
                 <tbody id="plugins-tbody">
@@ -367,21 +383,21 @@
       <section class="view" data-view="logs" hidden>
         <div class="card">
           <div class="card__head">
-            <h2>服务端日志 <span class="count-badge" id="logs-count">0</span></h2>
+            <h2><span data-i18n="logs.title">服务端日志</span> <span class="count-badge" id="logs-count">0</span></h2>
             <div class="card__tools">
               <select class="select select--sm" id="logs-level" aria-label="日志级别过滤">
-                <option value="">全部级别</option>
-                <option value="info">info 及以上</option>
-                <option value="warn">warn 及以上</option>
-                <option value="error">仅 error</option>
+                <option value="" data-i18n="logs.levelAll">全部级别</option>
+                <option value="info" data-i18n="logs.levelInfo">info 及以上</option>
+                <option value="warn" data-i18n="logs.levelWarn">warn 及以上</option>
+                <option value="error" data-i18n="logs.levelError">仅 error</option>
               </select>
               <label class="switch" title="暂停自动滚动，方便仔细看某一行">
                 <input type="checkbox" id="logs-pause" />
                 <span class="switch__track"><span class="switch__thumb"></span></span>
-                <span class="switch__label">暂停滚动</span>
+                <span class="switch__label" data-i18n="logs.pauseScroll">暂停滚动</span>
               </label>
-              <button class="btn btn--ghost" id="logs-export" type="button">导出文本</button>
-              <button class="btn btn--ghost" id="logs-clear" type="button">清空视图</button>
+              <button class="btn btn--ghost" id="logs-export" type="button" data-i18n="logs.export">导出文本</button>
+              <button class="btn btn--ghost" id="logs-clear" type="button" data-i18n="logs.clear">清空视图</button>
             </div>
           </div>
           <div class="card__body">
@@ -392,8 +408,8 @@
             <div class="log-list" id="log-list">
               <div class="empty-state">
                 <div class="empty-state__icon">≡</div>
-                <div class="empty-state__title">正在连接日志流…</div>
-                <div class="empty-state__text">若长时间无内容，请检查 logview 插件是否启用。</div>
+                <div class="empty-state__title" data-i18n="logs.emptyConnecting">正在连接日志流…</div>
+                <div class="empty-state__text" data-i18n="logs.emptyHint">若长时间无内容，请检查 logview 插件是否启用。</div>
               </div>
             </div>
           </div>
@@ -404,11 +420,11 @@
       <section class="view" data-view="settings" hidden>
         <div class="card">
           <div class="card__head">
-            <h2>插件设置</h2>
+            <h2 data-i18n="settings.title">插件设置</h2>
             <div class="card__tools">
-              <button class="btn btn--ghost" id="settings-export" type="button">导出当前配置</button>
-              <button class="btn btn--ghost" id="settings-reload" type="button">重新载入</button>
-              <button class="btn btn--primary" id="settings-save" type="button">保存设置</button>
+              <button class="btn btn--ghost" id="settings-export" type="button" data-i18n="settings.export">导出当前配置</button>
+              <button class="btn btn--ghost" id="settings-reload" type="button" data-i18n="settings.reload">重新载入</button>
+              <button class="btn btn--primary" id="settings-save" type="button" data-i18n="settings.save">保存设置</button>
             </div>
           </div>
           <div class="card__body">
@@ -428,7 +444,7 @@
       <!-- 服务信息 -->
       <section class="view" data-view="about" hidden>
         <div class="card">
-          <div class="card__head"><h2>服务状态</h2></div>
+          <div class="card__head"><h2 data-i18n="about.service.title">服务状态</h2></div>
           <div class="card__body">
             <dl class="kv" id="about-kv">
               <div class="skeleton skeleton-line"></div>
@@ -436,12 +452,12 @@
           </div>
         </div>
         <div class="card">
-          <div class="card__head"><h2>接入端点</h2></div>
+          <div class="card__head"><h2 data-i18n="about.endpoints.title">接入端点</h2></div>
           <div class="card__body">
             <ul class="endpoint-list">
-              <li><code>TCP :8080</code><span class="muted">NDJSON 长连接（Agent 接入）</span></li>
-              <li><code>HTTP :8081</code><span class="muted">REST 网关 + 本控制台</span></li>
-              <li><code>UDP :8082</code><span class="muted">局域网自动发现（Beacon）</span></li>
+              <li><code>TCP :8080</code><span class="muted" data-i18n="about.tcp.desc">NDJSON 长连接（Agent 接入）</span></li>
+              <li><code>HTTP :8081</code><span class="muted" data-i18n="about.http.desc">REST 网关 + 本控制台</span></li>
+              <li><code>UDP :8082</code><span class="muted" data-i18n="about.udp.desc">局域网自动发现（Beacon）</span></li>
             </ul>
             <p class="hint">可用 REST 接口：<code>/api/status</code> · <code>/api/agents</code> · <code>/api/rooms</code> · <code>/api/send</code> · <code>/api/room</code> · <code>/api/broadcast</code> · <code>/api/create_room</code> · <code>/api/join</code> · <code>/api/leave</code> · <code>/api/discover</code> · <code>/api/plugins</code> · <code>/api/settings</code> · <code>/api/manifest</code></p>
             <p class="hint">V5 可观测性接口：<code>/api/logs</code> · <code>/api/logs/stream</code> · <code>/api/stream</code>（SSE）· <code>/api/stream/stats</code> · <code>/metrics</code>（Prometheus）· <code>/api/metrics/summary</code> · <code>/healthz</code> · <code>/readyz</code> · <code>/api/health/detail</code></p>
@@ -456,7 +472,7 @@
   <div class="cmdk" id="cmdk" hidden role="dialog" aria-modal="true" aria-label="命令面板">
     <div class="cmdk__backdrop" data-cmdk-close></div>
     <div class="cmdk__panel">
-      <input class="cmdk__input" id="cmdk-input" type="text" placeholder="搜索视图或操作…"
+      <input class="cmdk__input" id="cmdk-input" type="text" placeholder="搜索视图或操作…" data-i18n-placeholder="cmd.searchPlaceholder"
              aria-label="命令面板搜索框" autocomplete="off" spellcheck="false" />
       <ul class="cmdk__list" id="cmdk-list" role="listbox" aria-label="命令结果"></ul>
       <div class="cmdk__hint">
@@ -471,5 +487,17 @@
   <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
 
   <script src="app.js"></script>
+  <script>
+    // V7 ③：注册 Service Worker（零依赖静态资源，失败静默降级为普通网页）。
+    // SSE（/api/stream、/api/logs/stream）由页面直连，SW 不代理 —— 见 sw.js 的 SSE_PATHS 旁路规则。
+    (function () {
+      if (!('serviceWorker' in navigator)) return;
+      if (window.LanHubPWA && typeof window.LanHubPWA.registerSW === 'function') {
+        window.LanHubPWA.registerSW();
+        return;
+      }
+      navigator.serviceWorker.register('sw.js').catch(function () {});
+    })();
+  </script>
 </body>
 </html>

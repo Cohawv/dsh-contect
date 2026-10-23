@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="LAN Agent Hub">
+  <title>LAN Agent Hub</title>
+  <g fill="none" stroke="#00f0ff" stroke-width="26" stroke-linecap="round">
+    <path d="M144 144 204 204" />
+    <path d="M368 144 308 204" />
+    <path d="M144 368 204 308" />
+    <path d="M368 368 308 308" />
+  </g>
+  <g fill="#00f0ff">
+    <circle cx="112" cy="112" r="46" />
+    <circle cx="400" cy="112" r="46" />
+    <circle cx="112" cy="400" r="46" />
+    <circle cx="400" cy="400" r="46" />
+  </g>
+  <circle cx="256" cy="256" r="74" fill="#00f0ff" />
+  <circle cx="256" cy="256" r="30" fill="#0b0e14" />
+</svg>
