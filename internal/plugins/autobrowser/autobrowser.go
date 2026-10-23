@@ -80,6 +80,11 @@ func (p *AutoBrowser) Init(ctx *plugin.Context) error {
 	p.open = ctx.Bool("open", true)
 	// 插件实例是进程级单例：先清掉上一次装配的残留。
 	p.url = url
+	// 双 Init 幂等：上一轮 Start 起的 goroutine 还拿着旧 done，先关掉再换新的
+	// （否则旧 goroutine 的取消信道失效，Stop 关的永远是新 done——契约测试抓出）。
+	if p.done != nil {
+		close(p.done)
+	}
 	// 每次装配换一个全新的取消信道——上一轮 Stop 关掉的那个不能复用。
 	p.done = make(chan struct{})
 	return nil

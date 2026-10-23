@@ -108,7 +108,11 @@ func (p *Store) Init(ctx *plugin.Context) error {
 	if err != nil {
 		return fmt.Errorf("store: 打开存储失败: %w", err)
 	}
-	p.engine.Store(eng)
+	// Init 幂等：替换前关闭旧引擎，避免双 Init 泄漏 messages.log 句柄
+	// （插件契约测试抓出：C8 要求 Init 可重复调用）。
+	if old := p.engine.Swap(eng); old != nil {
+		_ = old.Close()
+	}
 
 	// 挂接核心钩子（store import core，依赖方向单向；core 不 import store）。
 	hub.Router.SetMessageSink(p)

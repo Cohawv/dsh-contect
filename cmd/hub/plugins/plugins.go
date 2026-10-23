@@ -18,6 +18,7 @@ import (
 	_ "lan-agent-hub/internal/plugins/realtime"    // SSE 实时推送（/api/stream）
 	_ "lan-agent-hub/internal/plugins/ack"         // 投递确认与对账（V6 ②）
 	_ "lan-agent-hub/internal/plugins/capdir"      // 能力目录与按能力选人（V6 ②）
+	_ "lan-agent-hub/internal/plugins/file"        // Agent 间文件传输：分片/sha256/TTL（V6 ④）
 	_ "lan-agent-hub/internal/plugins/group"       // 分组与定向路由（V6 ②）
 	_ "lan-agent-hub/internal/plugins/scheduler"   // 定时任务：发消息/调 API/插件开关（V6 ③）
 	_ "lan-agent-hub/internal/plugins/webhook"     // 事件外发 Webhook：签名/重试/熔断（V6 ③）

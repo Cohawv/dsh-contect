@@ -164,9 +164,6 @@ func (p *Webhook) Init(ctx *plugin.Context) error {
 	p.client = &http.Client{Timeout: p.timeout}
 	p.now = func() int64 { return time.Now().UnixMilli() }
 	p.sleep = time.Sleep
-	p.subs = make(map[string]*subscription)
-	p.unsubs = make(map[string]func())
-	p.brk = make(map[string]*urlBreaker)
 
 	subs, err := parseSubscriptions(ctx.String("subscriptions", "[]"))
 	if err != nil {
@@ -183,8 +180,21 @@ func (p *Webhook) Init(ctx *plugin.Context) error {
 		return err
 	}
 
+	// 幂等：双 Init 时先退订上一轮的总线订阅再重置——
+	// 直接重置 unsubs 会丢弃退订函数，旧 topic 订阅永久泄漏（插件契约测试抓出）。
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.unsubs == nil {
+		p.unsubs = make(map[string]func())
+	}
+	for topic, unsub := range p.unsubs {
+		if unsub != nil {
+			unsub()
+		}
+		delete(p.unsubs, topic)
+	}
+	p.subs = make(map[string]*subscription)
+	p.brk = make(map[string]*urlBreaker)
 	for _, s := range subs {
 		s.fromConfig = true
 		p.subs[s.ID] = s

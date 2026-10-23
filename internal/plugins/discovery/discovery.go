@@ -84,7 +84,11 @@ func (p *Discovery) Init(ctx *plugin.Context) error {
 		return errors.New("discovery: missing *core.Hub in context")
 	}
 	p.hub = hub
-	// 插件实例是进程级单例，先清掉上一次装配的残留（避免读到旧 Service）。
+	// 插件实例是进程级单例，先停掉上一次装配的残留（避免双 Init 泄漏 UDP socket，
+	// 与 store/webhook 同款幂等修复——插件契约测试抓出）。
+	if p.svc != nil {
+		p.svc.Stop()
+	}
 	p.svc = nil
 	p.bindAddr = ""
 
