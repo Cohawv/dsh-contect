@@ -52,7 +52,7 @@ func TestRegisteredAckGating(t *testing.T) {
 	var content map[string]any
 	cfg := EndpointsCfg{HeartbeatMs: DefaultHeartbeatMs, TimeoutMs: DefaultTimeoutMs, TCPPort: 8080, HTTPPort: 8081}
 
-	legacy := RegisteredAck("A", nil, ProtoLegacy, cfg)
+	legacy := RegisteredAck("A", nil, ProtoLegacy, cfg, 0)
 	if err := json.Unmarshal(legacy.Content, &content); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestRegisteredAckGating(t *testing.T) {
 		t.Fatalf("legacy text must always be present, got %v", content["text"])
 	}
 
-	v2 := RegisteredAck("A", []string{CapStructuredAck, CapHeartbeatNeg}, ProtoV2, cfg)
+	v2 := RegisteredAck("A", []string{CapStructuredAck, CapHeartbeatNeg}, ProtoV2, cfg, 0)
 	if err := json.Unmarshal(v2.Content, &content); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestRegisteredAckGating(t *testing.T) {
 		t.Fatalf("v2 ack must still carry legacy text, got %v", content["text"])
 	}
 
-	v3 := RegisteredAck("A", []string{CapStructuredAck, CapHeartbeatNeg, CapDiscovery, CapAgentCaps, CapEndpoints}, ProtoCurrent, cfg)
+	v3 := RegisteredAck("A", []string{CapStructuredAck, CapHeartbeatNeg, CapDiscovery, CapAgentCaps, CapEndpoints}, ProtoCurrent, cfg, 0)
 	if err := json.Unmarshal(v3.Content, &content); err != nil {
 		t.Fatal(err)
 	}
@@ -98,6 +98,36 @@ func TestRegisteredAckGating(t *testing.T) {
 	}
 	if ep, _ := content["endpoints"].(map[string]any); ep["tcpPort"] != float64(8080) {
 		t.Fatalf("v3 endpoints must carry tcpPort, got %v", ep)
+	}
+
+	// 未声明 replay cap：即使版本够高，也绝不含 lastSeq（老客户端零变化）。
+	if _, ok := content["lastSeq"]; ok {
+		t.Fatalf("v3 ack without replay cap must not contain lastSeq")
+	}
+}
+
+// TestRegisteredAckReplayGating 验证 lastSeq 仅对声明 replay cap 的客户端下发（V6 ①）。
+func TestRegisteredAckReplayGating(t *testing.T) {
+	cfg := EndpointsCfg{HeartbeatMs: DefaultHeartbeatMs, TimeoutMs: DefaultTimeoutMs, TCPPort: 8080, HTTPPort: 8081}
+
+	// 声明 replay cap：应携带 lastSeq。
+	withReplay := RegisteredAck("A", []string{CapReplay}, ProtoCurrent, cfg, 42)
+	var c map[string]any
+	if err := json.Unmarshal(withReplay.Content, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c["lastSeq"] != float64(42) {
+		t.Fatalf("ack with replay cap must carry lastSeq=42, got %v", c["lastSeq"])
+	}
+
+	// 不声明 replay cap：不应携带 lastSeq。用全新 map 接收，避免 Unmarshal 合并污染。
+	without := RegisteredAck("A", []string{}, ProtoCurrent, cfg, 42)
+	var c2 map[string]any
+	if err := json.Unmarshal(without.Content, &c2); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c2["lastSeq"]; ok {
+		t.Fatalf("ack without replay cap must not carry lastSeq")
 	}
 }
 

@@ -29,6 +29,12 @@ type Hub struct {
 	// 清扫观测字段（V3 新增，供 V5 metrics 使用）。
 	muSweep     sync.RWMutex
 	LastSweepAt int64 // 上次 SweepLoop 实际执行清理的时间戳（毫秒）
+
+	// replayProvider 是「离线消息回放」钩子（V6 ① store 注入）。为 nil 时（未挂载
+	// store 或已停用）重连不补发，行为退化为历史一致。
+	muReplay        sync.Mutex
+	replayProvider  ReplayProvider
+	lastSeqProvider func() int64 // 当前已持久化的最大 seq（store 注入；nil 时为 0）
 }
 
 func NewHub() *Hub {
@@ -67,20 +73,69 @@ func NewHub() *Hub {
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
+// SetReplayProvider 注入「离线消息回放」钩子（由 store 插件在 Init 时调用）。
+// 传 nil 即卸载（store 被运行期停用时调用）。仅由装配期 / 插件启停调用。
+func (h *Hub) SetReplayProvider(f ReplayProvider) {
+	h.muReplay.Lock()
+	h.replayProvider = f
+	h.muReplay.Unlock()
+}
+
+// replayProviderLocked 读取当前回放钩子（nil 安全）。
+func (h *Hub) replayProviderLocked() ReplayProvider {
+	h.muReplay.Lock()
+	f := h.replayProvider
+	h.muReplay.Unlock()
+	return f
+}
+
+// SetLastSeqProvider 注入「当前已持久化最大 seq」读取器（由 store 插件在 Init 时调用）。
+// 传 nil 即卸载。
+func (h *Hub) SetLastSeqProvider(f func() int64) {
+	h.muReplay.Lock()
+	h.lastSeqProvider = f
+	h.muReplay.Unlock()
+}
+
+// LastSeq 返回当前已持久化的消息序号上限（无 store 时为 0）。
+func (h *Hub) LastSeq() int64 {
+	h.muReplay.Lock()
+	defer h.muReplay.Unlock()
+	if h.lastSeqProvider != nil {
+		return h.lastSeqProvider()
+	}
+	return 0
+}
+
 // HandleEnvelope 处理一条来自 sess 的信封（纯业务分发，不感知传输与编码）。
 func (h *Hub) HandleEnvelope(sess Session, env *protocol.Envelope) {
 	switch env.Type {
 	case protocol.TypeRegister:
 		var p struct {
-			Name string   `json:"name"`
-			Caps []string `json:"caps"`
+			Name     string   `json:"name"`
+			Caps     []string `json:"caps"`
+			SinceSeq int64    `json:"sinceSeq"` // V6 ①：声明 replay cap 的客户端携带，用于离线消息回放
 		}
 		_ = protocol.UnmarshalContent(env.Content, &p)
 		// 版本协商：服务端迁就客户端
 		proto := protocol.Negotiate(env.V)
 		a := h.Registry.Bind(env.From, p.Name, p.Caps, proto, sess)
-		a.Deliver(protocol.RegisteredAck(env.From, p.Caps, proto, h.ackCfg()))
+		// V6 ①：声明 replay cap 的客户端，注册回执带 lastSeq（当前已持久化的最大 seq）。
+		// 未声明的客户端拿不到该字段，行为退化为历史一致。
+		var lastSeq int64
+		if protocol.HasCap(p.Caps, protocol.CapReplay) {
+			lastSeq = h.LastSeq()
+		}
+		a.Deliver(protocol.RegisteredAck(env.From, p.Caps, proto, h.ackCfg(), lastSeq))
 		h.Bus.Publish(protocol.TopicAgentOnline, env.From)
+
+		// V6 ①：声明 replay cap 且携带 sinceSeq 的客户端，补发离线期间（seq > sinceSeq）
+		// 与其相关的消息。回放在 ack 之后异步进行（直接复用当前会话下发）。
+		if protocol.HasCap(p.Caps, protocol.CapReplay) && p.SinceSeq > 0 {
+			if replay := h.replayProviderLocked(); replay != nil {
+				replay(sess, env.From, p.SinceSeq)
+			}
+		}
 
 	case protocol.TypeHeartbeat:
 		h.Registry.Touch(env.From)

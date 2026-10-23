@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"lan-agent-hub/internal/protocol"
@@ -38,6 +39,11 @@ type Router struct {
 
 	// bus 为 nil 时不发布（单测直连场景），行为与 V4 一致。
 	bus *EventBus
+
+	// sink 是「消息落盘」钩子（V6 ① store 注入）。为 nil 时（未挂载 store 或已停用）
+	// 静默跳过，行为与历史完全一致。热路径只做一次指针读取，不阻塞。
+	mu   sync.Mutex
+	sink MessageSink
 }
 
 func NewRouter(reg *Registry, rooms *RoomService) *Router {
@@ -47,6 +53,23 @@ func NewRouter(reg *Registry, rooms *RoomService) *Router {
 // SetBus 注入事件总线。仅由 NewHub 在装配期调用一次（此后只读，无需加锁）。
 func (rt *Router) SetBus(bus *EventBus) {
 	rt.bus = bus
+}
+
+// SetMessageSink 注入「消息落盘」钩子（由 store 插件在 Init 时调用）。
+// 传 nil 即卸载（store 被运行期停用时调用，使持久化立即停掉，行为与无 store 一致）。
+// 仅由装配期 / 插件启停调用，热路径 Route 只读取，不在此加锁竞争。
+func (rt *Router) SetMessageSink(sink MessageSink) {
+	rt.mu.Lock()
+	rt.sink = sink
+	rt.mu.Unlock()
+}
+
+// messageSink 读取当前钩子（热路径用，nil 安全）。
+func (rt *Router) messageSink() MessageSink {
+	rt.mu.Lock()
+	s := rt.sink
+	rt.mu.Unlock()
+	return s
 }
 
 // Route 分配 seq 后按目标转发。
@@ -82,6 +105,13 @@ func (rt *Router) Route(env protocol.Envelope) string {
 		Delivered: delivered,
 		Seq:       env.Seq,
 	})
+
+	// V6 ①：把已路由完成的信封交给消息落盘钩子（store）。
+	// 必须在 seq / ts 分配之后调用，且调用方拿到的 env 是值拷贝（含 Seq / TS），
+	// store 不会反向修改路由态。钩子为 nil 时静默跳过——热路径仅一次指针读取。
+	if s := rt.messageSink(); s != nil {
+		s.Append(env)
+	}
 	return missed
 }
 

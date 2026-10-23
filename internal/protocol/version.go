@@ -36,6 +36,7 @@ var ServerCaps = []string{
 	"discovery",             // 局域网自动发现（UDP 广播 + 单播探测）
 	"agent-caps",            // list 回执携带各 agent 的 caps/proto
 	"endpoints",             // 注册回执下发 tcp/http 端点
+	"replay",                // 离线消息回放（声明后注册回执带 lastSeq、可携带 sinceSeq 续传）
 }
 
 // HasCap 判断能力集中是否包含某个能力。
@@ -57,7 +58,10 @@ func HasCap(caps []string, want string) bool {
 //     因此仅在协商版本 >= 2 时下发（版本门控）；
 //   - features / clientCaps / endpoints 是 v3 新增，仅在 proto >= 3 时下发，
 //     且 features 内部仍按客户端声明的 cap 逐位门控。
-func RegisteredAck(agentID string, clientCaps []string, proto int, hb EndpointsCfg) Envelope {
+//   - lastSeq 仅在客户端声明 replay cap 时下发（V6 ①），告知客户端「服务端已持久化的
+//     最大消息序号」，便于客户端携带 sinceSeq 做离线回放；老客户端与不声明 replay 的
+//     客户端永远看不到该字段。
+func RegisteredAck(agentID string, clientCaps []string, proto int, hb EndpointsCfg, lastSeq int64) Envelope {
 	content := map[string]any{
 		"text":    "registered as " + agentID,
 		"action":  ActionRegistered,
@@ -76,6 +80,10 @@ func RegisteredAck(agentID string, clientCaps []string, proto int, hb EndpointsC
 		if ComputeFeatures(proto, clientCaps).Endpoints {
 			content["endpoints"] = Endpoints{TCPPort: hb.TCPPort, HTTPPort: hb.HTTPPort}
 		}
+	}
+	// replay cap 门控：仅声明 replay 的客户端收到 lastSeq（V6 ①）。
+	if HasCap(clientCaps, CapReplay) {
+		content["lastSeq"] = lastSeq
 	}
 	return NewEnvelope(TypeSystem, "hub", agentID, "", content)
 }

@@ -18,6 +18,9 @@ const (
 	CapAgentCaps = "agent-caps"
 	// endpoints：注册回执下发服务端 tcp/http 端点信息。
 	CapEndpoints = "endpoints"
+	// replay：声明本客户端支持「离线消息回放」——注册时携带 sinceSeq，服务端据此补发
+	// 离线期间与其相关的消息；注册回执也会带 lastSeq。不声明该 cap 的客户端行为零变化。
+	CapReplay = "replay"
 )
 
 // CapSet 是能力集合的便捷封装。
