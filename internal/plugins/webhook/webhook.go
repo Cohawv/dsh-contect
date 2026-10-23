@@ -137,7 +137,7 @@ func (p *Webhook) Options() []plugin.OptionDef {
 				"\"method\"?,\"headers\"?,\"secret\"?}]；event 必须是已知 topic",
 		},
 		{Key: "retries", Type: plugin.OptionInt, Default: defaultRetries, Min: minRetries, Max: maxRetries,
-			Description: "失败重试次数（不含首次；退避 500ms/2s）"},
+			Description: "投递尝试总次数（含首次；1=不重试。两次尝试间退避 500ms/2s）"},
 		{Key: "timeoutMs", Type: plugin.OptionInt, Default: defaultTimeoutMs, Min: 100, Max: 60000,
 			Description: "单次投递超时（毫秒）"},
 		{Key: "maxHistory", Type: plugin.OptionInt, Default: defaultMaxHistory, Min: 10, Max: 500,
@@ -422,11 +422,13 @@ func (p *Webhook) handleWebhooks(w http.ResponseWriter, r *http.Request) {
 }
 
 // listWebhooks 返回全部订阅（含健康态），按 ID 升序。
+// 值拷贝快照：编码在锁外进行，若直接拷指针，markResult 持锁写 Healthy 会与
+// JSON 编码读 Healthy 构成数据竞争（QA 独立验证抓出，D1）。
 func (p *Webhook) listWebhooks(w http.ResponseWriter) {
 	p.mu.RLock()
-	out := make([]*subscription, 0, len(p.subs))
+	out := make([]subscription, 0, len(p.subs))
 	for _, s := range p.subs {
-		out = append(out, s)
+		out = append(out, *s)
 	}
 	p.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })

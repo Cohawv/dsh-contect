@@ -571,3 +571,78 @@ func TestApplyHotUpdateKeepsRuntimeSubs(t *testing.T) {
 		t.Fatal("热更新非法 JSON 应报错")
 	}
 }
+
+// TestListConcurrentWithMarkResult：并发下列表编码与健康态写入互不破坏。
+// 回归 D1（QA 独立验证抓出）：listWebhooks 曾锁外经 *subscription 指针编码，
+// markResult 持锁写 Healthy 构成同字段并发读写；修为值拷贝后编码读的是快照。
+// 有 -race 环境时本测试即竞争探针；无 race 环境也验证并发下形状与计数稳定。
+func TestListConcurrentWithMarkResult(t *testing.T) {
+	wh, _ := webhookRig(t, nil)
+	for i := 0; i < 8; i++ {
+		doJSON(t, wh.handleWebhooks, http.MethodPost, "/api/webhooks",
+			fmt.Sprintf(`{"id":"wh%d","event":"agent.offline","url":"http://127.0.0.1:1/h%d"}`, i, i))
+	}
+
+	// 写侧：持续把订阅标记为不健康/健康（markResult 持锁写 Healthy）。
+	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			wh.mu.RLock()
+			subs := make([]*subscription, 0, len(wh.subs))
+			for _, s := range wh.subs {
+				subs = append(subs, s)
+			}
+			wh.mu.RUnlock()
+			for _, s := range subs {
+				wh.markResult(s, s.URL, false)
+				wh.markResult(s, s.URL, true)
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+	}()
+
+	// 读侧：4 个 goroutine 各做 200 次列表请求（编码在锁外进行）。
+	errCh := make(chan error, 4)
+	var readers sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for i := 0; i < 200; i++ {
+				rec := httptest.NewRecorder()
+				wh.handleWebhooks(rec, httptest.NewRequest(http.MethodGet, "/api/webhooks", nil))
+				if rec.Code != http.StatusOK {
+					errCh <- fmt.Errorf("列表应 200，实得 %d", rec.Code)
+					return
+				}
+				var list struct {
+					Webhooks []subscription `json:"webhooks"`
+				}
+				if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+					errCh <- fmt.Errorf("解码列表: %v", err)
+					return
+				}
+				if len(list.Webhooks) != 8 {
+					errCh <- fmt.Errorf("列表应 8 条，实得 %d", len(list.Webhooks))
+					return
+				}
+			}
+		}()
+	}
+	readers.Wait()
+	close(stop)
+	<-writerDone
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("并发列表出错: %v", err)
+	default:
+	}
+}
