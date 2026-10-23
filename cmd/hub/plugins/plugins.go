@@ -17,6 +17,8 @@ import (
 	_ "lan-agent-hub/internal/plugins/plugininfo"  // 管理 API（插件清单/开关/设置/部署清单）
 	_ "lan-agent-hub/internal/plugins/realtime"    // SSE 实时推送（/api/stream）
 	_ "lan-agent-hub/internal/plugins/ack"         // 投递确认与对账（V6 ②）
+	_ "lan-agent-hub/internal/plugins/capdir"      // 能力目录与按能力选人（V6 ②）
+	_ "lan-agent-hub/internal/plugins/group"       // 分组与定向路由（V6 ②）
 	_ "lan-agent-hub/internal/plugins/store"       // 消息持久化与离线回放（纯标准库；零外部依赖）
 	_ "lan-agent-hub/internal/plugins/sweeper"     // 心跳超时连接周期清理
 	_ "lan-agent-hub/internal/plugins/tcpgateway"  // TCP/NDJSON 长连接接入（Required）

@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"lan-agent-hub/internal/core"
+	"lan-agent-hub/internal/hubbridge"
 	"lan-agent-hub/internal/plugin"
 	"lan-agent-hub/internal/plugins/plugininfo"
 
@@ -96,6 +97,10 @@ func main() {
 	if err := mgr.BuildContext(hub); err != nil {
 		log.Fatalf("build context: %v", err)
 	}
+	// V6 ②：把内核能力（只读视图 + 发布能力）接进框架。此前 Publisher/HubView
+	// 一直是空实现——声明了接口却没有生产消费方。group 插件（V6b）是第一个
+	// 真实使用者：分组路由经 Publisher.Send 发消息，动态组成员经 View.Agents 解析。
+	mgr.SetHub(hubbridge.NewView(hub), hubbridge.NewPublisher(hub))
 	mgr.InitAll()
 	// StartAll 返回启动结果表 + 致命错误（必需插件被禁用，或必需插件 Start 失败，如端口被占）。
 	// 失败时先把每个失败插件的原因打出来，再退出——否则「双击两次 EXE / 端口被占」会变成

@@ -37,9 +37,26 @@ const (
 	TopicRoomChanged  = "room.changed"
 	// TopicMsgRouted 一条消息完成路由（载荷只放计数与 kind，不放整个信封）。
 	TopicMsgRouted = "msg.routed"
+	// TopicGroupChanged 分组集合发生变化（V6 ② group 插件发布：组的创建/删除/成员变更）。
+	//
+	// 与 room.changed 同构：组的增删是低频管理动作，载荷带组名与解析后的成员快照，
+	// 供控制台实时刷新组视图；不订阅的客户端零感知。
+	TopicGroupChanged = "group.changed"
 	// TopicHTTPRequest 一次 HTTP 请求进入共享 mux（探针端点除外）。
 	TopicHTTPRequest = "http.request"
 )
+
+// GroupChanged 是 protocol.TopicGroupChanged 的事件载荷（V6 ② group 插件发布）。
+//
+// action 取值：created / deleted / updated（成员或定义变更）。
+// Members 是「解析后」的成员快照（静态组为配置成员，动态组为当前在线的匹配 Agent），
+// 订阅方无需再回查一次组定义。
+type GroupChanged struct {
+	Action  string   `json:"action"` // created | deleted | updated
+	Name    string   `json:"name"`
+	Source  string   `json:"source"` // static | dynamic | runtime
+	Members []string `json:"members"`
+}
 
 // AllTopics 返回本包声明的全部事件 topic（供死契约检查遍历）。
 // 新增 topic 常量时**必须**同步加到这里，否则死契约检查看不到它。
@@ -49,6 +66,7 @@ func AllTopics() []string {
 		TopicAgentOffline,
 		TopicRoomChanged,
 		TopicMsgRouted,
+		TopicGroupChanged,
 		TopicHTTPRequest,
 	}
 }
