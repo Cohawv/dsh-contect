@@ -1,10 +1,12 @@
 /**
  * dsh-plugin-lan-hub 构建脚本
  *
- * 产物三个：
- *   dist/index.js           插件主体（DSH 加载的 main）
- *   dist/lanhub-policy.mjs  策略 CLI（单文件，无外部依赖，可作 bin 直接跑）
- *   dist/lanhub-update.mjs  更新通道 CLI（同上）
+ * 产物五个：
+ *   dist/index.js             插件主体（DSH 加载的 main）
+ *   dist/lanhub-policy.mjs    策略 CLI（单文件，无外部依赖，可作 bin 直接跑）
+ *   dist/lanhub-update.mjs    更新通道 CLI —— 消费侧：验签 / 下载 / 预置 / 自检
+ *   dist/lanhub-publish.mjs   发布侧：签名并生成清单（私钥只在构建机）
+ *   dist/lanhub-keygen.mjs    生成 Ed25519 密钥对
  *
  * 为什么必须编译成 JS 发布：
  * Node 的 type stripping 明确不支持 node_modules 下的文件，实测报错
@@ -48,6 +50,9 @@ await build({ ...common, entryPoints: ['src/index.ts'], outfile: 'dist/index.js'
 for (const [entry, out] of [
   ['tools/lanhub-policy.mjs', 'dist/lanhub-policy.mjs'],
   ['tools/lanhub-update.mjs', 'dist/lanhub-update.mjs'],
+  ['tools/lanhub-publish.mjs', 'dist/lanhub-publish.mjs'],
+  ['tools/lanhub-keygen.mjs', 'dist/lanhub-keygen.mjs'],
+  ['tools/lanhub-release.mjs', 'dist/lanhub-release.mjs'],
 ]) {
   await build({ ...common, entryPoints: [entry], outfile: out })
 }

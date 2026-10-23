@@ -51,6 +51,12 @@ LOG=/sdcard/wbconfig.log
     muteNotice: true
     policyFile: '/root/.dsh/lan-hub.policy.json'
     policyPollMs: 1500
+    # 验签公钥：留空则同步器判定 untrusted，不下载不预置。
+    # 这里内联 PEM（而不是路径）——信任根随配置走，不依赖容器里恰好有那个文件。
+    updatePublicKey: |
+      -----BEGIN PUBLIC KEY-----
+      MCowBQYDK2VwAyEAMAH+EyacshC+6Y8/1QPJWYCchINsf/mMjAsOGGDESpo=
+      -----END PUBLIC KEY-----
 PATCH_EOF
   echo "appended"
 

@@ -1,12 +1,15 @@
 {
   "name": "dsh-plugin-lan-hub",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "DeepSeek Harness plugin: join the LAN Agent Hub and chat with other agents (skill / MCP / HTTP / DSH).",
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
     "lanhub-policy": "./dist/lanhub-policy.mjs",
-    "lanhub-update": "./dist/lanhub-update.mjs"
+    "lanhub-update": "./dist/lanhub-update.mjs",
+    "lanhub-publish": "./dist/lanhub-publish.mjs",
+    "lanhub-keygen": "./dist/lanhub-keygen.mjs",
+    "lanhub-release": "./dist/lanhub-release.mjs"
   },
   "files": [
     "dist",

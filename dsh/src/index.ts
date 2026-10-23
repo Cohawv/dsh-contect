@@ -17,6 +17,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
 import { HubClient, type Envelope } from './hub-client.ts'
 import { POLICY_KEYS, POLICY_KEY_SET, normalizePolicy } from './policy.mjs'
+import { createUpdater } from './updater.mjs'
 
 export const name = 'lan-hub'
 
@@ -89,6 +90,24 @@ export interface Config {
   policyFile: string
   /** 策略文件轮询间隔（毫秒）；proot/容器里 inotify 常不可靠，轮询最稳 */
   policyPollMs: number
+
+  // ---------- update ----------
+  /** 定期拉清单比对（只读） */
+  updateAutoSync: boolean
+  /** 验签后下载到缓存 */
+  updateAutoFetch: boolean
+  /** 预置待激活（写 pending.json，不切换） */
+  updateAutoStage: boolean
+  /** 验签公钥（PEM 或路径）。空 = 无法判断来源 = 拒绝自动更新 */
+  updatePublicKey: string
+  /** 清单地址；空则按 host 推导 */
+  updateManifest: string
+  /** 同步间隔（毫秒） */
+  updateIntervalMs: number
+  /** 缓存目录；空用 ~/.dsh/updates */
+  updateCacheDir: string
+  /** 待激活目录；空用 <cache>/staged */
+  updateStagedDir: string
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -120,6 +139,16 @@ export const Config: Schema<Config> = Schema.object({
   // ---------- policy file（热更新通道）----------
   policyFile: Schema.string().default('').description('策略文件路径（JSON，非空即启用轮询）；脚本写它即可热改策略'),
   policyPollMs: Schema.number().default(1500).description('策略文件轮询间隔（毫秒）'),
+
+  // ---------- update（更新通道：只同步，不激活）----------
+  updateAutoSync: Schema.boolean().default(true).description('定期拉取更新清单并比对版本（只读，零风险）'),
+  updateAutoFetch: Schema.boolean().default(true).description('验签通过后下载制品到缓存（不碰安装目录）'),
+  updateAutoStage: Schema.boolean().default(true).description('把已验签的版本预置为待激活（由启动流程切换）'),
+  updatePublicKey: Schema.string().default('').description('验签公钥 PEM 或文件路径；为空则拒绝自动更新'),
+  updateManifest: Schema.string().default('').description('清单地址；留空按 http://<host>:8081/api/updates 推导'),
+  updateIntervalMs: Schema.number().default(600_000).description('同步检查间隔（毫秒，默认 10 分钟）'),
+  updateCacheDir: Schema.string().default('').description('制品缓存目录；留空用 ~/.dsh/updates'),
+  updateStagedDir: Schema.string().default('').description('待激活目录；留空用 <cache>/staged'),
 })
 
 /** 运行时热策略：与连接解耦，可原地更新，不需要重启/重连 */
@@ -240,6 +269,34 @@ export function apply(ctx: Context, initialConfig: Config) {
   }
 
   // -----------------------------------------------------------------
+  // 更新同步：只同步，不安装
+  //
+  // 插件自己绝不执行安装。原因见 src/updater.mjs 顶部——核心是"代码不能热替换"，
+  // 装完不重启就不生效，反而埋下"下次重启悄悄变"的不可观测变更。
+  // 所以这里只做到"预置待激活"，真正的切换交给下一次宿主启动（wb_boot.sh）。
+  // -----------------------------------------------------------------
+  const updater = createUpdater({
+    version: PLUGIN_VERSION,
+    name: 'dsh-plugin-lan-hub',
+    // 清单地址留空时按 host 推导：Hub 的 HTTP 端口是 TCP 端口 +1
+    manifestUrl:
+      config.updateManifest || `http://${config.host === 'auto' ? '127.0.0.1' : config.host}:${Number(config.port) + 1}/api/updates`,
+    publicKey: config.updatePublicKey,
+    cacheDir: config.updateCacheDir || '',
+    stagedDir: config.updateStagedDir || '',
+    autoFetch: config.updateAutoFetch !== false,
+    autoStage: config.updateAutoStage !== false,
+    log,
+  })
+
+  /** 连接建立后自证健康：写入 ok.json，供启动流程判断是否要回滚 */
+  function markHealthyOnce(): void {
+    if (updater.markHealthy()) {
+      log(`[lan-hub] update: ${PLUGIN_VERSION} 已自证健康（写入 ok.json）`)
+    }
+  }
+
+  // -----------------------------------------------------------------
   // 运行时状态
   // -----------------------------------------------------------------
   /** 已 drain、尚未确认消费的消息（唯一中间态：唤醒泵与 read 共用） */
@@ -290,6 +347,11 @@ export function apply(ctx: Context, initialConfig: Config) {
 
   // 插件卸载 / HMR 热替换时：停掉定时器并断开连接
   ctx.effect(() => {
+    // 连上 Hub 即自证健康：此刻若 staged 里有待激活版本且正是本版本，
+    // 说明上次切换成功，写 ok.json 让启动流程不必回滚。
+    // 用 onConnect 而不是 connect() 之后——connect() 不等待 socket 建立，
+    // 且断线重连时也应再确认一次。
+    client.onConnect(() => markHealthyOnce())
     client.connect()
     return () => {
       if (timer) {
@@ -300,12 +362,16 @@ export function apply(ctx: Context, initialConfig: Config) {
         clearInterval(pollTimer)
         pollTimer = null
       }
+      updater.stop()
       client.close()
     }
   })
 
   // 启用策略文件热更新（policyFile 为空则跳过）
   startPolicyPoll()
+
+  // 启用更新同步（updateAutoSync 为 false 则跳过）
+  if (config.updateAutoSync !== false) updater.start(config.updateIntervalMs)
 
   // -----------------------------------------------------------------
   // Agent 句柄绑定
@@ -627,6 +693,32 @@ export function apply(ctx: Context, initialConfig: Config) {
         startPolicyPoll()
       }
 
+      // 更新通道的字段变了：重启同步器（同样不需要重连）
+      const UPDATE_KEYS = [
+        'updateAutoSync',
+        'updateAutoFetch',
+        'updateAutoStage',
+        'updatePublicKey',
+        'updateManifest',
+        'updateIntervalMs',
+        'updateCacheDir',
+        'updateStagedDir',
+      ]
+      if (UPDATE_KEYS.some((k) => (config as any)[k] !== (prev as any)[k])) {
+        updater.reconfigure({
+          manifestUrl:
+            config.updateManifest || `http://${config.host === 'auto' ? '127.0.0.1' : config.host}:${Number(config.port) + 1}/api/updates`,
+          publicKey: config.updatePublicKey,
+          cacheDir: config.updateCacheDir || '',
+          stagedDir: config.updateStagedDir || '',
+          autoFetch: config.updateAutoFetch !== false,
+          autoStage: config.updateAutoStage !== false,
+        })
+        if (config.updateAutoSync !== false) updater.start(config.updateIntervalMs)
+        else updater.stop()
+        log('[lan-hub] update config changed -> syncer restarted (no reconnect)')
+      }
+
       const connChanged = CONNECTION_KEYS.some((k) => (config as any)[k] !== (prev as any)[k])
       if (connChanged) {
         log('[lan-hub] connection config changed -> restart (reconnect)')
@@ -908,6 +1000,7 @@ export function apply(ctx: Context, initialConfig: Config) {
           `muted: turn=${stats.muted.turn ?? 0} rate=${stats.muted.rate ?? 0} hop=${stats.muted.hop ?? 0} manual=${stats.muted.mute ?? 0}`,
           `turns: ${turnLines.length ? turnLines.join(' ') : '-'}`,
           `mute-until: ${muted.length ? muted.join(', ') : '-'}`,
+          updateLine(),
         ].join('\n')
       },
     }),
@@ -916,6 +1009,20 @@ export function apply(ctx: Context, initialConfig: Config) {
   const policyLine = (): string =>
     `policy: autoRespond=${policy.autoRespond} wakeRoom=${policy.wakeRoom} batch=${policy.batchMs}/${policy.maxWaitMs}ms ` +
     `maxAutoTurns=${policy.maxAutoTurns} maxHop=${policy.maxHop} rate=${policy.perPeerPerMin}/peer/min,${policy.globalPerMin}/global/min`
+
+  /**
+   * 更新通道状态。
+   * 专治"为什么没更新"——常见答案是 untrusted（没配公钥）或 up-to-date。
+   */
+  const updateLine = (): string => {
+    const s = updater.state
+    const ago = s.lastCheck ? `${Math.round((Date.now() - s.lastCheck) / 1000)}s ago` : 'never'
+    return (
+      `update: v${PLUGIN_VERSION} | sync=${config.updateAutoSync !== false ? 'on' : 'off'} ` +
+      `status=${s.lastStatus}${s.latest ? ` latest=${s.latest}` : ''} checked=${ago}${s.staged ? ` staged=${s.staged}` : ''}` +
+      (s.lastError ? `\n  last-error: ${s.lastError}` : '')
+    )
+  }
 
   /** 哪些字段不是来自静态配置（file=策略文件，runtime=hub_config） */
   const sourcesLine = (): string => {

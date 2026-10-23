@@ -20,22 +20,31 @@
 
 ```
 dsh/
-├── package.json          # dsh.bundle 声明；main 指向 dist（编译产物）；bin: lanhub-policy
+├── package.json          # dsh.bundle 声明；main 指向 dist（编译产物）；bin: 五个 CLI
 ├── build.mjs             # 构建：src/*.ts + CLI --bundle--> dist（esbuild，默认 minify）
 ├── dist/
-│   ├── index.js          # 实际被 dsh 加载的产物（已随包发布）
-│   ├── lanhub-policy.mjs # 策略 CLI 单文件（bin: lanhub-policy）
-│   └── lanhub-update.mjs # 更新通道 CLI 单文件（bin: lanhub-update）
+│   ├── index.js             # 实际被 dsh 加载的产物（已随包发布）
+│   ├── lanhub-policy.mjs    # 策略 CLI（bin: lanhub-policy）
+│   ├── lanhub-update.mjs    # 更新 CLI · 消费侧（bin: lanhub-update）
+│   ├── lanhub-publish.mjs   # 更新 CLI · 发布侧（bin: lanhub-publish）
+│   ├── lanhub-release.mjs   # 一条龙：构建→打包→发布→Hub 自检（bin: lanhub-release）
+│   └── lanhub-keygen.mjs    # 密钥生成（bin: lanhub-keygen）
 ├── cordis.patch.yml      # 配置层（含全部配置项与默认值）
 ├── src/                  # 不进发布包（已编译进 dist）
 │   ├── index.ts          # 插件入口：apply(ctx, config) + 10 个 tools
 │   ├── hub-client.ts     # 核心客户端（纯 Node，零依赖、零 DSH 依赖）
-│   └── policy.mjs        # 策略规范：字段/类型/默认值/钳制，插件与 CLI 共用
-├── tools/                # lanhub-policy.mjs 源码（不进包）+ wb_*.sh（进包）
+│   ├── policy.mjs        # 策略规范：字段/类型/默认值/钳制，插件与 CLI 共用
+│   ├── signing.mjs       # Ed25519 签名/验签（发布侧与消费侧共用同一份载荷定义）
+│   ├── publish.mjs       # 发布核心：签名 + 写清单 + 分发自检（publish/release 共用）
+│   ├── version.mjs       # 版本比较（插件、更新 CLI、发布 CLI 共用，必须一致）
+│   └── updater.mjs       # 插件内更新同步器（只同步，不安装）
+├── tools/                # CLI 源码（不进包，已编译进 dist）+ wb_*.sh（进包）
 ├── test/
 │   ├── smoke.ts          # 核心客户端端到端测试（需真实 Hub）
 │   ├── plugin-sim.ts     # 插件入口测试（模拟 Cordis 运行时）
-│   ├── update-sim.ts     # 更新通道端到端测试（本地假分发源 + 真实调用 CLI）
+│   ├── update-sim.ts     # 更新 CLI 端到端测试（假分发源 + 真实调用 CLI）
+│   ├── release-sim.ts    # 发布侧端到端测试（真 HTTP 分发源 + 真实调用 CLI）
+│   ├── updater-sim.ts    # 插件内同步器测试（真实签名，覆盖信任闸门与自检）
 │   └── mocks/            # @deepseek-ai/* 的 mock + 解析钩子
 └── README.md
 ```
@@ -188,6 +197,7 @@ Stripping types is currently unsupported for files under node_modules
 | connection | `host/port/agentId/agentName/heartbeatMs/reconnect/requestTimeoutMs/inboxLimit/autoDiscover/discoverPort/fallbackHost` | 插件重启 + 重连（会重新注册，进程内收件箱清空） |
 | policy | `autoRespond/autoInject/wakeRoom/batchMs/maxWaitMs/maxAutoTurns/maxHop/perPeerPerMin/globalPerMin/muteNotice` | 原地生效，**不断连、不重启** |
 | 热更新通道 | `policyFile/policyPollMs` | 只重启轮询器，不重连 |
+| 更新通道 | `updateAutoSync/updateAutoFetch/updateAutoStage/updatePublicKey/updateManifest/updateIntervalMs/updateCacheDir/updateStagedDir` | 只重启同步器，不重连 |
 
 配置由 Schemastery schema 校验并填默认值，无效配置在加载期就报错；
 热更新走 Cordis 的 `internal/update` waterfall——**先校验再切换**，坏配置进不来。
@@ -293,6 +303,137 @@ sh tools/wb_policy.sh set autoRespond=false
 > 脚本无法直接改运行中进程的内存——这是进程隔离决定的。所以"脚本化热更新"
 > = 脚本写文件 + 插件轮询，而不是脚本直接注入。
 
+## 更新通道：默认自动同步，但不在运行中安装
+
+策略能热改，是因为它只是内存里的一个对象；**代码不行**。所以更新被拆成三段，
+只有前两段默认开启：
+
+| 级别 | 默认 | 做什么 | 为什么 |
+|---|---|---|---|
+| `updateAutoSync` | **开** | 定期拉清单比对 | 只读，零风险 |
+| `updateAutoFetch` | **开** | 验签后下载到缓存 | 不动安装目录，删了就是 |
+| `updateAutoStage` | **开** | 预置到待激活区 | 可逆，等于提前铺好 |
+| 激活（切换 + 重启） | **不在运行中执行** | `wb_boot.sh` 在宿主**启动前**切换 | 见下 |
+| 运行中自动重启 | **永不** | — | 会杀掉正在进行的对话 |
+
+**为什么插件自己不安装**（三条，任一条都够）：
+
+1. 代码无法热替换——ESM 模块缓存 + 插件持有的 TCP 长连接。装完不重启就不生效，
+   性质会从"我装的"变成"下次重启悄悄变"，不可观测。
+2. 反正省不掉重启，所以"自动安装"并没有省事，只是把危险动作挪到你不在场时。
+3. 让长跑进程用自身权限替换自己的可执行代码，等于把投毒面从"人手工装包"
+   扩大到"任何能连上 Hub 的设备"。
+
+因此切换点被刻意挪到「进程还没起来」的干净时刻，由 `wb_boot.sh` 执行。
+
+### 信任模型：sha256 不够，必须签名
+
+清单和制品都在同一个 Hub 上，LAN 又无认证。**能改其中一个就能改另一个**，
+所以 sha256 只防传输截断，不防投毒——它证明的是"拿到的和清单说的一致"，
+不是"这包是发布者做的"。
+
+于是：制品带 Ed25519 签名，客户端用**本地 pin 的公钥**验。
+
+- 公钥**绝不能**从清单下载（否则投毒者连公钥一起发，签名自我证明）；
+- 未配置 `updatePublicKey` → 同步器直接判定 `untrusted`，不下载、不预置；
+- 降级攻击（把 `latest` 指回旧的、但确实签过的版本）由**只升不降**兜底。
+
+一把密钥就够，`node:crypto` 原生支持，零新增依赖：
+
+```sh
+lanhub-keygen --out ~/.dsh/lanhub-ed25519     # 私钥留构建机，公钥 pin 到客户端
+lanhub-publish bin/*.tgz --key ~/.dsh/lanhub-ed25519.key.pem --out ./updates
+```
+
+### 公钥怎么"跟着包更新"：锚 + 轮换链 + 撤销
+
+单个公钥写死在客户端，换密钥就得挨个改配置。这里用三层模型：
+
+1. **锚（anchor）**：`updatePublicKey` 配置 / 环境变量 → 否则回退到**包内置公钥**
+   （`trusted-key.mjs`，随 `npm pack` 编进产物）。锚是本地写死的，绝不从清单下载。
+2. **轮换链**：要换钥时 `lanhub-publish --rotate-to <新公钥>`——**当前私钥**给新公钥
+   签一封背书（`nextKey`）写进清单。客户端凭锚验过背书后把新公钥接力进链。链存成
+   **签名轮换记录**，加载时从锚出发**逐环验签重建**：任何一环对不上（含被种植的
+   `trusted-key.json`）整条丢弃，回落到锚。所以同机攻击者无法靠改缓存文件接管信任根。
+3. **撤销（防泄露）**：私钥一旦泄露，它签过的任何版本（含未来高版本）都会被旧根验过，
+   等于永久通行证。`lanhub-publish --revoke <keyId>` 用**当前私钥**签一封吊销声明写进
+   清单 `revocations`；客户端验过签名才把该 keyId 并入本地吊销集（只增不减，跨 Hub 存活）。
+   恶意 Hub 无法凭空吊销诚实钥匙——吊销声明也得过信任链。
+
+> 私钥**永不进包、永不进仓库**。泄露根的最终兜底仍是：重发带新内置根的新包
+> （`--embed`），让所有客户端升级到该包才能继续自动更新。这是根信任的固有局限。
+
+```sh
+lanhub-publish --rotate-to ~/.dsh/lanhub-ed25519-v2.pub.pem   # 声明接班人
+lanhub-publish --revoke 1a2b3c4d                              # 吊销泄露的那把（8 位 hex keyId）
+lanhub-update trust --cache ~/.dsh/updates                     # 看当前信任链与吊销集
+```
+
+### 发布一条龙：lanhub-release
+
+手工发布是四步，而每一步漏掉都对应一种**最隐蔽的事故**：
+
+| 漏掉 | 后果 |
+|---|---|
+| build | 签的是上一版 dist，版本号却是新的——客户端升上去以为拿到了修复 |
+| pack | 发布的是仓库里那个旧 tgz |
+| 自检 | "本地显示发布成功"，但 `pkg/` 里没复制过去 / Hub 的 `LANHUB_UPDATE_DIR` 指向别处，客户端 404 |
+
+```sh
+lanhub-release --key ~/.dsh/lanhub-ed25519/lanhub-ed25519.key.pem \
+               --hub http://192.0.2.78:8081 \
+               --pubkey ~/.dsh/lanhub-ed25519/lanhub-ed25519.pub.pem
+```
+
+四步：**构建 → `npm pack` → 签名发布 → 对真实 Hub 自检**。最后一步用客户端的方式
+（GET 清单 → 解析 url → 下载 → 比 sha256 → 验签）真的取一次——
+**签名对只证明"我写对了"，不证明"分发对了"**。
+
+```sh
+lanhub-release --verify-only --hub http://…   # 只自检，不构建不发布（排障用）
+lanhub-release --dry-run --key <key>          # 全流程试跑，只写临时目录
+lanhub-release --no-build --no-pack ./x.tgz   # dist 已就绪，直接发布指定包
+```
+
+版本真相只有一处：`package.json` 的 version。pack 由它决定文件名，发布再从文件名
+反解版本，三者不一致直接报错。自检失败会以 **exit 1** 结束——发布侧不能假装成功。
+
+> 当前 `cordis.patch.yml` 里已 pin 了本仓库用的公钥（内联 PEM）。换密钥时
+> 必须同时更新所有客户端的配置，否则它们会把新版本判为 `untrusted`（exit 13）。
+
+### 自检回滚
+
+自动更新唯一可靠的安全网。新版本若连不上 Hub，它**也拉不到修复版本**——
+更新源就在 Hub 上——会永久离线。所以：
+
+1. `wb_boot.sh` 切换后启动宿主；
+2. 插件连上 Hub 即写 `ok.json` **自证健康**（版本必须一致才算）；
+3. 连续 2 次启动没有 `ok.json` → 下一次启动时自动装回上一版，并写 `failed.json`。
+
+`stage` 会顺带把**当前版本**也下载进缓存作为回滚包——它通常是正在跑的那个，
+从没被下载过，不预备的话回滚就无从谈起。
+
+### 命令
+
+```sh
+lanhub-update check                  # exit 10 有更新 / 11 不兼容 / 13 不可信
+lanhub-update fetch                  # 验签 + 下载（不动安装目录）
+lanhub-update stage 0.7.0            # 预置待激活（含回滚包）
+lanhub-update pending                # 看待激活 / 尝试 / 健康 / 失败状态
+
+# 启动流程（wb_boot.sh 内部调用，别在运行中的会话里手动跑）
+lanhub-update healthcheck            # 结算上次结果，必要时自动回滚
+lanhub-update activate --yes         # 切换待激活版本
+```
+
+启动宿主：
+
+```sh
+sh wb_boot.sh dsh --profile web ...  # 先处理更新，再拉起宿主
+```
+
+更新环节的失败一律**不阻断启动**——更新是为了更好的运行，不能反过来成为起不来的原因。
+
 ## 体积与运行时开销
 
 优化前后的实测数据（0.4.0 → 0.5.0）：
@@ -369,7 +510,7 @@ sh tools/wb_update.sh check
 
 ```
 updates/lanhub-update.json
-updates/pkg/dsh-plugin-lan-hub-0.6.0.tgz
+updates/pkg/dsh-plugin-lan-hub-0.7.0.tgz
 ```
 
 清单格式：
@@ -380,12 +521,14 @@ updates/pkg/dsh-plugin-lan-hub-0.6.0.tgz
   "latest": "0.6.0",
   "proto": 3,
   "artifacts": {
-    "0.6.0": {
-      "url": "/api/updates/pkg/dsh-plugin-lan-hub-0.6.0.tgz",
+    "0.7.0": {
+      "url": "/api/updates/pkg/dsh-plugin-lan-hub-0.7.0.tgz",
       "sha256": "<小写十六进制>",
-      "size": 31000,
+      "size": 54305,
       "proto": 3,
-      "notes": "一句话变更说明"
+      "notes": "一句话变更说明",
+      "sig": "<Ed25519 签名 base64>",
+      "sigAlgo": "ed25519"
     }
   }
 }
@@ -518,11 +661,29 @@ effect disposer 断开连接、autoInject 注入，以及 autoRespond 的完整�
 以及**真实调用 `tools/lanhub-policy.mjs` 写文件后插件原地生效**（含写入损坏 JSON 时
 保留上一份策略、连接不受影响）。
 
-`update-sim.ts` 覆盖更新通道的 10 条：已是最新（exit 0）、有更新（exit 10）、
-proto 不兼容（exit 11）、sha256 校验与原子落盘、校验失败不留残留文件、
-缺 `--yes` 不执行（exit 12）、确认后真的执行安装命令、缓存损坏被 `verify`/`apply` 拦截、
-回滚自动挑更旧版本、`list --json` 结构可消费。它用本地 HTTP 假分发源 + **真实调用 CLI**，
-测的是进程边界而不是函数 mock。
+`update-sim.ts` 覆盖更新通道 19 条，用本地 HTTP 假分发源 + **真实调用 CLI**，
+测的是进程边界而不是函数 mock。信任模型是重点：未配置公钥（exit 13）、制品未签名
+（exit 13）、sha256 与签名不匹配即投毒（exit 13）、降级被拒；生命周期覆盖
+stage → activate → confirm → healthcheck → 自检回滚，以及"已达尝试上限不得无限重装"。
+
+`updater-sim.ts` 覆盖插件内同步器 10 条，用**真实 Ed25519 密钥**：三种信任失败一律
+不进待激活区、只升不降、验签通过后预置（含回滚包）但不执行安装、
+新版本自证健康才写 `ok.json`（旧版本不会误自证）、清单不可达不影响既有状态。
+
+`keyring-sim.ts` 覆盖**信任根链** 14 条：锚的确定（config > 内置）、轮换背书接受 /
+伪造拒绝 / 无背书拒绝、**被种植的 keyring 被整体丢弃回落到锚**、回滚包仍验得过、
+**撤销**（现任私钥签的吊销被接受并入本地、恶意吊销被忽略）、端到端一次同步完成
+「换钥 + 装新包 + 备回滚包」。
+
+`release-sim.ts` 覆盖**发布侧** 15 条：发布落盘与签名、重复发布被拒、`--revoke` 吊销声明
+写进清单且签名可验、**非法 keyId 被拒**、分发自检全绿、
+无公钥时验签标 skipped、制品被换（同长度）→ sha256 失败、换密钥签名 → 验签失败、
+制品缺失 → 404、latest 指错、清单损坏拒绝重建，以及 CLI 的
+`--verify-only` / 自检失败 exit 1 / `--dry-run` 不污染真实目录 / 缺制品 exit 2。
+
+```sh
+node test/release-sim.ts     # 不需要真实 Hub，自带 HTTP 分发源
+```
 
 ## 在 DSHA 真机上的验证
 

@@ -33,3 +33,27 @@
         # ---------- policy file（热更新通道，见 tools/lanhub-policy.mjs）----------
         policyFile: ''         # 非空即轮询该 JSON 文件；脚本写它即可热改策略
         policyPollMs: 1500
+        # ---------- update（更新通道：只同步，不安装）----------
+        # 插件自己绝不安装/重启——代码不能热替换，装完不重启等于埋一颗
+        # "下次启动悄悄变"的雷。切换由启动流程 wb_boot.sh 在宿主起来前完成。
+        updateAutoSync: true   # 定期拉清单比对（只读）
+        updateAutoFetch: true  # 验签通过后下载到缓存
+        updateAutoStage: true  # 预置为待激活（写 pending.json）
+        # 验签公钥（PEM 或文件路径）。留空也能工作——会回落到**包内置公钥**
+        # （src/trusted-key.mjs，由 lanhub-keygen --embed 生成，随 dist 分发）；
+        # 显式填了就以配置为准。三种来源优先级：轮换链 > 这里 > 内置。
+        #
+        # 换钥不要来改这里：发布侧用 `lanhub-publish --rotate-to <新公钥>`，
+        # 由当前私钥给新公钥背书，老客户端凭旧公钥验过就自己接力（轮换链），
+        # 不必挨台改配置，也就不存在"改漏一台就永远升不上去"。
+        #
+        # 这里直接内联 PEM 而不是写路径：信任根随配置走，不依赖客户端上某个文件
+        # 恰好存在——文件丢了会静默退化成"没有公钥"，那正是最危险的失败方向。
+        updatePublicKey: |
+          -----BEGIN PUBLIC KEY-----
+          MCowBQYDK2VwAyEAMAH+EyacshC+6Y8/1QPJWYCchINsf/mMjAsOGGDESpo=
+          -----END PUBLIC KEY-----
+        updateManifest: ''     # 留空按 http://<host>:<port+1>/api/updates 推导
+        updateIntervalMs: 600000
+        updateCacheDir: ''     # 留空用 ~/.dsh/updates
+        updateStagedDir: ''    # 留空用 <cache>/staged（wb_boot.sh 读这里）

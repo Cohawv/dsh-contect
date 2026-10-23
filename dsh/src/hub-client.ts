@@ -124,6 +124,7 @@ export class HubClient {
   private inbox: Envelope[] = []
   private pending: Pending[] = []
   private listeners: Array<(env: Envelope) => void> = []
+  private connectListeners: Array<() => void> = []
   private heartbeat: ReturnType<typeof setInterval> | null = null
   private retryTimer: ReturnType<typeof setTimeout> | null = null
   private retryDelay = 1_000
@@ -164,6 +165,16 @@ export class HubClient {
   /** 订阅收到的每一帧（用于把消息回灌给 Agent 上下文） */
   onMessage(cb: (env: Envelope) => void): void {
     this.listeners.push(cb)
+  }
+
+  /**
+   * 订阅"已连上并完成注册"（重连也会触发）。
+   *
+   * 用于更新自检：能连上 Hub 就说明新版本没把基本链路搞坏，可据此写 ok.json。
+   * connect() 本身不等待 socket 建立（内部重连是异步的），所以健康判定只能靠这个回调。
+   */
+  onConnect(cb: () => void): void {
+    this.connectListeners.push(cb)
   }
 
   /**
@@ -212,6 +223,13 @@ export class HubClient {
       })
       this.startHeartbeat()
       this.log(`[lan-hub] connected to ${host}:${port} as ${this.agentId}`)
+      for (const cb of this.connectListeners) {
+        try {
+          cb()
+        } catch (e) {
+          this.log(`[lan-hub] onConnect listener error: ${(e as Error).message}`)
+        }
+      }
     })
 
     sock.on('data', (chunk) => this.onData(chunk))
