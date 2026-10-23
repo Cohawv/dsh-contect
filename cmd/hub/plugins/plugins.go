@@ -19,6 +19,8 @@ import (
 	_ "lan-agent-hub/internal/plugins/ack"         // 投递确认与对账（V6 ②）
 	_ "lan-agent-hub/internal/plugins/capdir"      // 能力目录与按能力选人（V6 ②）
 	_ "lan-agent-hub/internal/plugins/group"       // 分组与定向路由（V6 ②）
+	_ "lan-agent-hub/internal/plugins/scheduler"   // 定时任务：发消息/调 API/插件开关（V6 ③）
+	_ "lan-agent-hub/internal/plugins/webhook"     // 事件外发 Webhook：签名/重试/熔断（V6 ③）
 	_ "lan-agent-hub/internal/plugins/store"       // 消息持久化与离线回放（纯标准库；零外部依赖）
 	_ "lan-agent-hub/internal/plugins/sweeper"     // 心跳超时连接周期清理
 	_ "lan-agent-hub/internal/plugins/tcpgateway"  // TCP/NDJSON 长连接接入（Required）
