@@ -190,7 +190,7 @@
     const r = await api('GET', '/api/agents');
     if (!r.ok) {
       setConn('offline', '已断开');
-      tbody.innerHTML = '<tr><td colspan="5"><div class="error-banner">加载失败：' +
+      tbody.innerHTML = '<tr><td colspan="6"><div class="error-banner">加载失败：' +
         esc(r.error) + '<button class="btn btn--ghost" onclick="location.reload()">重试</button></div></td></tr>';
       return;
     }
@@ -209,7 +209,7 @@
       const emptyMsg = agentsCache.length === 0
         ? '当前没有 Agent 在线'
         : '没有匹配的 Agent';
-      tbody.innerHTML = '<tr><td colspan="5"><div class="empty-state">' +
+      tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state">' +
         '<div class="empty-state__icon">☻</div>' +
         '<div class="empty-state__title">' + esc(emptyMsg) + '</div>' +
         '<div class="empty-state__text">' +
@@ -226,6 +226,7 @@
         '<td>' + (a.proto ? ('v' + esc(a.proto)) : '—') + '</td>' +
         '<td><div class="badge-row">' + caps + '</div></td>' +
         '<td>' + esc(fmtAgo(a.lastSeen)) + '</td>' +
+        '<td><button class="btn btn--sm" data-msg="' + esc(a.id) + '" type="button">发消息</button></td>' +
         '</tr>';
     }).join('');
   }
@@ -233,6 +234,16 @@
   /* ---------------- 聊天室 ---------------- */
   let roomsLoaded = false;
   let roomsCache = [];
+
+  // 会话视图状态：我加入的房间集合 + 收件箱（按窗口从 msg.content 流累积）。
+  const myRooms = new Set();
+  let inbox = [];
+  const INBOX_MAX = 200;
+  // 概览消息速率采样（客户端按窗口计数，避免依赖后端逐样本速率字段）。
+  let msgWindow = 0;
+  let msgRateSamples = [];
+  let lastSamples = [];
+  let lastTickTs = 0;
   async function loadRooms() {
     const grid = $('#room-grid');
     if (!roomsLoaded) grid.innerHTML = '<div class="skeleton skeleton-card"></div>';
@@ -274,18 +285,108 @@
     }).join('');
   }
 
-  /* 我的 Agent ID（用于加入/离开），持久化到 localStorage */
+  /* 我的 Agent ID（发送身份 + 加入/离开），持久化到 localStorage */
   function getMyId() { return ($('#my-id') && $('#my-id').value) || localStorage.getItem('lanhub.myId') || ''; }
+
+  // 统一身份：把 id 写入所有「发送方」字段与本地存储，并刷新界面。
+  function applyIdentity(id) {
+    id = (id || '').trim();
+    if (!id) return;
+    localStorage.setItem('lanhub.myId', id);
+    const fields = ['#my-id', '#d-from', '#r-from', '#b-from'];
+    fields.forEach((sel) => {
+      const el = $(sel);
+      if (el && !el.value) el.value = id; // 仅填空字段，避免覆盖用户手改
+    });
+    const badge = $('#inbox-id');
+    if (badge) badge.textContent = '· ' + id;
+    if (roomsLoaded) loadRooms(); // 刷新房间按钮禁用态
+  }
+
   function bindMyId() {
     const inp = $('#my-id');
     if (!inp) return;
     const saved = localStorage.getItem('lanhub.myId') || '';
-    inp.value = saved;
-    inp.addEventListener('input', () => {
-      localStorage.setItem('lanhub.myId', inp.value.trim());
-      // 重新渲染房间卡片以刷新按钮禁用态
-      if (roomsLoaded) loadRooms();
+    // 预填「我的身份」并同步到各发送方字段
+    ['#my-id', '#d-from', '#r-from', '#b-from'].forEach((sel) => {
+      const el = $(sel);
+      if (el && saved) el.value = saved;
     });
+    const badge = $('#inbox-id');
+    if (badge && saved) badge.textContent = '· ' + saved;
+
+    // #my-id 变更 → 作为权威身份，回填到空的发送方字段
+    inp.addEventListener('input', () => applyIdentity(inp.value));
+    // 任一发送方字段手填 → 记住为身份（若 #my-id 为空则同步过去）
+    ['#d-from', '#r-from', '#b-from'].forEach((sel) => {
+      const el = $(sel);
+      if (!el) return;
+      el.addEventListener('input', () => {
+        const v = el.value.trim();
+        if (!v) return;
+        localStorage.setItem('lanhub.myId', v);
+        if (!$('#my-id').value) { $('#my-id').value = v; }
+        const badge = $('#inbox-id');
+        if (badge) badge.textContent = '· ' + v;
+      });
+    });
+  }
+
+  /* ---------------- 会话视图（实时收件箱） ---------------- */
+  // applyMsgContent 处理 SSE 推送的 msg.content（含正文）。
+  // 只把「与我相关 / 我所在房间 / 他人广播」的消息放进收件箱，避免信息过载。
+  function applyMsgContent(e) {
+    let m;
+    try { m = JSON.parse(e.data); } catch (_) { return; }
+    // 概览速率采样：统计**所有**流过的消息（不论是否入箱），才能反映真实消息速率
+    msgWindow++;
+    const myId = getMyId();
+    const isOut = !!myId && m.from === myId;
+    const isIn = !!myId && m.to === myId;
+    const isRoom = !!m.roomId && myRooms.has(m.roomId);
+    const isBroadcast = !m.to && !m.roomId;
+    if (!(isOut || isIn || isRoom || (isBroadcast && m.from !== myId))) return;
+
+    let dir = 'in';
+    if (isOut) dir = 'out';
+    else if (isBroadcast) dir = 'broadcast';
+    else if (m.roomId) dir = 'room';
+
+    inbox.push({
+      dir,
+      from: m.from || '',
+      to: m.to || '',
+      roomId: m.roomId || '',
+      text: m.text || '',
+      ts: m.ts || 0,
+      seq: m.seq || 0,
+    });
+    if (inbox.length > INBOX_MAX) inbox = inbox.slice(inbox.length - INBOX_MAX);
+    renderInbox();
+  }
+
+  function renderInbox() {
+    const list = $('#inbox-list');
+    if (!list) return;
+    if (!inbox.length) {
+      list.innerHTML = '<div class="empty-state">' +
+        '<div class="empty-state__icon">✉</div>' +
+        '<div class="empty-state__title">暂无消息</div>' +
+        '<div class="empty-state__text">发送或接收的消息会出现在这里。先在「聊天室」里填写你的 Agent ID，发出的消息会标记为「我发出」。</div></div>';
+      return;
+    }
+    list.innerHTML = inbox.map((m) => {
+      let who;
+      if (m.dir === 'out') who = '→ ' + esc(m.to || '广播');
+      else if (m.dir === 'broadcast') who = '📢 ' + esc(m.from);
+      else if (m.dir === 'room') who = '#' + esc(m.roomId) + ' · ' + esc(m.from);
+      else who = esc(m.from) + ' → 我';
+      return '<div class="msg msg--' + m.dir + '">' +
+        '<div class="msg__head"><span class="msg__who">' + who + '</span>' +
+        '<span class="msg__time">' + esc(fmtClock(m.ts)) + '</span></div>' +
+        '<div class="msg__text">' + esc(m.text || '') + '</div></div>';
+    }).join('');
+    list.scrollTop = list.scrollHeight;
   }
 
   /* ---------------- 表单：通用校验 + 提交态 ---------------- */
@@ -806,6 +907,7 @@
     'room.changed',   // 房间变化（房间卡片刷新）
     'plugin.state',   // 插件启停（插件/设置视图徽标更新）
     'stats.tick',     // 在线数/房间数低频兜底（概览数字滚动）
+    'msg.content',    // 已路由消息正文（供会话视图实时接收）
   ].join(',');
 
   const realtime = {
@@ -860,6 +962,7 @@
     es.addEventListener('room.changed', applyRoomEvent);
     es.addEventListener('plugin.state', applyPluginStateEvent);
     es.addEventListener('stats.tick', applyStatsTick);
+    es.addEventListener('msg.content', applyMsgContent);
   }
 
   // resyncAll 重连后对账：把所有列表拉一遍（不阻塞界面，失败静默）。
@@ -1004,10 +1107,25 @@
   function applyStatsTick(e) {
     let p = null;
     try { p = JSON.parse(e.data); } catch (_) { return; }
+
+    // 消息速率采样：以「两次 stats.tick 之间的实际间隔」为窗口，换算成条/秒。
+    // 这样与服务端 statsInterval 配置无关（间隔自测量），也不会写死 5 秒。
+    const now = Date.now();
+    let rate = 0;
+    if (lastTickTs) {
+      const dt = (now - lastTickTs) / 1000;
+      if (dt > 0) rate = msgWindow / dt;
+    }
+    lastTickTs = now;
+    msgWindow = 0;
+    msgRateSamples.push(rate);
+    if (msgRateSamples.length > 15) msgRateSamples.shift();
+
     if (!p || !lastStatus) return;
     if (typeof p.agentCount === 'number') lastStatus.agentCount = p.agentCount;
     if (typeof p.roomCount === 'number') lastStatus.roomCount = p.roomCount;
     renderStatCards(lastStatus);
+    renderTrend(lastSamples, msgRateSamples);
   }
 
   /* =====================================================================
@@ -1053,15 +1171,18 @@
     const updated = $('#metrics-updated');
     if (updated) updated.textContent = '采样间隔 ' + Math.round((m.intervalMs || 0) / 1000) + ' 秒';
 
-    renderTrend(m.samples || []);
+    lastSamples = m.samples || [];
+    renderTrend(lastSamples, msgRateSamples);
   }
 
-  // renderTrend 用原生 SVG 画一条折线 + 面积（不引图表库）。
-  function renderTrend(samples) {
+  // renderTrend 用原生 SVG 画折线 + 面积（不引图表库）。
+  // 两条线：在线 Agent 数（服务端采样）+ 消息速率（客户端按窗口计数，单位 条/秒）。
+  function renderTrend(samples, msgRates) {
     const svg = $('#trend-svg');
     const axis = $('#trend-axis');
     if (!svg) return;
-    if (!samples.length) {
+    msgRates = msgRates || [];
+    if (!samples.length && !msgRates.length) {
       svg.innerHTML = '';
       if (axis) axis.innerHTML = '<span>暂无采样点</span>';
       return;
@@ -1069,7 +1190,7 @@
 
     const W = 600, H = 120, PAD = 6;
     const values = samples.map((s) => (s.agentsOnline || 0));
-    const maxV = Math.max(1, Math.max.apply(null, values));
+    const maxV = Math.max(1, Math.max.apply(null, values.length ? values : [0]));
     const step = values.length > 1 ? (W - PAD * 2) / (values.length - 1) : 0;
 
     const pts = values.map((v, i) => {
@@ -1089,18 +1210,38 @@
       '<line x1="0" x2="' + W + '" y1="' + (PAD + f * (H - PAD * 2)).toFixed(1) +
       '" y2="' + (PAD + f * (H - PAD * 2)).toFixed(1) + '" />').join('');
 
+    // 第二条线：消息速率（条/秒），按自己的最大值归一化，独立 Y 轴。
+    let rateLine = '';
+    if (msgRates.length) {
+      const maxR = Math.max(0.01, Math.max.apply(null, msgRates));
+      const rStep = msgRates.length > 1 ? (W - PAD * 2) / (msgRates.length - 1) : 0;
+      const rPts = msgRates.map((v, i) => {
+        const x = PAD + i * rStep;
+        const y = H - PAD - (v / maxR) * (H - PAD * 2);
+        return [x, y];
+      });
+      rateLine = '<polyline class="trend__line trend__line--rate" points="' +
+        rPts.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ') + '" />' +
+        '<g class="trend__dots trend__dots--rate">' +
+        rPts.map((p) => '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="2" />').join('') +
+        '</g>';
+    }
+
     svg.innerHTML =
       '<g class="trend__grid">' + grid + '</g>' +
       (area ? '<path class="trend__area" d="' + area + '" />' : '') +
       '<polyline class="trend__line" points="' + line + '" />' +
-      '<g class="trend__dots">' + dots + '</g>';
+      '<g class="trend__dots">' + dots + '</g>' +
+      rateLine;
 
     if (axis) {
       const first = samples[0] || {};
       const last = samples[samples.length - 1] || {};
+      const lastRate = msgRates.length ? msgRates[msgRates.length - 1] : null;
       axis.innerHTML =
         '<span>' + esc(fmtClock(first.ts)) + '</span>' +
-        '<span>峰值 ' + esc(maxV) + '</span>' +
+        '<span>在线峰值 ' + esc(maxV) + '</span>' +
+        '<span>' + (lastRate === null ? '消息速率 —' : '消息速率 ' + lastRate.toFixed(2) + ' 条/秒') + '</span>' +
         '<span>' + esc(fmtClock(last.ts)) + '</span>';
     }
   }
@@ -1352,8 +1493,26 @@
       const label = join ? '已加入' : '已离开';
       e.target.disabled = true;
       const r = await api('POST', path, { from: myId, roomId });
-      if (r.ok) { toast(label + '：' + roomId, 'success'); loadRooms(); loadStatus(true); }
-      else { toast('操作失败：' + r.error, 'error'); e.target.disabled = false; }
+      if (r.ok) {
+        if (join) myRooms.add(roomId); else myRooms.delete(roomId);
+        toast(label + '：' + roomId, 'success'); loadRooms(); loadStatus(true);
+      } else { toast('操作失败：' + r.error, 'error'); e.target.disabled = false; }
+    });
+
+    // 收件箱清空
+    const inboxClear = $('#inbox-clear');
+    if (inboxClear) inboxClear.addEventListener('click', () => { inbox = []; renderInbox(); });
+
+    // 在线 Agent 表「发消息」按钮（事件委托）
+    $('#agents-tbody').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-msg]');
+      if (!btn) return;
+      const id = btn.getAttribute('data-msg');
+      const to = $('#d-to');
+      if (to) to.value = id;
+      applyIdentity($('#d-from') ? $('#d-from').value : ''); // 确保身份已记住
+      setView('messaging');
+      toast('已选 ' + id + ' 为接收方，填好内容即可发送', 'info');
     });
 
     // 点对点消息

@@ -229,6 +229,14 @@ code {
   animation: spin .7s linear infinite;
 }
 .btn--primary.is-loading::after { color: #04141a; }
+/* 小号按钮：表格内联操作（在线 Agent 的「发消息」） */
+.btn--sm {
+  padding: 4px 10px; font-size: var(--fs-xs); font-weight: 600;
+  border-radius: var(--r-sm);
+  background: var(--accent-soft); color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.btn--sm:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
 
 /* ===================== 卡片 ===================== */
 .card {
@@ -582,6 +590,10 @@ code {
 .trend__line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .trend__area { fill: var(--accent-soft); stroke: none; }
 .trend__dots circle { fill: var(--accent); }
+/* 第二条序列：消息速率（品红，与在线数的青色区分） */
+.trend__dot--rate { background: var(--accent-2); margin-left: var(--sp-2); }
+.trend__line--rate { stroke: var(--accent-2); stroke-dasharray: 5 3; }
+.trend__dots--rate circle { fill: var(--accent-2); }
 .trend__axis {
   display: flex; justify-content: space-between;
   font-size: var(--fs-xs); color: var(--text-faint);
@@ -628,6 +640,37 @@ code {
 
 /* 窄屏下的下拉与日志行 */
 .select--sm { padding: 6px 10px; font-size: var(--fs-sm); }
+
+/* ================= 会话视图（实时收件箱） ================= */
+.inbox {
+  max-height: 420px; overflow-y: auto; display: flex; flex-direction: column;
+  gap: var(--sp-2); padding: var(--sp-1) var(--sp-2);
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
+  border: 1px solid var(--border); border-radius: var(--r-md);
+}
+.msg {
+  border: 1px solid var(--border); border-left: 3px solid var(--border-strong);
+  border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-2); max-width: 88%;
+}
+.msg--out { border-left-color: var(--accent); background: var(--accent-soft); align-self: flex-end; }
+.msg--in  { border-left-color: var(--accent-2); background: var(--surface-3); align-self: flex-start; }
+.msg--room { border-left-color: var(--warning); }
+.msg--broadcast { border-left-color: var(--text-faint); background: var(--surface-3); align-self: center; max-width: 96%; }
+.msg__head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: var(--sp-3); margin-bottom: 2px;
+}
+.msg__who { font-size: var(--fs-xs); font-weight: 600; color: var(--text-muted); font-family: var(--font-mono); }
+.msg__time { font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); }
+.msg__text {
+  font-size: var(--fs-md); color: var(--text); line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}
+@media (max-width: 640px) {
+  .msg { max-width: 96%; }
+  .inbox { max-height: 320px; }
+}
 @media (max-width: 640px) {
   .log-row { grid-template-columns: 66px 54px 1fr; }
 }

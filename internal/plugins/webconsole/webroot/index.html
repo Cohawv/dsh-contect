@@ -99,8 +99,11 @@
             </div>
             <div class="trend">
               <div class="trend__head">
-                <span class="trend__title">在线 Agent 趋势（最近 15 个采样点）</span>
-                <span class="trend__legend"><span class="trend__dot"></span>agents_online</span>
+                <span class="trend__title">在线 Agent 与消息速率趋势（最近 15 个采样点）</span>
+                <span class="trend__legend">
+                  <span class="trend__dot"></span>agents_online
+                  <span class="trend__dot trend__dot--rate"></span>消息速率（条/秒）
+                </span>
               </div>
               <svg class="trend__svg" id="trend-svg" viewBox="0 0 600 120" preserveAspectRatio="none" role="img" aria-label="在线 Agent 数量趋势"></svg>
               <div class="trend__axis" id="trend-axis"><span>—</span></div>
@@ -135,7 +138,7 @@
               <table class="table" id="agents-table">
                 <thead>
                   <tr>
-                    <th>ID</th><th>名称</th><th>协议</th><th>能力 (caps)</th><th>最近活跃</th>
+                    <th>ID</th><th>名称</th><th>协议</th><th>能力 (caps)</th><th>最近活跃</th><th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="agents-tbody"></tbody>
@@ -184,6 +187,25 @@
 
       <!-- 发送消息 -->
       <section class="view" data-view="messaging" hidden>
+        <div class="card">
+          <div class="card__head">
+            <h2>实时会话 <span class="muted" id="inbox-id"></span></h2>
+            <div class="card__tools">
+              <span class="muted">仅显示与你 / 你所在房间相关的消息（来自 <code>msg.content</code> 实时流）</span>
+              <button class="btn btn--ghost" id="inbox-clear" type="button">清空</button>
+            </div>
+          </div>
+          <div class="card__body">
+            <div class="inbox" id="inbox-list">
+              <div class="empty-state">
+                <div class="empty-state__icon">✉</div>
+                <div class="empty-state__title">暂无消息</div>
+                <div class="empty-state__text">发送或接收的消息会出现在这里。先在「聊天室」里填写你的 Agent ID，发出的消息会标记为「我发出」，收到的会标记为「发给我 / 房间」。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div class="card">
           <div class="card__head"><h2>点对点消息</h2></div>
           <div class="card__body">
