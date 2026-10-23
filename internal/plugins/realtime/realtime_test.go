@@ -432,3 +432,63 @@ func settledGoroutines() int {
 	time.Sleep(50 * time.Millisecond)
 	return runtime.NumGoroutine()
 }
+
+// TestMsgRoutedIsOptIn：msg.routed 可被显式订阅，但不在默认集合里（V7 ①）。
+//
+// V7 ① 的「事件流」视图要渲染 msg.routed；它频率高，故延续 msg.content 的做法：
+// 加入 busTopics（服务端订阅总线）但**不进 defaultTopics**（客户端不指定时不推），
+// 只有显式带 ?topics=msg.routed 的连接才收到。
+func TestMsgRoutedIsOptIn(t *testing.T) {
+	rig := newSSERig(t, map[string]any{"heartbeat": "50ms", "statsInterval": "10s"})
+	defer rig.close()
+
+	// 1) 显式订阅者能收到
+	sub := rig.stream(t, "?topics="+protocol.TopicMsgRouted, nil)
+	defer sub.Close()
+	// 2) 默认订阅者（不带 topics）收不到
+	def := rig.stream(t, "", nil)
+	defer def.Close()
+
+	rig.hub.Bus.Publish(protocol.TopicMsgRouted, core.MsgRouted{Kind: "direct", Delivered: 1, Seq: 7})
+
+	// 显式订阅：应收到 msg.routed 帧（心跳可能先到，跳过）
+	got := ""
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f := sub.readFrame(t)
+		if f.Ping {
+			continue
+		}
+		got = f.Event
+		break
+	}
+	if got != protocol.TopicMsgRouted {
+		t.Fatalf("显式订阅者应收到 %q，实得 %q", protocol.TopicMsgRouted, got)
+	}
+
+	// 默认订阅：只可能收到心跳/stats，绝不应出现 msg.routed
+	deadline = time.Now().Add(700 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		f := def.readFrame(t)
+		if !f.Ping && f.Event == protocol.TopicMsgRouted {
+			t.Fatalf("默认订阅集合不应含 %q（会放大默认 SSE 流量）", protocol.TopicMsgRouted)
+		}
+	}
+
+	// 3) defaultTopics 白名单本身不含它（防回归）
+	for _, tp := range defaultTopics {
+		if tp == protocol.TopicMsgRouted {
+			t.Fatalf("defaultTopics 不应含 %q", protocol.TopicMsgRouted)
+		}
+	}
+	// 4) busTopics 必须含它（否则显式订阅也收不到）
+	found := false
+	for _, tp := range rig.rt.busTopics() {
+		if tp == protocol.TopicMsgRouted {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("busTopics 应含 %q（V7 ① 事件流依赖）", protocol.TopicMsgRouted)
+	}
+}

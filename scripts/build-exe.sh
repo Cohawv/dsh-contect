@@ -20,5 +20,8 @@ GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/lan-age
 echo "==> 构建无窗口版 dist/lan-agent-hub-gui.exe（-H=windowsgui，双击即弹浏览器 UI）"
 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS -H=windowsgui" -o dist/lan-agent-hub-gui.exe ./cmd/hub
 
+echo "==> 构建 CLI 版 dist/hubctl.exe（V7 ②：独立二进制，经 REST/SSE 与 Hub 通信）"
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hubctl.exe ./cmd/hubctl
+
 echo "done -> dist/"
 ls -la dist/

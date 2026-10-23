@@ -59,7 +59,8 @@ const (
 const statsTickTopic = "stats.tick"
 
 // defaultTopics 是客户端不指定 topics 时的订阅集合（不含 msg.routed / http.request：
-// 它们频率高、对界面无意义，仅用于 metrics 计数）。
+// 它们频率高、对界面无意义，仅用于 metrics 计数；V7 ① 起 msg.routed 可被显式订阅，
+// 但默认集合仍不含它——见 busTopics 的说明）。
 var defaultTopics = []string{
 	protocol.TopicAgentOnline,
 	protocol.TopicAgentOffline,
@@ -315,12 +316,16 @@ func (p *Realtime) Apply(options map[string]any) error {
 //
 // 注意：msg.content 已加入订阅列表，但**不在 defaultTopics** 里——
 // 只有显式带 ?topics=msg.content 的客户端才会收到聊天正文，默认订阅集合不含它（隐私默认关）。
+//
+// msg.routed 同理（V7 ①）：高频事件，默认不推；控制台的「事件流」视图显式带
+// ?topics=msg.routed 订阅后才下发——满足 V7 事件流验收，又不放大默认 SSE 流量。
 func (p *Realtime) busTopics() []string {
 	return []string{
 		protocol.TopicAgentOnline,
 		protocol.TopicAgentOffline,
 		protocol.TopicRoomChanged,
 		protocol.TopicMsgContent,
+		protocol.TopicMsgRouted,
 		plugin.TopicState,
 	}
 }

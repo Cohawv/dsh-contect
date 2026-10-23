@@ -37,6 +37,9 @@
         <button class="nav__item" data-view="messaging" type="button">
           <span class="nav__icon">✉</span><span class="nav__label">发送消息</span>
         </button>
+        <button class="nav__item" data-view="events" type="button">
+          <span class="nav__icon">⚡</span><span class="nav__label">事件流</span>
+        </button>
         <button class="nav__item" data-view="plugins" type="button">
           <span class="nav__icon">▤</span><span class="nav__label">插件</span>
         </button>
@@ -63,10 +66,20 @@
           <p class="page-sub" id="page-sub">局域网多 Agent 通信中枢运行状态</p>
         </div>
         <div class="topbar__actions">
-          <span class="status-pill" id="conn-pill" data-state="loading">
+          <span class="status-pill" id="conn-pill" data-state="connecting" aria-live="polite">
             <span class="status-pill__dot"></span>
-            <span class="status-pill__text">连接中…</span>
+            <span class="status-pill__text">重连中</span>
           </span>
+          <button class="btn btn--ghost" id="cmdk-open" type="button" title="命令面板（Ctrl/⌘+K）">
+            <span class="btn__icon" aria-hidden="true">⌘</span> 命令面板
+            <kbd class="kbd">Ctrl K</kbd>
+          </button>
+          <label class="switch" title="冻结面板：事件流与指标同时暂停（排查用）">
+            <input type="checkbox" id="panel-freeze" />
+            <span class="switch__track"><span class="switch__thumb"></span></span>
+            <span class="switch__label">冻结面板</span>
+          </label>
+          <span class="muted" id="freeze-hint"></span>
           <label class="switch" title="自动刷新（每 5 秒）">
             <input type="checkbox" id="auto-refresh" />
             <span class="switch__track"><span class="switch__thumb"></span></span>
@@ -189,9 +202,9 @@
       <section class="view" data-view="messaging" hidden>
         <div class="card">
           <div class="card__head">
-            <h2>实时会话 <span class="muted" id="inbox-id"></span></h2>
+            <h2>消息时间线 <span class="muted" id="inbox-id"></span></h2>
             <div class="card__tools">
-              <span class="muted">仅显示与你 / 你所在房间相关的消息（来自 <code>msg.content</code> 实时流）</span>
+              <span class="muted">按会话分组 · 最新在顶部 · 点击消息可复制 JSON（来自 <code>msg.content</code> 实时流）</span>
               <button class="btn btn--ghost" id="inbox-clear" type="button">清空</button>
             </div>
           </div>
@@ -274,6 +287,44 @@
                 <button class="btn btn--primary" type="submit" id="broadcast-btn">广播</button>
               </div>
             </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- 事件流（V7 ①：订阅 /api/stream，倒序渲染 / 可过滤 / 可暂停 / 可展开载荷） -->
+      <section class="view" data-view="events" hidden>
+        <div class="card">
+          <div class="card__head">
+            <h2>事件流 <span class="count-badge" id="events-count">0</span></h2>
+            <div class="card__tools">
+              <span class="muted" id="events-buffered"></span>
+              <label class="switch" title="暂停画面排查：暂停期间事件继续缓冲，恢复后补显，不漏一条">
+                <input type="checkbox" id="events-pause" />
+                <span class="switch__track"><span class="switch__thumb"></span></span>
+                <span class="switch__label">暂停</span>
+              </label>
+              <button class="btn btn--ghost" id="events-clear" type="button">清空</button>
+            </div>
+          </div>
+          <div class="card__body">
+            <p class="hint">
+              来自 <code>/api/stream</code> 的实时事件（<code>agent.online</code> · <code>agent.offline</code> ·
+              <code>room.changed</code> · <code>plugin.state</code> · <code>msg.routed</code> · <code>msg.content</code>），
+              按时间倒序排列，最多保留 <span id="events-total">—</span>。
+              点击任意一条展开完整 JSON 载荷；暂停期间事件照常缓冲，恢复后一次性补显。
+            </p>
+            <div class="ev-filters">
+              <div class="ev-chips" id="event-type-filters" role="group" aria-label="事件类型过滤（可多选）"></div>
+              <input class="input input--search" id="events-agent" type="search"
+                     placeholder="按 Agent 筛选…" aria-label="按 Agent 筛选事件" />
+            </div>
+            <div class="ev-list" id="event-list">
+              <div class="empty-state">
+                <div class="empty-state__icon">⚡</div>
+                <div class="empty-state__title">等待事件…</div>
+                <div class="empty-state__text">实时事件会按时间倒序出现在这里。</div>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -399,6 +450,21 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <!-- 命令面板（V7 ① / ⑤：Ctrl+⌘K 打开，全程键盘可达，关闭后焦点还原） -->
+  <div class="cmdk" id="cmdk" hidden role="dialog" aria-modal="true" aria-label="命令面板">
+    <div class="cmdk__backdrop" data-cmdk-close></div>
+    <div class="cmdk__panel">
+      <input class="cmdk__input" id="cmdk-input" type="text" placeholder="搜索视图或操作…"
+             aria-label="命令面板搜索框" autocomplete="off" spellcheck="false" />
+      <ul class="cmdk__list" id="cmdk-list" role="listbox" aria-label="命令结果"></ul>
+      <div class="cmdk__hint">
+        <span><kbd class="kbd">↑</kbd><kbd class="kbd">↓</kbd> 选择</span>
+        <span><kbd class="kbd">Enter</kbd> 执行</span>
+        <span><kbd class="kbd">Esc</kbd> 关闭</span>
+      </div>
+    </div>
   </div>
 
   <!-- 全局反馈 -->
