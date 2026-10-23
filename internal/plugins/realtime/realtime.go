@@ -312,11 +312,15 @@ func (p *Realtime) Apply(options map[string]any) error {
 }
 
 // busTopics 返回需要订阅的总线 topic（不含本插件自产的 stats.tick）。
+//
+// 注意：msg.content 已加入订阅列表，但**不在 defaultTopics** 里——
+// 只有显式带 ?topics=msg.content 的客户端才会收到聊天正文，默认订阅集合不含它（隐私默认关）。
 func (p *Realtime) busTopics() []string {
 	return []string{
 		protocol.TopicAgentOnline,
 		protocol.TopicAgentOffline,
 		protocol.TopicRoomChanged,
+		protocol.TopicMsgContent,
 		plugin.TopicState,
 	}
 }

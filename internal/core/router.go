@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 
@@ -106,6 +107,10 @@ func (rt *Router) Route(env protocol.Envelope) string {
 		Seq:       env.Seq,
 	})
 
+	// 同时发布带正文的 msg.content（opt-in topic，仅显式订阅者收到；realtime 据此推 SSE）。
+	// 与 msg.routed（只计数量）分离：正文不下发给未订阅的客户端。
+	rt.publishContent(env)
+
 	// V6 ①：把已路由完成的信封交给消息落盘钩子（store）。
 	// 必须在 seq / ts 分配之后调用，且调用方拿到的 env 是值拷贝（含 Seq / TS），
 	// store 不会反向修改路由态。钩子为 nil 时静默跳过——热路径仅一次指针读取。
@@ -121,6 +126,37 @@ func (rt *Router) publishRouted(ev MsgRouted) {
 		return
 	}
 	rt.bus.Publish(protocol.TopicMsgRouted, ev)
+}
+
+// publishContent 发布一条 msg.content 事件（带正文，供控制台接收；bus 为 nil 时静默）。
+func (rt *Router) publishContent(env protocol.Envelope) {
+	if rt.bus == nil {
+		return
+	}
+	rt.bus.Publish(protocol.TopicMsgContent, protocol.MsgContent{
+		Type:   env.Type,
+		From:   env.From,
+		To:     env.To,
+		RoomID: env.RoomID,
+		Text:   contentText(env.Content),
+		TS:     env.TS,
+		Seq:    env.Seq,
+	})
+}
+
+// contentText 从信封 Content 中尽力提取可读文本（形如 {"text":"..."} 时提取，否则空串）。
+func contentText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	if s, ok := m["text"].(string); ok {
+		return s
+	}
+	return ""
 }
 
 // DeliverTo 点对点投递，返回是否送达（false 表示目标不在线）。
