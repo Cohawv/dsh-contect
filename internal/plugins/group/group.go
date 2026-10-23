@@ -151,6 +151,11 @@ func (p *Group) Start() error { return nil }
 func (p *Group) Stop() error  { return nil }
 
 // Apply 实现 plugin.Applier：热更新静态/动态组配置（运行期创建的组保留）。
+//
+// 语义说明：经 POST /api/groups 创建/覆盖的组 Source=runtime，此后不再被
+// hub.json 的热更新覆盖（运行期优先）；重启后配置重新生效，运行期组随之丢失。
+// 这是「运行期改动能对抗配置推送、但重启以配置为准」的有意取舍——
+// 若需要配置强制回收运行期组，删掉该组名对应的配置项并重启即可。
 func (p *Group) Apply(options map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -214,7 +219,7 @@ func (p *Group) listGroups(w http.ResponseWriter) {
 	out := make([]map[string]any, 0, len(defs))
 	for _, g := range defs {
 		item := map[string]any{"name": g.Name, "source": g.Source, "members": p.effective(g)}
-		if g.Source == sourceDynamic {
+		if isDynamic(g) {
 			item["caps"] = g.Caps
 			item["mode"] = g.Mode
 		}
@@ -254,8 +259,10 @@ func (p *Group) createGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	p.publishChanged(action, g)
 
-	item := map[string]any{"name": g.Name, "source": g.Source, "members": p.effective(g)}
-	if g.Source == sourceDynamic {
+	item := map[string]any{
+		"name": g.Name, "source": g.Source, "members": p.effective(g), "action": action,
+	}
+	if isDynamic(g) {
 		item["caps"] = g.Caps
 		item["mode"] = g.Mode
 	}
@@ -301,6 +308,12 @@ func (p *Group) sendToGroup(w http.ResponseWriter, r *http.Request, name string)
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.Text == "" && len(body.Content) == 0 {
+		// 没有任何可投递内容：明确 400，而不是投递一条空文本消息
+		//（调用方多半是漏传字段，静默投递空消息会污染对账）。
+		http.Error(w, "empty payload: need \"text\" or \"content\"", http.StatusBadRequest)
 		return
 	}
 	content := any(body.Content)
@@ -391,11 +404,15 @@ func (p *Group) snapshot(name string) (*groupDef, bool) {
 }
 
 // effective 返回组的有效成员（定义层）：
-//   - 静态/运行组：配置成员（去重、排序）；
-//   - 动态组：当前在线且 caps 匹配的 Agent（按 ID 排序；无匹配时返回空切片而非 nil，
-//     保证 JSON 序列化为 [] —— 客户端解析形状稳定）。
+//   - 显式成员组（无 caps 规则）：配置成员（去重、排序）；
+//   - 动态组（有 caps 规则）：当前在线且 caps 匹配的 Agent（按 ID 排序；
+//     无匹配时返回空切片而非 nil，保证 JSON 序列化为 [] —— 客户端解析形状稳定）。
+//
+// 注意：组的「类型」按 len(Caps)>0 判定，与 Source（来源：static/dynamic/runtime）正交——
+// 运行期 API 创建的 caps 组 Source=runtime 但类型仍是动态。混用两者曾导致
+// 运行期动态组落入静态空成员分支（QA 独立验证抓出的缺陷，见 git log）。
 func (p *Group) effective(g *groupDef) []string {
-	if g.Source != sourceDynamic {
+	if !isDynamic(g) {
 		return sortedUnique(g.Members)
 	}
 	out := make([]string, 0, 4)
@@ -407,6 +424,11 @@ func (p *Group) effective(g *groupDef) []string {
 	sort.Strings(out)
 	return out
 }
+
+// isDynamic 判断组是否为 caps 规则组（动态成员）。Source 只记录「这个组从哪来」
+// （static=配置静态 / dynamic=配置动态 / runtime=运行期 API），不决定类型——
+// 否则运行期创建的 caps 组会被当成静态空组。
+func isDynamic(g *groupDef) bool { return len(g.Caps) > 0 }
 
 // onlineSubset 从 targets 中过滤出当前在线的成员（保序）。
 func (p *Group) onlineSubset(targets []string) []string {
@@ -512,6 +534,8 @@ func parseDynamic(s string) ([]*groupDef, error) {
 
 // normalizeDef 校验并归一化一个组定义。
 // caps 非空 → 动态组（mode 默认 any，只接受 any/all）；否则 → 显式成员组（成员不可为空）。
+// source 参数只记录来源（static/dynamic/runtime），不改变组的类型判定——
+// 因此运行期 API 创建的 caps 组是「Source=runtime 的动态组」。
 func normalizeDef(name string, members, caps []string, mode, source string) (*groupDef, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {

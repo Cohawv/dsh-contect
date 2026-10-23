@@ -560,3 +560,150 @@ func TestRigEmptyDynamicGroupAck(t *testing.T) {
 		t.Fatalf("无匹配成员应回 empty-group，实得 %q", body.Action)
 	}
 }
+
+// TestRigRuntimeCapsGroupWorks：缺陷 #1 回归——运行期 POST 创建的 caps 动态组
+// 必须能解析成员、能发送（此前按 Source 判定类型导致其落入静态空成员分支，
+// 创建返回 200 但组永远为空）。
+func TestRigRuntimeCapsGroupWorks(t *testing.T) {
+	hub, base := groupRig(t, nil) // 无配置组，全靠运行期 API
+
+	pyAgent := &stubSession{id: "py-agent"}
+	goAgent := &stubSession{id: "go-agent"}
+	hub.Registry.Bind("py-agent", "Py", []string{"python"}, protocol.ProtoCurrent, pyAgent)
+	hub.Registry.Bind("go-agent", "Go", []string{"go"}, protocol.ProtoCurrent, goAgent)
+
+	// 1) 运行期创建 caps 组
+	resp, err := http.Post(base+"/api/groups", "application/json",
+		strings.NewReader(`{"name":"rt-py","caps":["python"]}`))
+	if err != nil {
+		t.Fatalf("POST create: %v", err)
+	}
+	var created struct {
+		Name    string   `json:"name"`
+		Source  string   `json:"source"`
+		Caps    []string `json:"caps"`
+		Mode    string   `json:"mode"`
+		Members []string `json:"members"`
+		Action  string   `json:"action"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		resp.Body.Close()
+		t.Fatalf("解码创建响应: %v", err)
+	}
+	resp.Body.Close()
+	if created.Source != sourceRuntime {
+		t.Fatalf("运行期创建 source 应为 runtime，实得 %q", created.Source)
+	}
+	if len(created.Caps) != 1 || created.Mode != modeAny {
+		t.Fatalf("caps/mode 应随响应返回: %+v", created)
+	}
+	if !reflect.DeepEqual(created.Members, []string{"py-agent"}) {
+		t.Fatalf("有效成员应为在线匹配者 [py-agent]，实得 %v", created.Members)
+	}
+	if created.Action != "created" {
+		t.Fatalf("响应应带 action=created，实得 %q", created.Action)
+	}
+
+	// 2) GET 列表里同样按动态组展示
+	listResp, err := http.Get(base + "/api/groups")
+	if err != nil {
+		t.Fatalf("GET groups: %v", err)
+	}
+	var list struct {
+		Groups []struct {
+			Name    string   `json:"name"`
+			Source  string   `json:"source"`
+			Caps    []string `json:"caps"`
+			Members []string `json:"members"`
+		} `json:"groups"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&list); err != nil {
+		listResp.Body.Close()
+		t.Fatalf("解码列表: %v", err)
+	}
+	listResp.Body.Close()
+	if len(list.Groups) != 1 || list.Groups[0].Name != "rt-py" || len(list.Groups[0].Caps) != 1 {
+		t.Fatalf("运行期 caps 组未按动态组展示: %+v", list.Groups)
+	}
+
+	// 3) 发送：只有声明 python 的 Agent 收到
+	sendResp, err := http.Post(base+"/api/groups/rt-py/send", "application/json",
+		strings.NewReader(`{"text":"hello rt"}`))
+	if err != nil {
+		t.Fatalf("POST send: %v", err)
+	}
+	var sent struct {
+		Delivered int `json:"delivered"`
+	}
+	if err := json.NewDecoder(sendResp.Body).Decode(&sent); err != nil {
+		sendResp.Body.Close()
+		t.Fatalf("解码发送响应: %v", err)
+	}
+	sendResp.Body.Close()
+	if sent.Delivered != 1 {
+		t.Fatalf("运行期 caps 组应投递 1，实得 %d", sent.Delivered)
+	}
+	if pyAgent.received() != 1 || goAgent.received() != 0 {
+		t.Fatalf("只有 py-agent 应收到：py=%d go=%d", pyAgent.received(), goAgent.received())
+	}
+}
+
+// TestRuntimeCapsGroupSurvivesApply：运行期 caps 组不得被配置热更新误删
+//（类型判定改按 caps 后，replaceConfigLocked 仍只替换同 Source 的配置组）。
+func TestRuntimeCapsGroupSurvivesApply(t *testing.T) {
+	p := &Group{groups: map[string]*groupDef{}}
+	g, err := normalizeDef("rt-py", nil, []string{"python"}, "", sourceRuntime)
+	if err != nil {
+		t.Fatalf("normalizeDef: %v", err)
+	}
+	p.groups["rt-py"] = g
+
+	// 热更新：新的动态配置组进来
+	if err := p.Apply(map[string]any{"dynamicGroups": `{"cfg-py":{"caps":["go"]}}`}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if _, ok := p.groups["rt-py"]; !ok {
+		t.Fatal("运行期 caps 组被热更新误删")
+	}
+	if _, ok := p.groups["cfg-py"]; !ok {
+		t.Fatal("新配置动态组应生效")
+	}
+	// 且运行期组仍按动态语义解析
+	if !isDynamic(p.groups["rt-py"]) {
+		t.Fatal("运行期 caps 组应判定为动态组")
+	}
+}
+
+// TestCreateGroupUpdatedAction：重复创建同名组返回 action=updated（缺陷 #2 回归）。
+func TestCreateGroupUpdatedAction(t *testing.T) {
+	p := &Group{hub: core.NewHub(), pub: &stubPub{}, view: viewOf(), groups: map[string]*groupDef{}}
+	doJSON(t, p.handleGroups, http.MethodPost, "/api/groups", `{"name":"ops","members":["a"]}`)
+	rec := doJSON(t, p.handleGroups, http.MethodPost, "/api/groups", `{"name":"ops","members":["a","b"]}`)
+	var resp struct {
+		Action string `json:"action"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解码响应: %v", err)
+	}
+	if resp.Action != "updated" {
+		t.Fatalf("二次创建应回 action=updated，实得 %q", resp.Action)
+	}
+}
+
+// TestSendEmptyPayload400：无 text 无 content 的发送请求应 400（不投递空消息）。
+func TestSendEmptyPayload400(t *testing.T) {
+	p := &Group{
+		view:   viewOf(plugin.AgentInfo{ID: "A"}),
+		pub:    &stubPub{},
+		groups: map[string]*groupDef{"devs": {Name: "devs", Source: sourceStatic, Members: []string{"A"}}},
+	}
+	for _, body := range []string{`{}`, ``, `{"text":""}`} {
+		rec := doJSON(t, p.handleGroupOp, http.MethodPost, "/api/groups/devs/send", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body=%q 应 400，实得 %d", body, rec.Code)
+		}
+	}
+	if len(p.pub.(*stubPub).sent) != 0 {
+		t.Fatal("空 payload 不应产生任何投递")
+	}
+}
