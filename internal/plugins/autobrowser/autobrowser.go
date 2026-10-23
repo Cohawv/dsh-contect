@@ -21,10 +21,12 @@ import (
 // Disable/Apply 持 opMu——两者可以同时进到本插件，出现「Stop 关 done」与
 // 「Start 重建 done」并发写同一字段。加一把小锁把 open/url/done 三个字段的读写收口。
 type AutoBrowser struct {
-	mu   sync.Mutex
-	open bool
-	url  string
-	done chan struct{} // Stop 时关闭：取消「延迟 400ms 打开浏览器」的协程
+	mu     sync.Mutex
+	open   bool
+	url    string
+	done   chan struct{}      // Stop 时关闭：取消「延迟 400ms 打开浏览器」的协程
+	openFn func(url string)   // 可注入：默认 openBrowser（单测借此断言「是否真的打开」）
+	delay  time.Duration      // 可注入：默认 openDelay（单测借此免等 400ms）
 }
 
 // Meta 声明插件元信息；依赖 httpgateway 以保证 dashboardURL 交接顺序。
@@ -78,6 +80,13 @@ func (p *AutoBrowser) Init(ctx *plugin.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.open = ctx.Bool("open", true)
+	// 注入点默认值（生产路径为 openBrowser + openDelay；单测可覆盖以便断言）。
+	if p.openFn == nil {
+		p.openFn = openBrowser
+	}
+	if p.delay <= 0 {
+		p.delay = openDelay
+	}
 	// 插件实例是进程级单例：先清掉上一次装配的残留。
 	p.url = url
 	// 双 Init 幂等：上一轮 Start 起的 goroutine 还拿着旧 done，先关掉再换新的
@@ -95,7 +104,14 @@ func (p *AutoBrowser) Init(ctx *plugin.Context) error {
 func (p *AutoBrowser) Start() error {
 	p.mu.Lock()
 	open, url, done := p.open, p.url, p.done
-	if done == nil { // 防御：未经 Init 直接被 Start（单测直连场景）
+	openFn, delay := p.openFn, p.delay
+	if openFn == nil { // 防御：未经 Init 直接被 Start（单测直连场景）
+		openFn = openBrowser
+	}
+	if delay <= 0 {
+		delay = openDelay
+	}
+	if done == nil {
 		done = make(chan struct{})
 		p.done = done
 	}
@@ -106,8 +122,8 @@ func (p *AutoBrowser) Start() error {
 	}
 	go func() {
 		select {
-		case <-time.After(400 * time.Millisecond): // 等 HTTP 端口绑定完成
-			openBrowser(url)
+		case <-time.After(delay): // 等 HTTP 端口绑定完成
+			openFn(url)
 		case <-done:
 			return
 		}
@@ -129,6 +145,9 @@ func (p *AutoBrowser) Stop() error {
 func init() {
 	plugin.Register(&AutoBrowser{})
 }
+
+// openDelay 是「等 HTTP 端口绑定完成」的延迟（可注入字段 delay 的默认值）。
+const openDelay = 400 * time.Millisecond
 
 // openBrowser 在系统默认浏览器中打开 URL，零依赖、跨平台。
 // 失败仅记日志，不影响服务本身（用户仍可手动访问）。
