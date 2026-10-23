@@ -101,6 +101,7 @@ func TestMetricsFormat(t *testing.T) {
 		"hub_agents_online", "hub_rooms", "hub_messages_total", "hub_http_requests_total",
 		"hub_plugin_uptime_seconds", "hub_events_dropped_total", "hub_sse_clients",
 		"hub_sse_events_dropped_total",
+		"hub_deliver_dropped_total", "hub_deliver_closed_total",
 	}
 	for _, name := range families {
 		if !helps[name] {
@@ -323,3 +324,31 @@ type noopSession struct{}
 func (noopSession) ID() string                { return "noop" }
 func (noopSession) Deliver(protocol.Envelope) {}
 func (noopSession) Close() error              { return nil }
+
+// 下发丢弃必须可见：这是「连接正常、延迟正常、消息却少了」的唯一证据。
+func TestDropCountersAreExposed(t *testing.T) {
+	rig := newMetricsRig(t, nil)
+	rig.hub.SetDropStats(func() (int64, int64) { return 4321, 17 })
+
+	body := rig.scrape(t)
+	samples, _, _ := parseMetrics(t, body)
+	if v := samples["hub_deliver_dropped_total"]; v != 4321 {
+		t.Errorf("hub_deliver_dropped_total = %v，期望 4321", v)
+	}
+	if v := samples["hub_deliver_closed_total"]; v != 17 {
+		t.Errorf("hub_deliver_closed_total = %v，期望 17", v)
+	}
+}
+
+// 未接入统计（纯内核形态、无 TCP 接入层）时必须安全降级为 0，而不是 panic。
+func TestDropCountersDegradeWithoutProvider(t *testing.T) {
+	rig := newMetricsRig(t, nil)
+	body := rig.scrape(t)
+	samples, _, _ := parseMetrics(t, body)
+	if _, ok := samples["hub_deliver_dropped_total"]; !ok {
+		t.Fatalf("即使没有接入口子，指标族也应存在（值 0）")
+	}
+	if v := samples["hub_deliver_dropped_total"]; v != 0 {
+		t.Errorf("无提供方时应为 0，实际 %v", v)
+	}
+}

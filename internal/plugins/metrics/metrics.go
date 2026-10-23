@@ -321,16 +321,21 @@ func (p *Metrics) render() string {
 	var b strings.Builder
 
 	agentsOnline, rooms := 0, 0
-	eventsDropped := int64(0)
+	eventsDropped, deliverDropped, deliverClosed := int64(0), int64(0), int64(0)
 	if p.hub != nil {
 		agentsOnline = len(p.hub.ListAgentsDetailed())
 		rooms = len(p.hub.Rooms.List())
 		eventsDropped = p.hub.Bus.Dropped()
+		deliverDropped, deliverClosed = p.hub.DropStats()
 	}
 
 	writeGauge(&b, "hub_agents_online", "当前在线 Agent 数", float64(agentsOnline))
 	writeGauge(&b, "hub_rooms", "房间数", float64(rooms))
 	writeCounter(&b, "hub_messages_total", "累计路由消息数", float64(p.msgTotal.Load()))
+	// 下发侧丢弃：队列满被静默丢弃的消息数。
+	// 这是「连接正常、延迟正常、但消息少了」的唯一可见证据，必须暴露。
+	writeCounter(&b, "hub_deliver_dropped_total", "发送队列满被丢弃的消息数", float64(deliverDropped))
+	writeCounter(&b, "hub_deliver_closed_total", "连接已关闭后仍尝试下发而被丢弃的消息数", float64(deliverClosed))
 
 	// HTTP 请求数（按 path 标签）：基数有上限，超出归入 other。
 	p.mu.Lock()

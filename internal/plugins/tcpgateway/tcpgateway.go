@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lan-agent-hub/internal/core"
@@ -22,8 +23,20 @@ import (
 const sendBufferSize = 256
 
 // TCPGateway 是 tcpgateway 插件实体。
+// deliverStats 是下发侧的丢弃统计。
+//
+// 为什么必须记账：队列满时的丢弃是**静默**的——发送方以为发成功了，
+// 接收方收不到，唯一的迹象是「连接正常、延迟很低、消息却少了」。
+// 这类问题在 1000 连接下曾表现为 9% 的业务消息凭空消失，
+// 而压测报告上一切正常。数字必须能被看见。
+type deliverStats struct {
+	dropped atomic.Int64 // 发送队列满，丢弃
+	closed  atomic.Int64 // 连接已关闭后仍尝试下发
+}
+
 type TCPGateway struct {
 	addr   string
+	stats  deliverStats
 	hub    *core.Hub
 	ln     transport.Listener
 	done   chan struct{}
@@ -80,9 +93,16 @@ func (p *TCPGateway) Start() error {
 	p.done = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
+	// 把丢弃统计挂到内核：metrics 插件据此暴露 hub_deliver_dropped_total。
+	p.hub.SetDropStats(p.DropStats)
 	go p.serve(ctx)
 	log.Printf("LAN Agent Hub TCP listening on %s (NDJSON)", p.addr)
 	return nil
+}
+
+// DropStats 返回（队列满丢弃数, 关闭后尝试下发数），供内核/指标层读取。
+func (p *TCPGateway) DropStats() (dropped, closed int64) {
+	return p.stats.dropped.Load(), p.stats.closed.Load()
 }
 
 // serve 接受连接并驱动读写循环。Stop 时关闭 listener 使 Accept 返回错误退出循环。
@@ -99,7 +119,7 @@ func (p *TCPGateway) serve(ctx context.Context) {
 			}
 			return
 		}
-		s := newSession(conn)
+		s := newSession(conn, &p.stats)
 		go s.writeLoop()
 		go s.readLoop(p.hub)
 	}
@@ -140,13 +160,15 @@ type session struct {
 	sendCh chan protocol.Envelope
 	closed chan struct{}
 	once   sync.Once
+	stats  *deliverStats
 }
 
-func newSession(conn transport.Conn) *session {
+func newSession(conn transport.Conn, stats *deliverStats) *session {
 	return &session{
 		conn:   conn,
 		sendCh: make(chan protocol.Envelope, sendBufferSize),
 		closed: make(chan struct{}),
+		stats:  stats,
 	}
 }
 
@@ -155,10 +177,27 @@ func (s *session) ID() string { return s.id }
 // Deliver 非阻塞下发；缓冲满则丢弃，连接已关闭时静默返回（不 panic）。
 func (s *session) Deliver(env protocol.Envelope) {
 	defer func() { _ = recover() }()
+	// 先单独判一次「已关闭」：若把 closed 与「队列满」放在同一个 select 里，
+	// 两者同时就绪时 Go 会随机挑一个，导致 closed/dropped 两个计数互相串味，
+	// 排查时无法判断到底是「连接死了」还是「消费不过来」。
+	select {
+	case <-s.closed:
+		if s.stats != nil {
+			s.stats.closed.Add(1)
+		}
+		return
+	default:
+	}
 	select {
 	case s.sendCh <- env:
 	case <-s.closed:
+		if s.stats != nil {
+			s.stats.closed.Add(1)
+		}
 	default:
+		if s.stats != nil {
+			s.stats.dropped.Add(1)
+		}
 	}
 }
 
@@ -183,7 +222,9 @@ func (s *session) writeLoop() {
 // readLoop 读帧 → 交给业务内核；退出时摘除在线记录。
 func (s *session) readLoop(hub *core.Hub) {
 	defer func() {
-		hub.Unregister(s.id)
+		// 按会话身份卸载：同 id 重连时本连接已被新连接顶替，
+		// 无条件按 id 删除会把新会话从在线表里摘掉（连接活着却收不到消息）。
+		hub.UnregisterSession(s.id, s)
 		_ = s.Close()
 	}()
 	for {

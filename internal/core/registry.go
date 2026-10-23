@@ -53,10 +53,59 @@ func (r *Registry) Bind(id, name string, caps []string, proto int, s Session) *A
 	return a
 }
 
+// BindReplace 同 Bind，但同时返回被它顶掉的旧 Agent（没有则 nil）。
+//
+// 同 id 重连时旧连接不会自己消失：它要等到读循环读到 EOF/错误才退出，期间
+// 仍在占用 socket 与写协程。调用方拿到旧 Agent 后应主动关掉它的会话，
+// 否则上下线风暴下会堆积大批「已不在表里、却还活着」的僵尸连接。
+func (r *Registry) BindReplace(id, name string, caps []string, proto int, s Session) (*Agent, *Agent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	prev := r.agents[id]
+	if prev != nil && prev.Sess == s {
+		// 同一会话重复注册（重连同一 socket、或客户端重发 register）：不当作替换，
+		// 否则调用方会把自己的连接关掉。
+		prev.Name, prev.Caps, prev.Proto = name, caps, proto
+		prev.LastSeen = time.Now().UnixMilli()
+		return prev, nil
+	}
+	a := &Agent{
+		ID:       id,
+		Name:     name,
+		Caps:     caps,
+		Proto:    proto,
+		LastSeen: time.Now().UnixMilli(),
+		Sess:     s,
+	}
+	r.agents[id] = a
+	return a, prev
+}
+
+// Unbind 强制按 id 摘除（管理面意图：不管现在是谁，都要下线）。
 func (r *Registry) Unbind(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.agents, id)
+}
+
+// UnbindSession 只在「当前登记的会话正是 sess」时摘除，返回是否真的摘除。
+//
+// 为什么必须校验会话身份：同 id 重连时，新会话先被 Bind 写进表，旧会话的读循环
+// 随后读到 EOF 调到这里。若按 id 无条件删除，**旧会话会把新会话摘掉**——
+// 连接还活着，却再收不到任何消息，房间成员身份也一并丢失，且会误发一条
+// agent.offline。压测里表现为「连接全成功、延迟很低、但一部分消息凭空消失」。
+func (r *Registry) UnbindSession(id string, sess Session) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.agents[id]
+	if !ok {
+		return false
+	}
+	if sess != nil && a.Sess != sess {
+		return false // 表里已经是别人的会话了，旧会话无权摘除
+	}
+	delete(r.agents, id)
+	return true
 }
 
 // Get 返回在线 Agent 的快照副本。

@@ -38,8 +38,11 @@ type Hub struct {
 
 	// deliveryTracker 是「投递确认与对账」钩子（V6 ② ack 注入）。为 nil 时（未挂载
 	// ack 或已停用）TypeAck 退回 unknown type 语义，行为退化为历史一致。
-	muAck          sync.Mutex
+	muAck           sync.Mutex
 	deliveryTracker DeliveryTracker
+
+	muDrop      sync.Mutex
+	dropStatsFn DropStatsProvider
 }
 
 func NewHub() *Hub {
@@ -96,6 +99,31 @@ func (h *Hub) replayProviderLocked() ReplayProvider {
 
 // SetDeliveryTracker 注入「投递确认与对账」钩子（由 ack 插件在 Init 时调用）。
 // 传 nil 即卸载（ack 被运行期停用时调用）。仅由装配期 / 插件启停调用。
+// DropStatsProvider 返回（队列满丢弃数, 连接关闭后尝试下发数）。
+//
+// 下发丢包是传输层的事，但「丢了多少」是运维必须看见的数字：队列满丢弃是静默的，
+// 发送方以为成功、接收方收不到，唯一线索就是计数。core 只声明口子，
+// 具体实现由接入层插件提供（窄接口 + 自挂载，与 deliveryTracker 同一套路）。
+type DropStatsProvider func() (dropped, closed int64)
+
+// SetDropStats 由接入层插件在 Start 时调用；传 nil 表示不提供统计（安全降级）。
+func (h *Hub) SetDropStats(p DropStatsProvider) {
+	h.muDrop.Lock()
+	h.dropStatsFn = p
+	h.muDrop.Unlock()
+}
+
+// DropStats 返回下发丢弃统计；未接入统计时返回 (0, 0)。
+func (h *Hub) DropStats() (dropped, closed int64) {
+	h.muDrop.Lock()
+	fn := h.dropStatsFn
+	h.muDrop.Unlock()
+	if fn == nil {
+		return 0, 0
+	}
+	return fn()
+}
+
 func (h *Hub) SetDeliveryTracker(t DeliveryTracker) {
 	h.muAck.Lock()
 	h.deliveryTracker = t
@@ -140,7 +168,12 @@ func (h *Hub) HandleEnvelope(sess Session, env *protocol.Envelope) {
 		_ = protocol.UnmarshalContent(env.Content, &p)
 		// 版本协商：服务端迁就客户端
 		proto := protocol.Negotiate(env.V)
-		a := h.Registry.Bind(env.From, p.Name, p.Caps, proto, sess)
+		a, displaced := h.Registry.BindReplace(env.From, p.Name, p.Caps, proto, sess)
+		if displaced != nil && displaced.Sess != nil {
+			// 同 id 重连：旧连接已不在在线表里，让它继续挂着只会白占 socket 与写协程。
+			// 关掉它；它的读循环随后会调 UnregisterSession，因会话不匹配而静默失效。
+			_ = displaced.Sess.Close()
+		}
 		// V6 ①：声明 replay cap 的客户端，注册回执带 lastSeq（当前已持久化的最大 seq）。
 		// 未声明的客户端拿不到该字段，行为退化为历史一致。
 		var lastSeq int64
@@ -256,6 +289,9 @@ func (h *Hub) notifyUndelivered(from, target string) {
 }
 
 // Unregister 处理连接断开：摘除在线记录、退出所有房间、发布下线事件。
+//
+// 强制语义（不管表里现在是谁）：管理面主动下线、测试清理走这里。
+// 连接自然断开请用 UnregisterSession——同 id 重连时前者会误伤新会话。
 func (h *Hub) Unregister(id string) {
 	if id == "" {
 		return
@@ -263,6 +299,22 @@ func (h *Hub) Unregister(id string) {
 	h.Registry.Unbind(id)
 	h.Rooms.Drop(id)
 	h.Bus.Publish(protocol.TopicAgentOffline, id)
+}
+
+// UnregisterSession 处理「某个具体会话」断开：只有该会话仍是在线记录时才生效。
+//
+// 返回 false 表示什么都没做（会话已被新连接顶替），此时不得丢房间、不得发
+// agent.offline——否则界面上会看到「刚上线又离线」的抽搐，而实际连接好着。
+func (h *Hub) UnregisterSession(id string, sess Session) bool {
+	if id == "" {
+		return false
+	}
+	if !h.Registry.UnbindSession(id, sess) {
+		return false
+	}
+	h.Rooms.Drop(id)
+	h.Bus.Publish(protocol.TopicAgentOffline, id)
+	return true
 }
 
 // SweepLoop 定期清理心跳超时的连接，可被外部通过 ctx 取消（V3 插件化开的可控口子）。
