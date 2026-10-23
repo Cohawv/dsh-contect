@@ -17,6 +17,9 @@ backup/
 # 本地运行产物
 bin/
 
+# 压测归档（scripts/bench-baseline.sh 的产出；数字与机器强相关，不入库）
+/bench/
+
 # 根构建/运行态目录（Go hub 的 exe 由 *.exe 已忽略，这里补忽略运行态 hub.json/log 与发布目录）
 /dist/
 # 更新通道真实发布目录（由发布脚本写入，非源码，勿入库）

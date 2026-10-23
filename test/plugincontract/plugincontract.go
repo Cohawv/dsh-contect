@@ -271,6 +271,9 @@ func safeOptions(t *testing.T) map[string]map[string]any {
 		"tcpgateway":  {"addr": fmt.Sprintf("127.0.0.1:%d", freePort(t))},
 		"httpgateway": {"httpAddr": fmt.Sprintf("127.0.0.1:%d", freePort(t))},
 		"store":       {"path": initScratchDir(t)},
+		// file 插件默认 dataDir = "data/files"（相对 cwd）——不重定向就会在
+		// test/plugincontract/ 下拉出 data/ 目录。
+		"file":        {"dataDir": initScratchDir(t)},
 		"discovery":   {"bindAddr": "", "hubName": "plugin-contract"},
 		"autobrowser": {"open": false},
 	}

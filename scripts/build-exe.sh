@@ -23,5 +23,8 @@ GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS -H=windowsgui" -
 echo "==> 构建 CLI 版 dist/hubctl.exe（V7 ②：独立二进制，经 REST/SSE 与 Hub 通信）"
 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hubctl.exe ./cmd/hubctl
 
+echo "==> 构建压测版 dist/hubbench.exe（V8 ①：独立二进制，走真实协议）"
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hubbench.exe ./cmd/hubbench
+
 echo "done -> dist/"
 ls -la dist/
