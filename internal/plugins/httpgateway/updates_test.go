@@ -77,6 +77,60 @@ func TestUpdateManifestPassthrough(t *testing.T) {
 	}
 }
 
+// 签名字段必须原样透传。Hub 只是分发点，不理解也不校验签名——信任判断全在客户端，
+// 因为客户端的公钥是本地 pin 的，Hub 说什么都不影响结论。
+func TestUpdateManifestSignaturePassthrough(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LANHUB_UPDATE_DIR", dir)
+	body := `{"name":"dsh-plugin-lan-hub","latest":"0.7.0","keyId":"ab12cd34","proto":3,
+	          "artifacts":{"0.7.0":{"url":"/api/updates/pkg/a.tgz","sha256":"abc","size":123,
+	          "proto":3,"sig":"SGVsbG8=","sigAlgo":"ed25519"}}}`
+	if err := os.WriteFile(filepath.Join(dir, updateManifestFile), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := doGet(t, newUpdateMux(), UpdateManifestPath)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	var m UpdateManifest
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.KeyID != "ab12cd34" {
+		t.Errorf("keyId = %q want ab12cd34", m.KeyID)
+	}
+	a := m.Items["0.7.0"]
+	if a.Sig != "SGVsbG8=" {
+		t.Errorf("sig = %q want SGVsbG8=", a.Sig)
+	}
+	if a.SigAlgo != "ed25519" {
+		t.Errorf("sigAlgo = %q want ed25519", a.SigAlgo)
+	}
+}
+
+// 未签名的制品也必须能透传（本地开发常见）。是否拒绝由客户端按"是否配置了公钥"决定，
+// Hub 不做这个判断——它没有立场知道客户端的信任策略。
+func TestUpdateManifestUnsignedAllowed(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LANHUB_UPDATE_DIR", dir)
+	body := `{"latest":"0.7.0","artifacts":{"0.7.0":{"url":"/a.tgz","sha256":"abc","size":1,"proto":3}}}`
+	if err := os.WriteFile(filepath.Join(dir, updateManifestFile), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := doGet(t, newUpdateMux(), UpdateManifestPath)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	var m UpdateManifest
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Items["0.7.0"].Sig != "" {
+		t.Errorf("未签名制品的 sig 应为空，实际 %q", m.Items["0.7.0"].Sig)
+	}
+}
+
 // latest 指向不存在的制品属于分发事故：必须 500 报错，不能装作"没有更新"。
 func TestUpdateManifestInconsistentLatest(t *testing.T) {
 	dir := t.TempDir()

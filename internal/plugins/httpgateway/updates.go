@@ -55,6 +55,18 @@ type UpdateArtifact struct {
 	Proto int `json:"proto"`
 	// MinHost 是该版本要求的最低宿主 dsh 版本。
 	MinHost string `json:"minHost"`
+	// Sig 是该制品的 Ed25519 签名（base64），载荷为
+	// "lanhub-update\n<sigVersion>\n<name>\n<version>\n<sha256>\n<proto>"。
+	//
+	// 为什么 sha256 不够：清单与制品同源，LAN 又无认证，能改其中一个就能改另一个，
+	// 所以 sha256 只防传输截断、不防投毒。开启自动安装时，签名是唯一能证明
+	// "这包确实是发布者做的"的手段。
+	//
+	// 逐个 artifact 签（而非签整个 manifest），是为了增量发布时不必重签历史版本。
+	// 缺失/为空表示未签名，客户端在配置了公钥时应拒绝。
+	Sig string `json:"sig"`
+	// SigAlgo 是签名算法标识（当前只有 "ed25519"），为将来轮换留出空间。
+	SigAlgo string `json:"sigAlgo"`
 }
 
 // UpdateManifest 是 GET /api/updates 的响应体。
@@ -65,9 +77,34 @@ type UpdateManifest struct {
 	// Proto / MinHost 是 latest 的冗余摘要，便于客户端一眼判断兼容性。
 	Proto   int    `json:"proto"`
 	MinHost string `json:"minHost"`
+	// KeyID 标识本清单所用签名密钥（如公钥指纹前 16 位）。
+	// 只是**提示**：客户端的信任根必须 pin 在本地配置里，绝不能据 KeyID 去下载
+	// 对应公钥——否则投毒者连公钥一起发，签名就自我证明了。
+	KeyID string `json:"keyId"`
 	// Source 标明清单位置，纯调试用。
 	Source string                    `json:"source"`
 	Items  map[string]UpdateArtifact `json:"artifacts"`
+	// NextKey 是密钥轮换背书：由**当前**私钥签发的下一把公钥。
+	//
+	// Hub 不校验它（服务端不理解信任关系，也不持任何密钥），只是一路透传；
+	// 是否接受由客户端用自己 pin 的旧公钥验。这样"换钥"不必挨台改配置——
+	// 老客户端凭旧根验过背书后自己接力，而信任根始终没离开客户端本地。
+	NextKey *UpdateKeyRotation `json:"nextKey,omitempty"`
+}
+
+// UpdateKeyRotation 描述一次密钥轮换的背书。
+type UpdateKeyRotation struct {
+	// PublicKey 是下一把公钥的 PEM。
+	PublicKey string `json:"publicKey"`
+	// Sig 是用**当前**私钥对公钥本身做的 Ed25519 签名（base64），载荷为
+	// "lanhub-key-rotation\n<sigVersion>\n<publicKey>"。
+	Sig string `json:"sig"`
+	// SigAlgo 是签名算法标识（当前只有 "ed25519"）。
+	SigAlgo string `json:"sigAlgo"`
+	// KeyID 是新公钥的短标识，仅用于日志与人核对。
+	KeyID string `json:"keyId"`
+	// RotatedAt 是轮换声明时间（RFC3339），纯展示。
+	RotatedAt string `json:"rotatedAt"`
 }
 
 // updateDir 返回分发目录。允许用环境变量指向别处（容器 / 只读挂载都能用）。
