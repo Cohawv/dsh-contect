@@ -37,6 +37,7 @@ var ServerCaps = []string{
 	"agent-caps",            // list 回执携带各 agent 的 caps/proto
 	"endpoints",             // 注册回执下发 tcp/http 端点
 	"replay",                // 离线消息回放（声明后注册回执带 lastSeq、可携带 sinceSeq 续传）
+	"ack",                   // 投递确认（声明后服务端记录投递状态，可查询对账）
 }
 
 // HasCap 判断能力集中是否包含某个能力。

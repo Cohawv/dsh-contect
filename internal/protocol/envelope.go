@@ -24,6 +24,7 @@ const (
 	TypeList       = "list"        // 拉取在线列表
 	TypeSystem     = "system"      // 系统/控制回执
 	TypePresence   = "presence"    // 上下线事件
+	TypeAck        = "ack"         // 投递确认回执（V6 ②：接收方确认收到消息；仅声明 ack cap 的会话参与）
 )
 
 // Envelope 是统一的消息信封，所有接入形式（TCP / HTTP / MCP / DSH）共用同一结构。

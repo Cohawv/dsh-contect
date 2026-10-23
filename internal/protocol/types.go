@@ -10,6 +10,7 @@ const (
 	ActionCreated     = "created"     // 房间已创建
 	ActionList        = "list"        // 在线列表
 	ActionUndelivered = "undelivered" // 消息未送达（如目标离线）
+	ActionAckReceived = "ack_received" // 服务端已收到投递确认（V6 ②）
 	ActionError       = "error"       // 通用错误
 )
 

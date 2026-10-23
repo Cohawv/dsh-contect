@@ -24,3 +24,22 @@ type MessageSink interface {
 // ReplayProvider 是「离线消息回放」的窄接口：声明了 replay cap 的客户端重连时，
 // Hub 调用它把 seq > sinceSeq 且与该客户端相关的消息补发给其会话。
 type ReplayProvider func(sess Session, from string, sinceSeq int64)
+
+// DeliveryTracker 是「投递确认与对账」的窄接口（V6 ② ack 插件实现）。
+//
+// 设计动机（V6 ②）：可靠投递需要记录「一条消息是否真的被接收方确认」。Router 在消息完成
+// 路由后把路由结果（是否投递给在线接收方）交给 Track；接收方回 TypeAck 时 Hub 把回执交给
+// Ack。Tracker 的实现方（ack 插件）据此维护投递状态，供发送方查询对账。
+//
+// 与 MessageSink 同理：core 只定义接口、插件实现并把自己挂上 Hub；依赖方向严格单向
+// （ack import core，core 绝不 import ack）。钩子为 nil 时（未挂载 ack 插件，或插件被运行期
+// 停用）Hub 静默跳过——未启用 ack 的部署、以及老版本尚未理解 TypeAck 的客户端，行为完全不变。
+type DeliveryTracker interface {
+	// Track 在一条消息完成路由后调用。
+	//   - delivered == true 表示已投递给在线接收方（pending：等待接收方回 ack）；
+	//   - delivered == false 表示目标离线（failed，reason 由实现填 "offline"）。
+	// target 是接收方 agentId（点对点场景；房间/广播为 ""）。
+	Track(msgID string, delivered bool, target string)
+	// Ack 在收到一条 TypeAck 回执时调用：标记 msgID 已被接收方确认（delivered）。
+	Ack(msgID string, status string, from string)
+}

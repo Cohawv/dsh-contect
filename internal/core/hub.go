@@ -35,6 +35,11 @@ type Hub struct {
 	muReplay        sync.Mutex
 	replayProvider  ReplayProvider
 	lastSeqProvider func() int64 // 当前已持久化的最大 seq（store 注入；nil 时为 0）
+
+	// deliveryTracker 是「投递确认与对账」钩子（V6 ② ack 注入）。为 nil 时（未挂载
+	// ack 或已停用）TypeAck 退回 unknown type 语义，行为退化为历史一致。
+	muAck          sync.Mutex
+	deliveryTracker DeliveryTracker
 }
 
 func NewHub() *Hub {
@@ -87,6 +92,22 @@ func (h *Hub) replayProviderLocked() ReplayProvider {
 	f := h.replayProvider
 	h.muReplay.Unlock()
 	return f
+}
+
+// SetDeliveryTracker 注入「投递确认与对账」钩子（由 ack 插件在 Init 时调用）。
+// 传 nil 即卸载（ack 被运行期停用时调用）。仅由装配期 / 插件启停调用。
+func (h *Hub) SetDeliveryTracker(t DeliveryTracker) {
+	h.muAck.Lock()
+	h.deliveryTracker = t
+	h.muAck.Unlock()
+}
+
+// deliveryTrackerLocked 读取当前投递追踪钩子（nil 安全）。
+func (h *Hub) deliveryTrackerLocked() DeliveryTracker {
+	h.muAck.Lock()
+	t := h.deliveryTracker
+	h.muAck.Unlock()
+	return t
 }
 
 // SetLastSeqProvider 注入「当前已持久化最大 seq」读取器（由 store 插件在 Init 时调用）。
@@ -144,9 +165,17 @@ func (h *Hub) HandleEnvelope(sess Session, env *protocol.Envelope) {
 		// 点对点：目标离线时给发送方回执（与历史行为一致）
 		if missed := h.Router.Route(*env); missed != "" {
 			h.notifyUndelivered(env.From, missed)
+			if t := h.deliveryTrackerLocked(); t != nil {
+				t.Track(env.MsgID, false, missed)
+			}
+		} else if t := h.deliveryTrackerLocked(); t != nil {
+			t.Track(env.MsgID, true, env.To)
 		}
 	case protocol.TypeRoom, protocol.TypeBroadcast:
 		h.Router.Route(*env)
+		if t := h.deliveryTrackerLocked(); t != nil {
+			t.Track(env.MsgID, true, "")
+		}
 
 	case protocol.TypeCreateRoom:
 		var p struct {
@@ -184,13 +213,34 @@ func (h *Hub) HandleEnvelope(sess Session, env *protocol.Envelope) {
 		sess.Deliver(protocol.NewEnvelope(protocol.TypeSystem, "hub", env.From, "",
 			map[string]any{"action": protocol.ActionList, "agents": h.ListAgents(lp.Caps)}))
 
+	case protocol.TypeAck:
+		// V6 ②：投递确认回执。仅当挂载了 ack 插件（deliveryTracker 非 nil）时才识别——
+		// 未挂载时退回 default 的 unknown type 语义，保证「无 ack 插件的部署」与历史完全一致。
+		if t := h.deliveryTrackerLocked(); t != nil {
+			var p struct {
+				MsgID  string `json:"msgId"`
+				Status string `json:"status"`
+			}
+			_ = protocol.UnmarshalContent(env.Content, &p)
+			t.Ack(p.MsgID, p.Status, env.From)
+			sess.Deliver(protocol.NewEnvelope(protocol.TypeSystem, "hub", env.From, "",
+				map[string]any{"action": protocol.ActionAckReceived, "msgId": p.MsgID}))
+		} else {
+			h.unknownType(sess, env)
+		}
+
 	default:
-		sess.Deliver(protocol.NewEnvelope(protocol.TypeSystem, "hub", env.From, "", map[string]any{
-			"text":   "unknown type: " + env.Type, // 旧契约，保留
-			"action": protocol.ActionError,
-			"code":   protocol.CodeUnknownType,
-		}))
+		h.unknownType(sess, env)
 	}
+}
+
+// unknownType 对不认识的类型回一条 unknown_type 系统回执（旧契约，长期保留）。
+func (h *Hub) unknownType(sess Session, env *protocol.Envelope) {
+	sess.Deliver(protocol.NewEnvelope(protocol.TypeSystem, "hub", env.From, "", map[string]any{
+		"text":   "unknown type: " + env.Type, // 旧契约，保留
+		"action": protocol.ActionError,
+		"code":   protocol.CodeUnknownType,
+	}))
 }
 
 // notifyUndelivered 给发送方回一条未送达回执。
