@@ -17,5 +17,10 @@ backup/
 # 本地运行产物
 bin/
 
+# 根构建/运行态目录（Go hub 的 exe 由 *.exe 已忽略，这里补忽略运行态 hub.json/log 与发布目录）
+/dist/
+# 更新通道真实发布目录（由发布脚本写入，非源码，勿入库）
+/updates/
+
 # AI 会话数据（非项目源码）
 .workbuddy/
