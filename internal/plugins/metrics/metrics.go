@@ -307,6 +307,51 @@ func (p *Metrics) uptime() int64 {
 }
 
 // ---------------------------------------------------------------------------
+// 一次观测取值：/metrics 与 /api/metrics/summary 的唯一取值入口
+// ---------------------------------------------------------------------------
+
+// obsSnapshot 是一次观测取值的完整结果（两个端点共用）。
+//
+// 为什么必须有这一层：/metrics 与 /api/metrics/summary 是两个独立端点，
+// 但它们描述的必须是「同一台进程、同一刻」的状态。历史写法是各自就地取值——
+// render 里内联读 hub 快照与运行时快照，handleSummary 里再读一遍——
+// 于是在两个端点之间，值会各算一套：先量口径再谈数字，
+// 典型症状就是 summary 的 goroutines 与 /metrics 的 hub_goroutines 差出十几个，
+// 排查时根本分不清是「采样时差」还是「真有泄漏」。
+// 收敛成一个只调一次的函数，两处读的就是同一份数字（口径分歧比数字难看更糟）。
+type obsSnapshot struct {
+	AgentsOnline   int                 // 在线 Agent 数
+	Rooms          int                 // 房间数
+	MessagesTotal  int64               // 累计路由消息数
+	EventsDropped  int64               // 总线异步队列丢弃
+	DeliverDropped int64               // 发送队列满丢弃
+	DeliverClosed  int64               // 连接已关后丢弃
+	SSEClients     int                 // 当前 SSE 连接数
+	SSEDropped     int64               // 慢客户端丢弃的 SSE 事件
+	Runtime        plugin.RuntimeStats // 运行时资源快照（缓存版，零 STW）
+}
+
+// snapshot 采集一次当前状态。**每个请求只调一次**，端点内部复用同一份结果。
+//
+// 运行时快照固定走 cachedRuntimeStats（读缓存，不 STW）：
+// /metrics 的抓取频率由外部决定（Prometheus 默认 15s，排查时常常 1s），
+// 在这里现读 MemStats 会 stop-the-world，在扇出场景下直接表现为丢消息。
+func (p *Metrics) snapshot() obsSnapshot {
+	s := obsSnapshot{MessagesTotal: p.msgTotal.Load()}
+	if p.hub != nil {
+		s.AgentsOnline = len(p.hub.ListAgentsDetailed())
+		s.Rooms = len(p.hub.Rooms.List())
+		s.EventsDropped = p.hub.Bus.Dropped()
+		s.DeliverDropped, s.DeliverClosed = p.hub.DropStats()
+	}
+	if c, d, ok := p.sseStats(); ok {
+		s.SSEClients, s.SSEDropped = c, d
+	}
+	s.Runtime = p.cachedRuntimeStats()
+	return s
+}
+
+// ---------------------------------------------------------------------------
 // /metrics
 // ---------------------------------------------------------------------------
 
@@ -328,26 +373,20 @@ func (p *Metrics) handleMetrics(w http.ResponseWriter, r *http.Request) {
 func (p *Metrics) render() string {
 	var b strings.Builder
 
-	agentsOnline, rooms := 0, 0
-	eventsDropped, deliverDropped, deliverClosed := int64(0), int64(0), int64(0)
-	if p.hub != nil {
-		agentsOnline = len(p.hub.ListAgentsDetailed())
-		rooms = len(p.hub.Rooms.List())
-		eventsDropped = p.hub.Bus.Dropped()
-		deliverDropped, deliverClosed = p.hub.DropStats()
-	}
+	// 一次取值，全函数复用：见 obsSnapshot 上方对「同源」的说明。
+	snap := p.snapshot()
 
-	writeGauge(&b, "hub_agents_online", "当前在线 Agent 数", float64(agentsOnline))
-	writeGauge(&b, "hub_rooms", "房间数", float64(rooms))
-	writeCounter(&b, "hub_messages_total", "累计路由消息数", float64(p.msgTotal.Load()))
+	writeGauge(&b, "hub_agents_online", "当前在线 Agent 数", float64(snap.AgentsOnline))
+	writeGauge(&b, "hub_rooms", "房间数", float64(snap.Rooms))
+	writeCounter(&b, "hub_messages_total", "累计路由消息数", float64(snap.MessagesTotal))
 	// 下发侧丢弃：队列满被静默丢弃的消息数。
 	// 这是「连接正常、延迟正常、但消息少了」的唯一可见证据，必须暴露。
-	writeCounter(&b, "hub_deliver_dropped_total", "发送队列满被丢弃的消息数", float64(deliverDropped))
-	writeCounter(&b, "hub_deliver_closed_total", "连接已关闭后仍尝试下发而被丢弃的消息数", float64(deliverClosed))
+	writeCounter(&b, "hub_deliver_dropped_total", "发送队列满被丢弃的消息数", float64(snap.DeliverDropped))
+	writeCounter(&b, "hub_deliver_closed_total", "连接已关闭后仍尝试下发而被丢弃的消息数", float64(snap.DeliverClosed))
 
 	// 运行时资源（V8 ④）：长期运行的内存曲线靠这几族看。
-	// 与 /api/runtime 同源（见 cachedRuntimeStats），且渲染路径零 STW。
-	rt := p.cachedRuntimeStats()
+	// 与 /api/runtime、/api/metrics/summary 同源（同一个 snapshot），且渲染路径零 STW。
+	rt := snap.Runtime
 	writeGauge(&b, "hub_goroutines", "当前 goroutine 数（泄漏的第一信号）", float64(rt.Goroutines))
 	writeGauge(&b, "hub_heap_alloc_bytes", "存活堆对象占用字节数", float64(rt.HeapAllocBytes))
 	writeGauge(&b, "hub_heap_objects", "存活堆对象数", float64(rt.HeapObjects))
@@ -406,15 +445,10 @@ func (p *Metrics) render() string {
 		}
 	}
 
-	writeCounter(&b, "hub_events_dropped_total", "因异步队列满被丢弃的事件数", float64(eventsDropped))
+	writeCounter(&b, "hub_events_dropped_total", "因异步队列满被丢弃的事件数", float64(snap.EventsDropped))
 
-	sseClients, sseDropped := 0, int64(0)
-	if c, d, ok := p.sseStats(); ok {
-		sseClients = c
-		sseDropped = d
-	}
-	writeGauge(&b, "hub_sse_clients", "当前 SSE 连接数", float64(sseClients))
-	writeCounter(&b, "hub_sse_events_dropped_total", "因慢客户端被丢弃的 SSE 事件数", float64(sseDropped))
+	writeGauge(&b, "hub_sse_clients", "当前 SSE 连接数", float64(snap.SSEClients))
+	writeCounter(&b, "hub_sse_events_dropped_total", "因慢客户端被丢弃的 SSE 事件数", float64(snap.SSEDropped))
 
 	return b.String()
 }
@@ -508,6 +542,11 @@ func formatFloat(v float64) string {
 // ---------------------------------------------------------------------------
 
 // summaryResponse 是 /api/metrics/summary 的响应体。
+//
+// V8f：补齐「性能与规模」需要的字段（丢弃侧 + 运行时资源）。
+// 契约约束：这些 JSON 键名是前端控制台与 hubctl CLI 已经按名字开发的，
+// 改名等于破坏契约；同时它们的取值必须与 /metrics 的对应 gauge **同源**
+// （同一个 snapshot，见 obsSnapshot 上方的说明）。
 type summaryResponse struct {
 	UptimeMs          int64    `json:"uptimeMs"`
 	AgentsOnline      int      `json:"agentsOnline"`
@@ -519,6 +558,20 @@ type summaryResponse struct {
 	SSEClients        int      `json:"sseClients"`
 	IntervalMs        int64    `json:"intervalMs"`
 	Samples           []Sample `json:"samples"`
+	// 下发侧丢弃（与 /metrics 的 hub_deliver_*_total 同一份取值）：
+	// 「连接都正常、消息却少了」的唯一可核对证据。
+	DeliverDropped int64 `json:"deliverDropped"`
+	DeliverClosed  int64 `json:"deliverClosed"`
+	// 运行时资源（与 /metrics 的 hub_goroutines / hub_heap_* / hub_gc_total 同一份取值）。
+	HeapAllocBytes uint64 `json:"heapAllocBytes"`
+	HeapInuseBytes uint64 `json:"heapInuseBytes"`
+	Goroutines     int    `json:"goroutines"`
+	GCTotal        uint32 `json:"gcTotal"`
+	// 内存阈值状态：无 pprof 插件提供者时如实为 0/false，
+	// 不编一个「看起来合理」的默认阈值——那会让告警状态永远为真。
+	MemLimitBytes uint64 `json:"memLimitBytes"`
+	MemHigh       bool   `json:"memHigh"`
+	MemHighTotal  int64  `json:"memHighTotal"`
 }
 
 // handleSummary 输出概览用的趋势与速率。
@@ -527,20 +580,29 @@ func (p *Metrics) handleSummary(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// 一次取值贯穿整个响应：与 /metrics 共用同一个 snapshot，
+	// 因此「同一时刻的概览」与「同一时刻的 gauge」不会各说各话。
+	snap := p.snapshot()
 	resp := summaryResponse{
 		UptimeMs:          p.uptime(),
-		MessagesTotal:     p.msgTotal.Load(),
+		AgentsOnline:      snap.AgentsOnline,
+		Rooms:             snap.Rooms,
+		MessagesTotal:     snap.MessagesTotal,
 		HTTPRequestsTotal: p.httpTotal.Load(),
+		EventsDropped:     snap.EventsDropped,
+		SSEClients:        snap.SSEClients,
 		IntervalMs:        p.interval().Milliseconds(),
 		Samples:           p.snapshotSamples(),
-	}
-	if p.hub != nil {
-		resp.AgentsOnline = len(p.hub.ListAgentsDetailed())
-		resp.Rooms = len(p.hub.Rooms.List())
-		resp.EventsDropped = p.hub.Bus.Dropped()
-	}
-	if c, _, ok := p.sseStats(); ok {
-		resp.SSEClients = c
+
+		DeliverDropped: snap.DeliverDropped,
+		DeliverClosed:  snap.DeliverClosed,
+		HeapAllocBytes: snap.Runtime.HeapAllocBytes,
+		HeapInuseBytes: snap.Runtime.HeapInuseBytes,
+		Goroutines:     snap.Runtime.Goroutines,
+		GCTotal:        snap.Runtime.NumGC,
+		MemLimitBytes:  snap.Runtime.MemLimitBytes,
+		MemHigh:        snap.Runtime.MemHigh,
+		MemHighTotal:   snap.Runtime.MemHighTotal,
 	}
 	resp.MessagesPerSecond = ratePerSecond(resp.Samples)
 	writeJSON(w, resp)
