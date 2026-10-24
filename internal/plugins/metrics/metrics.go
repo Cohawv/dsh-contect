@@ -390,6 +390,10 @@ func (p *Metrics) render() string {
 	writeGauge(&b, "hub_goroutines", "当前 goroutine 数（泄漏的第一信号）", float64(rt.Goroutines))
 	writeGauge(&b, "hub_heap_alloc_bytes", "存活堆对象占用字节数", float64(rt.HeapAllocBytes))
 	writeGauge(&b, "hub_heap_objects", "存活堆对象数", float64(rt.HeapObjects))
+	// 堆压力的参考线：heap_alloc 长期贴着的那个"天花板"就是 next_gc，
+	// 两者的比值才是"离下一次 GC 还有多远"。只报 heap_alloc 而不报 next_gc，
+	// 读的人无从判断 300MB 是"很轻松"还是"快要 GC 了"。
+	writeGauge(&b, "hub_next_gc_bytes", "下一次 GC 的目标堆字节数（0 = 未设置）", float64(rt.NextGCBytes))
 	writeCounter(&b, "hub_gc_total", "累计 GC 次数", float64(rt.NumGC))
 	writeCounter(&b, "hub_gc_pause_seconds_total", "累计 GC 停顿秒数", float64(rt.GCPauseTotalNs)/1e9)
 	writeGauge(&b, "hub_memory_limit_bytes", "堆占用告警阈值字节数（0 = 未启用告警）", float64(rt.MemLimitBytes))
@@ -567,6 +571,10 @@ type summaryResponse struct {
 	HeapInuseBytes uint64 `json:"heapInuseBytes"`
 	Goroutines     int    `json:"goroutines"`
 	GCTotal        uint32 `json:"gcTotal"`
+	// NextGCBytes 是下一次 GC 的目标堆大小（Go 自己算的），是「快要 GC 了」的真实信号。
+	// 没有它的话，控制台只能用 memLimitBytes（默认 1GiB 的告警阈值）当参考线，
+	// 而实际堆通常远低于它，曲线长期贴底、看不出压力，也判断不了"堆是否在缓慢爬升"。
+	NextGCBytes uint64 `json:"nextGCBytes"`
 	// 内存阈值状态：无 pprof 插件提供者时如实为 0/false，
 	// 不编一个「看起来合理」的默认阈值——那会让告警状态永远为真。
 	MemLimitBytes uint64 `json:"memLimitBytes"`
@@ -600,6 +608,7 @@ func (p *Metrics) handleSummary(w http.ResponseWriter, r *http.Request) {
 		HeapInuseBytes: snap.Runtime.HeapInuseBytes,
 		Goroutines:     snap.Runtime.Goroutines,
 		GCTotal:        snap.Runtime.NumGC,
+		NextGCBytes:    snap.Runtime.NextGCBytes,
 		MemLimitBytes:  snap.Runtime.MemLimitBytes,
 		MemHigh:        snap.Runtime.MemHigh,
 		MemHighTotal:   snap.Runtime.MemHighTotal,

@@ -18,9 +18,11 @@ import (
 
 // runtimeFamilies 是 V8 ④ 新增的指标族与期望类型。
 var runtimeFamilies = map[string]string{
-	"hub_goroutines":             "gauge",
-	"hub_heap_alloc_bytes":       "gauge",
-	"hub_heap_objects":           "gauge",
+	"hub_goroutines":       "gauge",
+	"hub_heap_alloc_bytes": "gauge",
+	"hub_heap_objects":     "gauge",
+	// heap_alloc 的参考线：没有它，读的人无法判断当前堆是"轻松"还是"快要 GC 了"。
+	"hub_next_gc_bytes":          "gauge",
 	"hub_gc_total":               "counter",
 	"hub_gc_pause_seconds_total": "counter",
 	"hub_memory_limit_bytes":     "gauge",
@@ -159,7 +161,7 @@ func typeOf(body, name string) string {
 // 表现为「安静地是 0」，而这恰恰是契约破坏最难发现的一种形态。
 var summaryKeys = []string{
 	"deliverDropped", "deliverClosed",
-	"heapAllocBytes", "heapInuseBytes", "goroutines", "gcTotal",
+	"heapAllocBytes", "heapInuseBytes", "goroutines", "gcTotal", "nextGCBytes",
 	"memLimitBytes", "memHigh", "memHighTotal",
 }
 
@@ -184,6 +186,12 @@ func TestSummaryExposesPerformanceFields(t *testing.T) {
 	}
 	if s.HeapInuseBytes == 0 {
 		t.Error("heapInuseBytes = 0，期望 > 0")
+	}
+	// nextGCBytes 必须真的有值：Go 进程启动后 NextGC 由 GC 目标算出，恒为正。
+	// 等于 0 只有两种可能——取了别的字段（例如 HeapObjects 在空堆上是 0），
+	// 或者干脆没赋值。控制台要用它当"离下一次 GC 还有多远"的参考线，占位 0 会让曲线全废。
+	if s.NextGCBytes == 0 {
+		t.Error("nextGCBytes = 0，期望 > 0（取错字段或没赋值）")
 	}
 	// 丢弃侧：值必须如实来自 hub 的口子。
 	if s.DeliverDropped != 99 {
@@ -217,6 +225,9 @@ func TestSummaryAndMetricsShareRuntimeSource(t *testing.T) {
 		HeapAllocBytes: 4096,
 		HeapInuseBytes: 8192,
 		HeapObjects:    33,
+		// NextGCBytes 刻意取一个与 heapAllocBytes **不同**的值：
+		// 两者相等时，"把 NextGC 写成 HeapAlloc"这类取错字段在对照里看不出来。
+		NextGCBytes:    65536,
 		NumGC:          5,
 		GCPauseTotalNs: 1_500_000,
 		MemLimitBytes:  1 << 20,
@@ -241,6 +252,9 @@ func TestSummaryAndMetricsShareRuntimeSource(t *testing.T) {
 		{"goroutines", float64(s.Goroutines), "hub_goroutines"},
 		{"heapAllocBytes", float64(s.HeapAllocBytes), "hub_heap_alloc_bytes"},
 		{"gcTotal", float64(s.GCTotal), "hub_gc_total"},
+		// nextGCBytes 必须有同名 gauge：summary 暴露了而 Prometheus 侧没有，
+		// 就是又一次口径分家（前端画参考线、抓取端看不到同一条线）。
+		{"nextGCBytes", float64(s.NextGCBytes), "hub_next_gc_bytes"},
 		{"memLimitBytes", float64(s.MemLimitBytes), "hub_memory_limit_bytes"},
 		{"memHighTotal", float64(s.MemHighTotal), "hub_mem_high_total"},
 		{"deliverDropped", float64(s.DeliverDropped), "hub_deliver_dropped_total"},
