@@ -14,8 +14,7 @@
   "files": [
     "dist",
     "cordis.patch.yml",
-    "README.md",
-    "tools/wb_*.sh"
+    "README.md"
   ],
   "keywords": [
     "dsh-plugin"

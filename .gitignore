@@ -17,7 +17,7 @@ backup/
 # 本地运行产物
 bin/
 
-# 压测归档（scripts/bench-baseline.sh 的产出；数字与机器强相关，不入库）
+# 压测归档（数字与机器强相关，不入库）
 /bench/
 
 # 根构建/运行态目录（Go hub 的 exe 由 *.exe 已忽略，这里补忽略运行态 hub.json/log 与发布目录）
@@ -42,3 +42,17 @@ bin/
 # 一次性排障脚本
 /scripts/adb-audit.sh
 /scripts/adb-audit2.sh
+# DSHA 容器诊断脚本（会话期临时工具）
+# 例外：下面 4 个被 dsh/README.md 引用为真机操作方式，必须保留
+/dsh/tools/wb_*.sh
+!/dsh/tools/wb_cfg.sh
+!/dsh/tools/wb_config.sh
+!/dsh/tools/wb_policy.sh
+!/dsh/tools/wb_update.sh
+# 控制台 sim 测试脚本（DOM harness + 用例）
+/internal/plugins/webconsole/*.cjs
+# 度量与冒烟脚本
+/scripts/a11y-check.mjs
+/scripts/bench-baseline.sh
+/scripts/fitness.sh
+/scripts/smoke.sh

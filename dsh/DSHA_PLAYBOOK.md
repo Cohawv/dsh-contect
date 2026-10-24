@@ -644,4 +644,3 @@ curl -s "http://127.0.0.1:13539/api/tools?token=$TOK"
 参考资料（PC 侧仓库，根 `D:/AI-Agent/vibe/dsh-contect`）：
 - `dsh/README.md` —— DSHA 安装章节、配置写法
 - `dsh/build.mjs` —— esbuild 编译（`external: @deepseek-ai/*`）
-- `dsh/tools/wb_*.sh` —— 本文用到的全部容器脚本
