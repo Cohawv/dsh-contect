@@ -355,6 +355,21 @@ code {
 }
 .member-chip--empty { color: var(--text-faint); border-style: dashed; }
 
+/* 可点击踢人的成员 chip：button 重置回 chip 外观，hover 出 danger 提示可移除。
+   cursor 只在 hover 时提示——常驻 pointer 会让整个成员列表看起来全是链接。 */
+.member-chip--kick {
+  cursor: pointer; font: inherit; font-size: var(--fs-xs); font-family: inherit;
+}
+.member-chip--kick:hover { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+/* 两击确认的「已武装」态：换文字之外还要一个非颜色的信号（实心边框 + 加粗），
+   色盲/灰度打印下确认态与普通态依然可区分。 */
+.member-chip--kick.is-armed, .btn.is-armed {
+  color: var(--danger); font-weight: 600;
+  border-style: solid;
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
 /* ===================== 表单 ===================== */
 .form { display: flex; flex-direction: column; gap: var(--sp-4); }
 .form--inline { flex-direction: row; flex-wrap: wrap; align-items: flex-end; gap: var(--sp-3); }

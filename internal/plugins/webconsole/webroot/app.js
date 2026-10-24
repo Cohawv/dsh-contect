@@ -593,8 +593,13 @@
       return;
     }
     grid.innerHTML = rooms.map((rm) => {
+      // 成员 chip 是可点击的 button：点击一次进入确认态，再点才真正移除。
+      // 用 button 而不是 span——键盘用户 Tab 得到、Enter 触发；span 会把
+      // 「移除成员」这个破坏性操作从键盘路径上整个排除掉。
       const members = (rm.members || []).map((m) =>
-        '<span class="member-chip">' + esc(m) + '</span>').join('');
+        '<button type="button" class="member-chip member-chip--kick" data-kick="' + esc(m) + '" ' +
+        'data-room="' + esc(rm.id) + '" title="' + esc(ts('rooms.kickChip', '点击两次移除该成员')) + '">' +
+        esc(m) + '</button>').join('');
       const memberHtml = members || '<span class="member-chip member-chip--empty">' +
         esc(ts('rooms.noMembers', '暂无成员')) + '</span>';
       const joinDisabled = myId ? '' : 'disabled title="' + esc(ts('rooms.needMyId', '先在上方填写你的 Agent ID')) + '"';
@@ -611,6 +616,12 @@
             esc(ts('rooms.join', '加入')) + '</button>' +
           '<button class="btn btn--danger" data-leave="' + esc(rm.id) + '" ' + joinDisabled + '>' +
             esc(ts('rooms.leave', '离开')) + '</button>' +
+          // 改名 / 删除不依赖身份（房间级操作，无权限体系下的全员可管理），
+          // 但删除必须两击确认——系统没有权限体系，二次确认是不可逆操作的最后一道闸。
+          '<button class="btn btn--ghost" data-rename="' + esc(rm.id) + '" data-name="' + esc(rm.name || '') + '">' +
+            esc(ts('rooms.rename', '改名')) + '</button>' +
+          '<button class="btn btn--danger" data-drop="' + esc(rm.id) + '">' +
+            esc(ts('rooms.drop', '删除')) + '</button>' +
         '</div></div>';
     }).join('');
   }
@@ -2580,6 +2591,73 @@
     $('#room-grid').addEventListener('click', async (e) => {
       const join = e.target.getAttribute('data-join');
       const leave = e.target.getAttribute('data-leave');
+      const drop = e.target.getAttribute('data-drop');
+      const kick = e.target.getAttribute('data-kick');
+      const rename = e.target.getAttribute('data-rename');
+
+      // ---- 删除房间 / 踢成员：两击确认 ----
+      // armConfirm 把按钮切到「确认态」：换文字 + 告警色，3 秒不点自动还原。
+      // 单击直接执行对「离开」这类可逆操作没问题，但删除房间不可逆——
+      // 系统无权限体系，这 3 秒确认窗是手滑和误触之间唯一的缓冲。
+      const armConfirm = (btn, confirmText) => {
+        btn.dataset.armed = '1';
+        btn.dataset.orig = btn.textContent;
+        btn.textContent = confirmText;
+        btn.classList.add('is-armed');
+        setTimeout(() => {
+          if (btn.dataset.armed !== '1') return; // 期间已被二次点击消费
+          btn.dataset.armed = '';
+          btn.textContent = btn.dataset.orig || '';
+          btn.classList.remove('is-armed');
+        }, 3000);
+      };
+
+      if (drop) {
+        if (e.target.dataset.armed !== '1') { armConfirm(e.target, ts('rooms.dropConfirm', '确认删除')); return; }
+        e.target.disabled = true;
+        const r = await api('POST', '/api/delete_room', { roomId: drop });
+        if (r.ok) { toast(tsp('msg.roomDropped', '已删除房间 {id}', { id: drop }), 'success'); loadRooms(); loadStatus(true); }
+        else { toast('操作失败：' + r.error, 'error'); e.target.disabled = false; e.target.dataset.armed = ''; }
+        return;
+      }
+      if (kick) {
+        const roomId = e.target.getAttribute('data-room');
+        if (e.target.dataset.armed !== '1') { armConfirm(e.target, ts('rooms.kickConfirm', '确认移除')); return; }
+        e.target.disabled = true;
+        const r = await api('POST', '/api/kick', { roomId, agent: kick });
+        if (r.ok) { toast(tsp('rooms.kicked', '已移除 {n}', { n: kick }), 'success'); loadRooms(); }
+        else { toast('操作失败：' + r.error, 'error'); e.target.disabled = false; e.target.dataset.armed = ''; }
+        return;
+      }
+
+      // ---- 改名：卡片名区切换为内联输入行（确认 / 取消） ----
+      if (rename) {
+        const card = e.target.closest('.room-card');
+        const nameEl = card.querySelector('.room-card__name');
+        if (card.querySelector('.room-rename-row')) return; // 已在改名模式
+        nameEl.innerHTML =
+          '<span class="room-rename-row">' +
+          '<input class="input" type="text" maxlength="64" aria-label="' + esc(ts('rooms.renamePrompt', '新的房间名')) + '" value="' + esc(e.target.getAttribute('data-name') || '') + '">' +
+          '<button type="button" class="btn btn--ghost" data-rename-save="' + esc(rename) + '">' + esc(ts('rooms.renameSave', '保存')) + '</button>' +
+          '<button type="button" class="btn btn--ghost" data-rename-cancel="1">' + esc(ts('rooms.renameCancel', '取消')) + '</button>' +
+          '</span>';
+        const inp = nameEl.querySelector('input');
+        inp.focus(); inp.select();
+        return;
+      }
+      const renameSave = e.target.getAttribute('data-rename-save');
+      if (renameSave) {
+        const inp = e.target.closest('.room-rename-row').querySelector('input');
+        const newName = inp.value.trim();
+        if (!newName) { toast(ts('rooms.renameNeedName', '房间名不能为空'), 'error'); inp.focus(); return; }
+        e.target.disabled = true;
+        const r = await api('POST', '/api/rename_room', { roomId: renameSave, name: newName });
+        if (r.ok) { toast(tsp('msg.roomRenamed', '已改名为 {name}', { name: newName }), 'success'); loadRooms(); }
+        else { toast('操作失败：' + r.error, 'error'); e.target.disabled = false; }
+        return;
+      }
+      if (e.target.getAttribute('data-rename-cancel')) { loadRooms(); return; } // 重绘即还原
+
       if (!join && !leave) return;
       const myId = getMyId();
       if (!myId) { toast(ts('msg.needMyId', '请先在上方填写你的 Agent ID'), 'error'); return; }
@@ -3347,7 +3425,7 @@
      ===================================================================== */
 
   // 与 sw.js 的 SW_VERSION 同值（缓存版本 / 设置页展示的版本号）
-  const APP_VERSION = '7.6';
+  const APP_VERSION = '7.7';
   const INSTALL_STATES = ['idle', 'available', 'installing', 'installed', 'unsupported'];
   const INSTALL_LABEL = '安装应用';
   const OFFLINE_TEXT = '已离线：正在显示最近一次缓存的数据，恢复网络后会自动刷新。';
@@ -3731,6 +3809,14 @@
 
   /* V8f：性能视图的可测入口——供 console-perf-sim.cjs 在 Node vm 里驱动断言
      （视图注册 / 渲染 / 曲线 / 轮询开关 / 纯函数模型）。生产行为不变。 */
+  // 房间管理的可测入口：console-rooms-manage-sim.cjs 在 vm 里驱动真实渲染与点击处理。
+  // handler 本身绑在 #room-grid 上（委托），sim 通过替身元素的 _h.click 直接调用。
+  window.LanHubRooms = {
+    loadRooms: loadRooms,
+    renderRooms: renderRooms,
+    cache: function () { return roomsCache; },
+  };
+
   window.LanHubPerf = {
     state: perfState,
     CONST: {
