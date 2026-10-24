@@ -205,10 +205,40 @@ OUT=/sdcard/your.log
 `ERROR: could not get idle state`（启动页日志区持续刷新导致），此时改为 `screencap` 截图目测坐标：
 
 ```
-底部导航 4 个按钮：x≈130 / 400 / 670 / 944 ，y≈2272
-终端主体 (540,1400)   启动 DSHA (540,430)   停止 (760,700)
+底部导航 4 个按钮：x≈130 / 400 / 670 / 944 ，y≈2230
+终端主体 (540,1400)   启动 DSHA (540,608)   停止 (765,806)
 换算：截图宽度 500px → 实际 1080，系数 2.16；截图高度 1030 → 2340，系数 2.27
 ```
+
+**又一台机型：某国产 Android 14（SDY-AN00，1200×2652）** —— 2026-10-24 实测，
+**底部导航在 y≈1600，不是 2548**（旧记录里的 2548 打过去毫无反应，白排查半小时）：
+
+```
+底部导航 4 个按钮：x≈150 / 450 / 750 / 1050 ，y≈1600
+启动页：  ▶ 进入工作台/启动 DSHA (600,704)   ↻ 重启 (350,886)   □ 停止 (851,886)
+终端页：  ＋ 新建 (1020,602)   终端主体 (600,1400)
+```
+
+> **别猜、也别信旧记录**：布局随 DSHA 版本变（手机一 dsh 0.2.0-rc.2 与手机二
+> 0.2.1-rc.2 的启动页按钮就差了一截）。可靠做法是 `uiautomator dump` 后**按
+> text 取 bounds**，而不是按机型背坐标。dump 出来的 `text` 是屏幕坐标，
+> 直接取中心点即可；只有当 dump 的 text 为空（Compose 未生成语义节点）时，
+> 才退回截图目测。
+
+**screencap 返回 0 字节时的排查**（2026-10-24 在某国产 Android 14 上遇到）：
+
+```
+adb shell screencap -p /sdcard/x.png   →   文件存在但 0 字节
+adb exec-out screencap -p > x.png      →   同样 0 字节
+dumpsys power | grep mWakefulness      →   mWakefulness=Awake（屏幕没睡）
+```
+
+此时**不是息屏、也不是没 root**，而是该机型的 SurfaceFlinger 对当前 adb 会话
+拒绝出图。**别在截图上死磕**：直接改用 `uiautomator dump`（同机照常成功），
+再配 `dumpsys window | grep mCurrentFocus` 确认前台是谁。
+实战里这比截图更可靠——微信/微博等带悬浮窗的应用还会盖住前台窗口，
+`am start` 之后必须用 `mCurrentFocus` 复核，必要时先 `input keyevent 3`（HOME）
+再 `am start`，否则你以为切到了 DSHA，实际点的是悬浮窗后面的别的应用。
 
 ### 5.2 页面文本读取
 
@@ -311,6 +341,12 @@ node -e "fetch('http://127.0.0.1:8081/api/agents').then(r=>r.text()).then(t=>con
 | 20 | 偶尔启动时日志出现 `discovery failed: discovery timeout`，但同一个网络下重启一次又好了 | **启动早期**网卡/路由/省电策略的瞬时未就绪，单次发现超时；功能上靠 fallback 仍能连上，但看起来像报错 | 0.1.2 起自动**重试 2 次**（间隔 1.2s）再兜底；失败日志带诊断 `ifaces=N, sent=M, recv=K`：`ifaces=0` 即网卡还没就绪，属瞬时问题，**不必处理** |
 | 21 | 日志警告 `dsh: warning: 1 entry did not activate` + `dsh-mesh-fleet: TypeError: invalid mesh-fleet config: expected an object` | mesh-fleet 自带 patch 写的是 `config: ${{config}}`，用户 patch 里没有该条目 → 占位符替换成**字符串**；而 `resolveConfig` 只接受对象/`undefined`/`null` | 在 `cordis.patch.yml` 追加 `- id: dsh-mesh-fleet` / `name: dsh-mesh-fleet` / `config: {}`，重启后应出现 `插件加载完成：dsh-mesh-fleet`。**注意**：它导致 mesh-fleet 的 11 个工具不注册，但**不是**工作台卡死的原因 |
 | 22 | **整个 DSHA 界面点哪都没反应**，画面停在最后一帧（还能滚动、内容偶尔还会增加），发消息/切会话都无效 | dsh web 的**本地监听 `127.0.0.1:3080` 被一条挂死的请求堵死**，后续请求全部排队不返回；页面数据全走 3080，所以交互全死。同进程的 `*:3081`（局域网）完全正常，因此**不是进程崩了**。触发点：打开「工作台」页面必然复现（真机两台各复现 2 次） | **区分方法**：`ss -ltn` 看 3080/3081 都在监听 → 设备内 `nc 127.0.0.1 3081` 秒回 401、`nc 127.0.0.1 3080` 一个字节不回 = 就是本条。**恢复**：DSHA「停止 → 启动」（或强杀 App 重开）；重启后只要不点「进入工作台」，3080 长时间稳定 |
+| 23 | 插件日志写着「加载完成」、Hub 上 agent 也在线，但**模型一个工具都调不到**；日志里另有 `dsh: warning: 1 entry did not activate` + `JsonSchemaError: ... required must be true when present` | 工具参数写了 JSON Schema 的 **`required: false`**。宿主 `@deepseek-ai/dsh-tools` 的 schema 编译器硬规则：属性上只要带了 `required`，值就必须**严格等于 true**；可选字段要**省略该键**。连接是在 `ctx.effect` 里先建立的，所以连接成功掩盖了注册失败 | 删掉这些 `required: false`（不能改成 `true`，那会让参数变必填）。回归测试：`node --experimental-strip-types test/schema-check.ts`——直接用宿主同款校验器 `assertSupportedJsonSchema` 校验每个工具。**验收信号是「did not activate」消失**，不是「加载完成」 |
+| 24 | 配了 `host: auto` 但日志一直 `discovery timeout (ifaces=0, sent=1, recv=0)`，最后靠 fallback 才连上 | **proot 容器里枚举不到可用网卡**（手机一 `ifaces=1` 能发现成功，手机二 `ifaces=0` 全打空）。此时 auto 等于完全失效，全靠 `fallbackHost` 兜底 | `host: 'auto'` **必须同时显式配 `fallbackHost`**（Hub 的局域网 IP）。看日志里是 `discovered hub at`（走通了）还是 `fallback`（兜底），别混淆 |
+| 25 | `screencap -p` 生成了文件但**大小 0 字节**，`exec-out` 也一样；`dumpsys power` 显示屏幕 Awake | 该机型 SurfaceFlinger 对当前 adb 会话拒绝出图（**不是息屏、也不是没 root**） | 直接改用 `uiautomator dump`（同机照常成功）取 bounds；别在截图上死磕 |
+| 26 | 按旧记录的坐标 tap 底部导航毫无反应，dump 出来的 bounds 又和屏幕坐标对不上 | **布局随 DSHA 版本变**：手机一 dsh 0.2.0-rc.2 与手机二 0.2.1-rc.2 的按钮位置不同；旧机型坐标（2548）对另一台机型无效 | 每台机器现场 `uiautomator dump` 取 bounds 中心点，**不要背坐标**；tap 完再 dump 复核是否切页成功 |
+| 27 | `am start` 之后前台仍是别的应用（微博） | 微博的 `WeiboBrowser` 是 **SYSTEM_ALERT_WINDOW 悬浮窗**，优先级高于 Activity，`am start` 抢不回焦点 | `input keyevent 3`（HOME）→ `am start` → 用 `dumpsys window \| grep mCurrentFocus` 复核；必要时 `am force-stop` 那个应用 |
+| 28 | 新开一条 shell 后 `adb devices` 空、`adb forward` 也失效 | 每个 Bash 命令是**新会话**，adb server 被回收 → 连接与端口转发一起丢（无线调试设备尤其明显） | 每条命令开头 `adb connect <ip:port>`；**forward 与 curl 必须放在同一条命令里**，否则转发当场失效（曾因此误判成「服务没起来」） |
 
 ---
 
@@ -437,6 +473,18 @@ sleep 8
 | `wb_extract.sh` | 把编译产物导出到 /sdcard 供 `adb pull` 拉回 |
 | `wb_e2e.sh` | 端到端：加载插件、调用 8 个工具、与电脑端双向收发 |
 | `wb_final.sh` | 最终状态核实 |
+| `wb_deploy.sh` | **参数化**装指定版本插件：`sh wb_deploy.sh <版本> [profile]`。装前装后 dump profile 的 patch 全文 + 校验装进去的版本与关键能力特征 |
+| `wb_cfg.sh` | **参数化**写配置：`sh wb_cfg.sh <版本> <agentId> <agentName>`。固化依赖源到 `/root/local-plugins/`、删掉旧 lan-hub 块并追加**字段写全**的配置块 |
+| `wb_export_log.sh` | 把容器内 `dsh-web.log` 的关键段（版本/配置/加载行/lan-hub 行/错误）导出到 `/sdcard/lanhub.log`——**容器文件 adb 看不见，只能这么搬证据** |
+| `wb_tools.sh` | 探查宿主已注册的工具清单（`dsh` CLI 没有 tools 子命令，这条路当时未走通，见 §13.4） |
+
+> **多台手机的标准动作**（2026-10-24 实测顺序，脚本都已就位）：
+> 1. `adb push` 三件套：`dsh-plugin-lan-hub-<版本>.tgz` + `wb_deploy.sh` + `wb_cfg.sh`
+> 2. 终端注入 `sh /sdcard/wb_cfg.sh <版本> <agentId> <agentName>`
+>    （这一步同时完成「装版本 + 固化依赖源 + 写配置」，不用再单独跑 deploy）
+> 3. 启动页「停止 → 启动」（**必须**，见 §6.3）
+> 4. `sh /sdcard/wb_export_log.sh` → `adb shell cat /sdcard/lanhub.log` 核对
+> 5. PC 侧 `curl http://127.0.0.1:8081/api/agents` 确认该 agent 在线且 caps 全量
 
 ## 13. 本项目已验证的终态
 
@@ -510,6 +558,88 @@ hub_list_agents, hub_read_messages, hub_send, hub_send_room
 
 > **`dsh plugin add` 会触发插件热重载**：实测装完包 + 改完配置后，无需「停止→启动」，
 > 日志就直接出现新的 `discovered hub at ... (auto)`。若改的是 bundle 层或不生效，再走 §6.3。
+
+### 13.2 「插件激活失败但连接正常」——0.7.0 → 0.7.1 的真机取证与修复
+
+**症状（最容易被判成「装好了」的一种故障）**：
+
+```
+[DSHA_STARTUP] 插件加载完成：dsh-plugin-lan-hub      ← 看着像成功
+[lan-hub] connected to 192.0.2.78:8080 as phone1   ← 连接也成功
+[lan-hub] negotiated proto=3 heartbeat=15000ms features=[...]
+dsh: warning: 1 entry did not activate               ← 但插件其实没激活
+lan-hub (dsh-plugin-lan-hub): JsonSchemaError: unsupported JSON schema:
+    parameters.autoRespond.required must be true when present
+```
+
+Hub 在线表里 agent **照样在**（因为连接是在 `ctx.effect` 里先建立的），
+但模型**一个工具都调不到**——10 个 `hub_*` 全部没注册。
+
+**根因**：工具参数写成了 JSON Schema 的 `required: false`。
+宿主 `@deepseek-ai/dsh-tools` 的 schema 编译器有硬规则：
+**属性上只要带了 `required`，值就必须严格等于 `true`**。
+可选字段的正确写法是**省略该键**，不是写 `false`。
+
+**修法**：`dsh/src/index.ts` 里 `hub_config` 的 6 个可选参数删掉 `required: false`
+（不能改成 `true`——那会让参数变必填，语义就变了）。
+
+**回归测试**（`dsh/test/schema-check.ts`）：不自己写近似规则，
+直接用宿主同款校验器 `@deepseek-ai/dsh-tools` 的 `assertSupportedJsonSchema`
+去校验每个注册工具的 `parameters`，并断言 10 个工具齐全：
+
+```bash
+cd D:/AI-Agent/vibe/Agent-core-contect/dsh
+node --experimental-strip-types test/schema-check.ts
+# 反向验证：把 required:false 加回 autoRespond → 测试当场变红，
+# 报错信息与真机日志逐字一致
+```
+
+**验收信号**（修复后在两台真机上都验过）：
+
+```
+[DSHA_STARTUP] 插件加载完成：dsh-plugin-lan-hub
+[lan-hub] connected to 192.0.2.78:8080 as phoneN
+[lan-hub] negotiated proto=3 heartbeat=15000ms features=[structuredAck,heartbeat,discovery,agentCaps,endpoints]
+（没有 "1 entry did not activate"，也没有 JsonSchemaError）
+```
+
+> **通用教训**：DSHA 的启动日志只说「插件加载完成」，**真正的判据是
+> "did not activate" 有没有出现**。装完插件一定要 grep 这一行，
+> 光看「加载完成」会漏掉整类激活失败。
+
+### 13.3 `host: auto` 在 proot 容器里可能发现不到（ifaces=0）
+
+```
+[lan-hub] discovery attempt 1/2 failed: discovery timeout (ifaces=0, sent=1, recv=0)
+[lan-hub] discovery attempt 2/2 failed: discovery timeout (ifaces=0, sent=1, recv=0)
+[lan-hub] discovery failed, fallback 192.0.2.78:8080
+[lan-hub] connected to 192.0.2.78:8080 as phone2      ← 靠兜底连上
+```
+
+`ifaces=0` 表示插件在容器里枚举不到可用网卡（proot 环境的网卡枚举限制）。
+此时 UDP 广播/单播全打空，**能连上完全是靠 `fallbackHost`**。
+
+所以 `host: 'auto'` **必须同时配 `fallbackHost`**，否则在容器里等于完全连不上。
+两台真机的表现也不一致：手机一 `ifaces=1` 能直接发现成功，手机二 `ifaces=0`
+走兜底。**判定标准看日志里的 `discovered hub at` 还是 `fallback`**。
+
+### 13.4 DSHA Web 端的 token（要查工具清单时才用得上）
+
+Web 端（容器内 35039 / 3080）除 `/` 外全部要 token，且**DSHA 重启后 token 会变**：
+
+```bash
+# 1) 从启动页「启动日志」区拿当前 token（uiautomator dump 能读到）
+"$ADB" -s "$T" shell "uiautomator dump /sdcard/ui.xml" >/dev/null 2>&1
+"$ADB" -s "$T" shell "sed 's/></>\n</g' /sdcard/ui.xml" | grep -oE 'token=[-A-Za-z0-9_]+'
+
+# 2) 转发到 PC 再访问（adb forward 会随会话丢失，必须同一条命令里做完）
+"$ADB" -s "$T" forward tcp:13539 tcp:35039
+curl -s "http://127.0.0.1:13539/api/tools?token=$TOK"
+```
+
+> 2026-10-24 实测：`?token=` / `Authorization: Bearer` / `X-Token` 三种传法
+> 都返回 `unauthorized`，**工具清单这条路当时没走通**。判断插件是否激活，
+> 用 §13.2 的日志信号更省事。
 
 参考资料（PC 侧仓库，根 `D:/AI-Agent/vibe/Agent-core-contect`）：
 - `dsh/README.md` —— DSHA 安装章节、配置写法

@@ -89,32 +89,52 @@ dsh plugin --profile demo add ./dsh
 用 proot 把 Ubuntu + Node 24 + dsh 搬进 App 私有目录，自带终端与插件管理。
 
 > 以下步骤在真机上实测通过：
-> 荣耀 SDY-AN00 / Android 14 / DSHA 0.2.21 / dsh 0.2.0-rc.2 / Node v24.19.0。
+> 手机一 华为 YAL-AL10 / Android 10 / DSHA / dsh 0.2.0-rc.2 / Node v24.19.0；
+> 手机二 荣耀 SDY-AN00 / Android 14 / dsh 0.2.1-rc.2 / Node v24.19.0。
+> （下文的版本号请替换成当前 `package.json` 的 version。）
 
 1. **打包**（在本目录执行）
 
    ```sh
    npm run build   # 生成 dist/index.js
-   npm pack        # 产出 dsh-plugin-lan-hub-0.1.0.tgz（含 dist）
+   npm pack        # 产出 dsh-plugin-lan-hub-<版本>.tgz（含 dist）
    ```
 
-2. **传到手机**：以下任选
-   - 电脑起临时 HTTP 服务，手机浏览器下载（最快）：
-     `python -m http.server 8000` → 手机访问 `http://<电脑IP>:8000/`
-   - 微信 / QQ 文件传输助手 → 存到手机 `Download` 目录
-   - `adb push dsh-plugin-lan-hub-0.1.0.tgz /sdcard/Download/`
+2. **传到手机**（`adb push` 最省事，不依赖手机能访问电脑的 HTTP）：
 
-3. **在 DSHA 的终端里安装**
+   ```sh
+   adb push dsh-plugin-lan-hub-<版本>.tgz /sdcard/
+   adb push tools/wb_cfg.sh /sdcard/          # 一条命令完成「装版本 + 写配置」
+   ```
 
-   先复制到容器内部再装，避免依赖外部存储：
+   其它方式：电脑起临时 HTTP 服务让手机浏览器下载、微信/QQ 传文件到 `Download`。
+
+3. **在 DSHA 的终端里安装 + 配置**
+
+   **推荐用现成脚本**（`dsh/tools/wb_cfg.sh`，一条命令做完装包、固化依赖源、
+   重写配置块、连通性自测）：
+
+   ```sh
+   sh /sdcard/wb_cfg.sh <版本> <agentId> <agentName>
+   # 例：sh /sdcard/wb_cfg.sh 0.7.1 phone1 Phone1
+   ```
+
+   它做四件事：把 tgz 复制到 `/root/local-plugins/`（不依赖 /sdcard）、
+   `rm -rf` 旧 `node_modules` 后 `dsh plugin --profile web add`、
+   重写 profile 里 `lan-hub` 配置块（**字段写全**，patch 是整块替换）、
+   打印依赖源与连通性结果。
+
+   手工等价写法：
 
    ```sh
    mkdir -p /root/local-plugins
-   cp /sdcard/Download/dsh-plugin-lan-hub-0.1.0.tgz /root/local-plugins/
-   dsh plugin --profile web add /root/local-plugins/dsh-plugin-lan-hub-0.1.0.tgz
+   cp /sdcard/dsh-plugin-lan-hub-<版本>.tgz /root/local-plugins/
+   rm -rf /root/.dsh/profiles/web/node_modules/dsh-plugin-lan-hub   # 覆盖装必须先删
+   cd /root/.dsh/profiles/web
+   dsh plugin --profile web add /root/local-plugins/dsh-plugin-lan-hub-<版本>.tgz
    ```
 
-   装完确认已进 bundles：
+   装完确认已进依赖：
 
    ```sh
    grep -A20 '"bundles"' /root/.dsh/profiles/web/package.json   # 应含 dsh-plugin-lan-hub
@@ -122,9 +142,25 @@ dsh plugin --profile demo add ./dsh
 
 4. **改 Hub 地址**（见下方「手机必须改的配置」）
 
+   > 多台手机**必须用不同 `agentId`**（`phone1` / `phone2`），否则在 Hub 上
+   > 按 id 注册会互相顶掉。`host: 'auto'` 建议同时显式配 `fallbackHost`——
+   > proot 容器里可能枚举不到网卡（`ifaces=0`），此时全靠兜底才能连上。
+
 5. **完整重启**：在 DSHA 启动页 **停止 → 启动**。
    只点「重启 Web」可能不会刷新插件清单（实测过：插件虽在管理页显示"已启用"，
    但本次启动的日志里仍没有它）。
+
+6. **验收**（别只看「加载完成」，要看有没有激活失败）：
+
+   ```sh
+   sh /sdcard/wb_export_log.sh      # 把容器内 dsh-web.log 关键段导出到 /sdcard/lanhub.log
+   # PC 侧：adb shell cat /sdcard/lanhub.log
+   #   期望：「插件加载完成：dsh-plugin-lan-hub」+「connected to ... as <agentId>」
+   #   且**没有**「did not activate」与 JsonSchemaError
+   curl http://127.0.0.1:8081/api/agents    # 期望看到该 agent，且 caps 五项齐全
+   ```
+
+   坐标、注入铁律、踩坑清单见 `dsh/DSHA_PLAYBOOK.md`（§3 容器通路、§5 坐标、§6 安装、§7 坑表）。
 
 #### 为什么必须发布编译后的 JS（关键）
 
@@ -571,6 +607,39 @@ updates/pkg/dsh-plugin-lan-hub-0.7.0.tgz
 | `hub_config` | `autoRespond?`, `wakeRoom?`, `muteForSec?`, `room?`, `unmute?`, `reset?` | 在线改策略（立即生效，不重连） |
 | `hub_stats` | — | 当前生效策略 + 计数（诊断「为什么不回」） |
 
+### 工具参数 schema 的硬规则（写错会「静默失效」）
+
+宿主的 `@deepseek-ai/dsh-tools` 在编译工具的 JSON Schema 时有一条硬规则：
+
+> **属性上只要带了 `required`，它的值就必须严格等于 `true`。**
+
+所以**可选参数的正确写法是省略 `required` 键**，而不是写 `required: false`：
+
+```ts
+// ✅ 可选参数：省略 required
+autoRespond: { type: 'boolean', description: 'Turn auto-reply on/off' }
+
+// ❌ 会让整条插件注册失败
+autoRespond: { type: 'boolean', required: false, description: '...' }
+```
+
+失败时的症状极具迷惑性（2026-10-24 在两台真机上实测）：
+
+```
+[DSHA_STARTUP] 插件加载完成：dsh-plugin-lan-hub      ← 看着像成功
+[lan-hub] connected to 192.0.2.78:8080 as phone1   ← 连接也成功
+dsh: warning: 1 entry did not activate               ← 但插件其实没激活
+lan-hub (dsh-plugin-lan-hub): JsonSchemaError: unsupported JSON schema:
+    parameters.autoRespond.required must be true when present
+```
+
+连接是在 `ctx.effect` 里先建立的，所以**连接成功会掩盖注册失败**：
+Hub 在线表里 agent 照常在，但模型一个工具都调不到。
+**验收要看「did not activate」有没有出现，不能只看「加载完成」。**
+
+回归测试见 `test/schema-check.ts`——它直接用宿主同款校验器
+`assertSupportedJsonSchema` 校验每个注册工具的 parameters。
+
 ## 收信流水线（设计要点）
 
 ```
@@ -650,7 +719,17 @@ node test/smoke.ts
 
 # 插件入口（模拟 Cordis 运行时，mock 掉 @deepseek-ai/*）
 node --import ./test/mocks/register.mjs ./test/plugin-sim.ts
+
+# 工具参数 schema 合规（用宿主同款校验器，不需要 Hub）
+node --experimental-strip-types test/schema-check.ts
 ```
+
+> **`plugin-sim.ts` 与 `schema-check.ts` 的分工**：前者 mock 掉了 `@deepseek-ai/*`，
+> 能验「10 个工具都注册了、execute 都真生效」；但 mock 掉的校验器**不会**执行
+> 宿主的 JSON Schema 编译规则，所以 `required: false` 这类写法它照样放行
+> （0.7.0 就是这样一路溜到真机才炸）。`schema-check.ts` 补的就是这一刀：
+> 直接调 `@deepseek-ai/dsh-tools` 的 `assertSupportedJsonSchema`，
+> **让宿主自己说行不行**——宿主规则变了，这条测试会先红。
 
 `smoke.ts` 覆盖：注册、私聊、建房/进房/房间消息、广播、离线提示、上下线事件、收件箱清空。
 `plugin-sim.ts` 覆盖：插件契约、10 个工具注册、每个工具 execute 真实生效、
