@@ -1112,3 +1112,13 @@ html, body { -webkit-tap-highlight-color: transparent; }
   border-top: 2px dashed var(--warning); vertical-align: middle;
 }
 .trend__dash--gc { border-top-style: dotted; border-top-color: var(--accent-2); }
+
+/* V8f：快照停更/降级横幅（与 .error-banner 同构，只是换成 warning 语义：
+   数据没坏、只是停止更新了，用红色会把"降级"误报成"故障"） */
+.warn-banner {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4); border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
+  color: var(--warning); font-size: var(--fs-sm); margin-bottom: var(--sp-4);
+}

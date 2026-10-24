@@ -177,6 +177,8 @@
           </div>
           <div class="card__body">
             <div id="perf-alert"></div>
+            <!-- 快照停更提示（>30 秒没刷才出现；由 JS 按状态跃迁渲染，不每 2 秒播报） -->
+            <div id="perf-snap-stale"></div>
             <div class="perf-grid">
               <div class="trend">
                 <div class="trend__head">
@@ -204,8 +206,11 @@
                 <div class="trend__axis" id="perf-heap-axis"><span>—</span></div>
               </div>
             </div>
-            <!-- 只在状态跃迁（丢弃 0→正、进出内存告警）时写入，避免每 2 秒播报一次 -->
+            <!-- 只在状态跃迁（丢弃 0→正、进出内存告警、快照停更/恢复）时写入，避免每 2 秒播报一次 -->
             <div class="sr-only" id="perf-live" role="status" aria-live="polite" aria-atomic="true"></div>
+            <!-- 观测口径说明：数据不做平滑/丢弃，只把「快照 15 秒粒度」讲清楚。
+                 冷启动头 15 秒的 goroutine / heap 仍是启动瞬间值，曲线会出现一段陡升 —— 那是真的，不是 bug。 -->
+            <p class="hint" data-i18n="perf.snap.note">运行时快照为 15 秒粒度（samples 里的 ts 是快照采样时刻，不是本次请求时刻）：进程刚启动的头 15 秒仍会报启动瞬间的值，曲线出现的陡升是真的采样，不做平滑；曲线末端最老可能差 15 秒。</p>
           </div>
         </div>
 

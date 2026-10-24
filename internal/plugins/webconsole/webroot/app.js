@@ -1842,6 +1842,10 @@
      ===================================================================== */
   const PERF_POLL_MS = 2000;   // 采样周期：与「每 2 秒」的对外承诺一致
   const PERF_WIN_CAP = 120;    // 滑动窗口上限：120 点 × 2 秒 ≈ 4 分钟
+  // 运行时快照的刷新周期是 15 秒（pprof 侧为消灭 STW 的设计），因此"两轮没刷"
+  // （>30 秒）就判定为停止更新：再等下去只会让用户怀疑服务端时钟坏了。
+  const PERF_SNAP_MS = 15000;
+  const PERF_SNAP_STALE_MS = PERF_SNAP_MS * 2;
 
   const perfState = {
     timer: null,                 // 轮询定时器（null = 未轮询）
@@ -1849,7 +1853,7 @@
     last: null,                  // 最近一次 summary 原始响应
     prev: null,                  // 上一次 summary（算「较上次」增量用）
     error: '',                   // 最近一次失败原因（空 = 正常）
-    live: { drops: false, mem: false }, // a11y 播报去重：只在状态跃迁时说话
+    live: { drops: false, mem: false, stale: false }, // a11y 播报去重：只在状态跃迁时说话
   };
 
   // perfNum 把任意输入收敛成有限数字：字段缺失（后端尚未升级）时一律当 0，
@@ -1861,13 +1865,21 @@
 
   // perfModel 是**纯函数**：把 summary 响应收敛成视图用的模型（含告警判定）。
   // 之所以抽出来：console-perf-sim.cjs 可以不碰 DOM 就验证判定与格式化逻辑。
-  function perfModel(raw) {
+  // nowMs 显式传入是为了让「快照有多旧」的判定在测试里可复现（默认取当前时间）。
+  function perfModel(raw, nowMs) {
     const m = raw || {};
+    const now = perfNum(nowMs) > 0 ? perfNum(nowMs) : Date.now();
     const deliverDropped = perfNum(m.deliverDropped);
     const deliverClosed = perfNum(m.deliverClosed);
     const memLimit = perfNum(m.memLimitBytes);
     const heapAlloc = perfNum(m.heapAllocBytes);
     const nextGC = perfNum(m.nextGCBytes);
+    // samples 的最后一点：它的 ts 是**快照采样时刻**（pprof 每 15 秒刷一次缓存），
+    // 不是本次请求的时刻 —— 所以"快照有多旧"只能看这个 ts。
+    const samples = Array.isArray(m.samples) ? m.samples : [];
+    const lastSample = samples.length ? samples[samples.length - 1] : null;
+    const sampleTs = lastSample ? perfNum(lastSample.ts) : 0;
+    const sampleAge = sampleTs > 0 ? Math.max(0, now - sampleTs) : null;
     return {
       rate: perfNum(m.messagesPerSecond),
       deliverDropped: deliverDropped,
@@ -1891,6 +1903,13 @@
       heapPct: memLimit > 0 ? Math.round((heapAlloc / memLimit) * 100) : null,
       // GC 水位：nextGC=0（未设置/插件未提供）时为 null，界面显示「—」而不是编一个 0%。
       gcPct: nextGC > 0 ? Math.round((heapAlloc / nextGC) * 100) : null,
+      // 快照新鲜度：运行时快照每 15 秒才刷新一次，超过 30 秒（两轮没刷）说明
+      // 快照协程停了（典型是 pprof 插件被停用），此时曲线末端是"冻住"的旧值。
+      sampleTs: sampleTs,
+      sampleAge: sampleAge,
+      // 边界：恰好 30 秒不算停更（允许一轮刷新的抖动），严格大于才触发。
+      sampleStale: sampleAge !== null && sampleAge > PERF_SNAP_STALE_MS,
+      samplesCount: samples.length,
       warnDrops: deliverDropped + deliverClosed > 0,
       warnMem: !!m.memHigh,
     };
@@ -2210,6 +2229,19 @@
         note: ts('perf.note.memHighTotal', '进入"超阈值"状态的累计次数（回落后再次越线会再计一次）'),
         warn: false,
       },
+      {
+        // 快照时刻：让用户一眼看出「这条曲线最老可能差 15 秒」，
+        // 而不是把冷启动的陡升当成故障、或者怀疑服务端时钟坏了。
+        label: ts('perf.row.snapTs', '快照时刻'),
+        value: model.sampleTs > 0
+          ? fmtClock(model.sampleTs) + ' · ' + fmtAgo(model.sampleTs)
+          : '—',
+        note: model.sampleTs > 0
+          ? tsp('perf.note.snapTs', 'samples 最后一点的采样时刻（{n} 点）；运行时快照 15 秒刷新一次',
+            { n: fmtInt(model.samplesCount) })
+          : ts('perf.note.snapNone', '还没有运行时快照（pprof 插件未启用时不会有）'),
+        warn: model.sampleStale,
+      },
     ];
     body.innerHTML = rows.map((r) =>
       '<tr' + (r.warn ? ' class="is-warn"' : '') + '>' +
@@ -2229,8 +2261,25 @@
       esc(perfState.error) + '</div>';
   }
 
+  // renderPerfSnap 画「运行时快照是否还在更新」的降级提示。
+  //
+  // 为什么不"平滑/丢弃"冷启动的头几个点：观测端不能篡改被观测值——曲线一旦被
+  // 修饰，就和 /metrics 的 gauge 对不上了，排障时反而更可疑。所以这里只解释、
+  // 不改数：数据照原样画，把「快照 15 秒粒度 / 末端可能差 15 秒」说清楚。
+  function renderPerfSnap(model) {
+    const host = $('#perf-snap-stale');
+    if (!host) return;
+    if (!model.sampleStale) { host.innerHTML = ''; return; }
+    host.innerHTML = '<div class="warn-banner">' +
+      '<span aria-hidden="true">⚠</span>' +
+      '<span>' + esc(ts('perf.snap.stale', '运行时数据已停止更新')) + '：' + esc(tsp(
+        'perf.snap.staleDesc', '最后一份快照在 {time}（{ago}）；通常表示 pprof 插件被停用或快照协程卡住，曲线末端的值不再变化',
+        { time: fmtClock(model.sampleTs), ago: fmtAgo(model.sampleTs) })) +
+      '</span></div>';
+  }
+
   // renderPerfLive 只在**状态跃迁**时播报：每 2 秒播一次数值会把人烦死，
-  // 而"丢弃从 0 变正""堆进入告警"这两个跃迁才是运维真正需要被叫醒的时刻。
+  // 而"丢弃从 0 变正""堆进入告警""快照停更/恢复"这几个跃迁才是运维真正需要被叫醒的时刻。
   function renderPerfLive(model) {
     const el = $('#perf-live');
     let msg = '';
@@ -2246,6 +2295,13 @@
       msg = ts('perf.live.memOk', '堆占用已回落至告警阈值以下');
     }
     perfState.live.mem = model.warnMem;
+    if (!msg && model.sampleStale && !perfState.live.stale) {
+      msg = tsp('perf.live.snapStale', '运行时数据已停止更新，最后快照在 {ago}',
+        { ago: fmtAgo(model.sampleTs) });
+    } else if (!msg && !model.sampleStale && perfState.live.stale) {
+      msg = ts('perf.live.snapOk', '运行时数据已恢复更新');
+    }
+    perfState.live.stale = model.sampleStale;
     if (!msg) return;           // 没有跃迁：不动 live 区域
     if (el) el.textContent = msg;
   }
@@ -2260,6 +2316,7 @@
     renderPerfCharts(model);
     renderPerfTable(model);
     renderPerfAlert();
+    renderPerfSnap(model);
     renderPerfLive(model);
 
     const updated = $('#perf-updated');
@@ -3290,7 +3347,7 @@
      ===================================================================== */
 
   // 与 sw.js 的 SW_VERSION 同值（缓存版本 / 设置页展示的版本号）
-  const APP_VERSION = '7.5';
+  const APP_VERSION = '7.6';
   const INSTALL_STATES = ['idle', 'available', 'installing', 'installed', 'unsupported'];
   const INSTALL_LABEL = '安装应用';
   const OFFLINE_TEXT = '已离线：正在显示最近一次缓存的数据，恢复网络后会自动刷新。';
@@ -3676,7 +3733,14 @@
      （视图注册 / 渲染 / 曲线 / 轮询开关 / 纯函数模型）。生产行为不变。 */
   window.LanHubPerf = {
     state: perfState,
-    CONST: { POLL_MS: PERF_POLL_MS, WIN_CAP: PERF_WIN_CAP, TREND_W: TREND_W, TREND_H: TREND_H },
+    CONST: {
+      POLL_MS: PERF_POLL_MS,
+      WIN_CAP: PERF_WIN_CAP,
+      SNAP_MS: PERF_SNAP_MS,
+      SNAP_STALE_MS: PERF_SNAP_STALE_MS,
+      TREND_W: TREND_W,
+      TREND_H: TREND_H,
+    },
     setView: setView,
     viewFromHash: viewFromHash,
     activeView: function () { return activeView; },
