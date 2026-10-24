@@ -17,7 +17,7 @@ func newRoomRoutes(t *testing.T) (http.Handler, *core.Hub) {
 	handlers := map[string]http.HandlerFunc{}
 	registerRoutes(func(pattern string, h http.HandlerFunc) {
 		handlers[pattern] = h
-	}, hub, nil, nil)
+	}, hub, nil, nil, nil)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h, ok := handlers[r.URL.Path]
 		if !ok {

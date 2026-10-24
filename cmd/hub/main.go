@@ -42,6 +42,9 @@ func main() {
 	// 注意语义是「只填补未显式配置的项」，见 timeoutPresetOptions 上方的说明。
 	timeoutsFlag := flag.String("timeouts", "",
 		"HTTP timeout preset: strict|relaxed|off (empty = leave plugin defaults); only fills options you did not set explicitly")
+	// V7d：-replace 接管。仅当端口占用者被 /healthz 确认是旧 Hub 实例时生效；
+	// 无关程序绝不代杀（见 preflight.go 顶部说明）。
+	replaceFlag := flag.Bool("replace", false, "take over from an existing hub instance listening on the same ports (asks it to shut down gracefully; never touches non-hub processes)")
 	flag.Parse()
 
 	// 让 /api/manifest 的版本与 -version 输出一致。
@@ -66,6 +69,12 @@ func main() {
 	timeoutFill, timeoutErr := timeoutPresetOptions(*timeoutsFlag)
 	if timeoutErr != nil {
 		log.Fatalf("参数错误: %v", timeoutErr)
+	}
+
+	// V7d：端口预检放在一切耗时工作之前——占端口的错误越早暴露越好，
+	// 文案见 preflightOne：三条出路（关旧实例 / -replace / 换端口）写进错误里。
+	if err := preflightPorts(*addr, *httpAddr, *replaceFlag); err != nil {
+		log.Fatalf("端口预检失败: %v", err)
 	}
 
 	// ① 配置文件：读取（缺失则视为全默认），非只读模式且首次运行时生成模板。

@@ -1,4 +1,4 @@
-// Package httpgateway 是 REST/控制台 HTTP 网关插件，承载 14 个 /api 端点。
+// Package httpgateway 是 REST/控制台 HTTP 网关插件，承载 15 个 /api 端点。
 //
 // 端点路径、响应字段、回执文案、Header 与历史 internal/adapter/http.go 逐字节一致，
 // 以保证契约 golden 仍为绿。**迁移禁止项**：/api/discover 不得补 X-Proto-Version
@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +62,9 @@ type HTTPGateway struct {
 	readHeaderTimeout time.Duration
 	idleTimeout       time.Duration
 	handlerTimeout    time.Duration
+	// exitFn 是 /api/shutdown 的进程退出出口（V7d）。
+	// 默认 os.Exit；测试注入 no-op 避免把测试进程一起带走。
+	exitFn func(code int)
 }
 
 // Meta 声明插件元信息。
@@ -68,7 +72,7 @@ func (p *HTTPGateway) Meta() plugin.Meta {
 	return plugin.Meta{
 		Name:        "httpgateway",
 		Version:     "1.1.0",
-		Description: "REST/控制台 HTTP 网关，承载 14 个 /api 端点与控制台根 /",
+		Description: "REST/控制台 HTTP 网关，承载 15 个 /api 端点与控制台根 /",
 		DefaultOn:   true,
 	}
 }
@@ -99,12 +103,12 @@ func (p *HTTPGateway) Options() []plugin.OptionDef {
 			Key:         "handlerTimeout",
 			Type:        plugin.OptionDuration,
 			Default:     "5s",
-			Description: "单个 API handler 的执行上限（如 5s），超时返回 503。只作用于本插件的 14 个端点，不影响流式端点",
+			Description: "单个 API handler 的执行上限（如 5s），超时返回 503。只作用于本插件的 15 个端点，不影响流式端点",
 		},
 	}
 }
 
-// Init 取出内核、HTTP 地址，从共享 KV 取 discovery 服务，并逐个注册 14 个端点
+// Init 取出内核、HTTP 地址，从共享 KV 取 discovery 服务，并逐个注册 15 个端点
 // （经 ctx.RegisterHTTP，触发框架的路由冲突预检）。同时把控制台地址交接给 autobrowser。
 func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 	hub, ok := ctx.Hub().(*core.Hub)
@@ -114,6 +118,9 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 	p.hub = hub
 	p.mux = ctx.ServeMux()
 	p.httpAddr = ctx.String("httpAddr", ":8081")
+	if p.exitFn == nil {
+		p.exitFn = os.Exit
+	}
 	// V8 ⑤：超时配置。负数视为关闭（Duration 解析失败也会走到默认值）。
 	p.readHeaderTimeout = ctx.Duration("readHeaderTimeout", defaultReadHeaderTimeout)
 	p.idleTimeout = ctx.Duration("idleTimeout", defaultIdleTimeout)
@@ -152,7 +159,7 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 		if e := ctx.RegisterHTTP(pattern, p.guard(h)); e != nil {
 			regErr = e
 		}
-	}, hub, p.disco, p.mgr)
+	}, hub, p.disco, p.mgr, p.exitFn)
 	if regErr != nil {
 		return regErr
 	}
@@ -163,7 +170,7 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 
 // guard 给单个 API handler 套上「执行上限 + 慢 handler 日志」两层保护（V8 ⑤）。
 //
-// 为什么只包本插件自己的 14 个端点、而不是整个共享 mux：
+// 为什么只包本插件自己的 15 个端点、而不是整个共享 mux：
 // 共享 mux 上还有 realtime 的 /api/stream（SSE）和 logview 的日志流。
 // TimeoutHandler 的语义是「到点就返回 503 并丢弃后续写入」——套在 SSE 上
 // 等于给一条设计上要挂几小时的长连接设了 5 秒死刑。按插件自治划分边界，
@@ -264,15 +271,16 @@ func (p *HTTPGateway) SkipReload() (bool, string) {
 }
 
 // ---------------------------------------------------------------------------
-// 端点定义：registerRoutes 把 14 个端点逐一注册到给定 registrar。
+// 端点定义：registerRoutes 把 15 个端点逐一注册到给定 registrar。
 // registrar 在插件场景是 ctx.RegisterHTTP（带冲突预检），在测试/兼容场景是 mux.HandleFunc。
 // 行为与历史 adapter/http.go 逐字节一致。
 // ---------------------------------------------------------------------------
 
-// registerRoutes 应用 11 个历史契约端点 + 3 个房间管理端点到 registrar。
-// mgr 为框架管理器：仅用于 /api/status?features=plugins 的插件汇总（为 nil 时该能力不可用，
-// 默认响应保持逐字节不变）。
-func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub, disco *discovery.Service, mgr *plugin.Manager) {
+// registerRoutes 应用历史契约端点 + 3 个房间管理端点 + /api/shutdown 到 registrar。
+// mgr 为框架管理器：仅用于 /api/status?features=plugins 的插件汇总与 shutdown 停机（为 nil 时
+// 该能力不可用，默认响应保持逐字节不变）。
+// shutdownExit 是 /api/shutdown 的进程退出出口；nil 时回落到 os.Exit（测试应注入 no-op）。
+func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub, disco *discovery.Service, mgr *plugin.Manager, shutdownExit func(int)) {
 	reg("/api/discover", func(w http.ResponseWriter, r *http.Request) {
 		if disco == nil {
 			http.Error(w, "discovery disabled", http.StatusNotFound)
@@ -478,6 +486,52 @@ func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub,
 		hub.Rooms.Leave(p.RoomID, p.Agent)
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
+
+	// /api/shutdown：请求本进程优雅退出（V7d）。
+	//
+	// 存在的唯一理由是 `-replace` 接管：新实例启动前探测到端口被旧 Hub 占用时，
+	// 通过这个端点请旧实例体面地走，而不是靠杀进程。安全边界两条，缺一不可：
+	//   1. 仅限 loopback 来源——这是管理操作，绝不允许局域网里任何人关掉 Hub；
+	//   2. 仅限 POST——GET 预检/爬虫/浏览器导航都不该产生副作用。
+	// 停机顺序刻意是「先回响应、后停机」：Shutdown 会等所有活动请求结束，
+	// 若在本 handler 里同步 Shutdown 自己，当前响应永远写不完，直接死锁。
+	// 因此响应写完交给异步 goroutine：先 StopAll（各插件收尾），再退出进程。
+	reg("/api/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "bad remote addr", http.StatusBadRequest)
+			return
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			// 403 而不是 404：不掩饰端点存在性（本服务本就无鉴权，掩盖没有意义），
+			// 只拒绝非本机来源。日志留痕，便于发现局域网内的关停尝试。
+			log.Printf("httpgateway: 拒绝非本机来源的 shutdown 请求（来源 %s）", r.RemoteAddr)
+			http.Error(w, "shutdown only allowed from localhost", http.StatusForbidden)
+			return
+		}
+		writeJSON(w, map[string]string{"status": "shutting-down"})
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		go func() {
+			// 给响应送达留一点时间（本机回环通常微秒级，100ms 足够宽裕）。
+			time.Sleep(100 * time.Millisecond)
+			log.Printf("httpgateway: 收到本机 shutdown 请求，开始优雅停机")
+			if mgr != nil {
+				mgr.StopAll()
+			}
+			exit := shutdownExit
+			if exit == nil {
+				exit = os.Exit
+			}
+			exit(0)
+		}()
+	})
 }
 
 // 更新通道的两个预留端点**故意不进 registerRoutes**：/api/plugins 的 v2 基线把
@@ -485,7 +539,7 @@ func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub,
 // 事实契约不划算。它们直接挂在共享 mux 上（见 attachUpdateRoutes），
 // 待更新通道正式立项时再拆成独立 updates 插件并显式登记到基线。
 
-// NewMux 构造 REST 网关路由表（仅 14 个 /api 端点，不含控制台根 /）。
+// NewMux 构造 REST 网关路由表（仅 15 个 /api 端点，不含控制台根 /）。
 // 行为必须与历史 adapter.NewMux 的端点部分逐字节一致，以保证契约 golden 仍为绿。
 // 控制台根 / 由 webconsole 插件（或测试中的 webconsole.RegisterWeb）挂载。
 //
@@ -495,7 +549,7 @@ func NewMux(hub *core.Hub, disco *discovery.Service) *http.ServeMux {
 	mux := http.NewServeMux()
 	registerRoutes(func(pattern string, h http.HandlerFunc) {
 		mux.HandleFunc(pattern, h)
-	}, hub, disco, nil)
+	}, hub, disco, nil, nil)
 	attachUpdateRoutes(mux)
 	return mux
 }

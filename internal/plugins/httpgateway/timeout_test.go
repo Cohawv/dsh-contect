@@ -132,16 +132,16 @@ func TestStreamingEndpointNotGuarded(t *testing.T) {
 // 一旦 httpgateway 的端点列表里出现 /api/stream 这类路径，guard 就会真的套上去。
 //
 // 数量是 13：registerRoutes 登记 11 个历史契约端点 + 3 个房间管理端点
-// （delete_room / rename_room / kick）；更新通道的 2 个预留端点
+// （delete_room / rename_room / kick）+ 本插件自己的 shutdown；更新通道的 2 个预留端点
 // （manifest / artifact）由 attachUpdateRoutes 直接挂到 mux，不计入本表。
 func TestRegisterRoutesStaysOffStreamPaths(t *testing.T) {
 	var patterns []string
 	registerRoutes(func(pattern string, _ http.HandlerFunc) {
 		patterns = append(patterns, pattern)
-	}, core.NewHub(), nil, nil)
+	}, core.NewHub(), nil, nil, nil)
 
-	if len(patterns) != 13 {
-		t.Fatalf("端点数量 = %d，期望 13（新增端点需同步更新本断言与契约基线）", len(patterns))
+	if len(patterns) != 14 {
+		t.Fatalf("端点数量 = %d，期望 14（新增端点需同步更新本断言与契约基线）", len(patterns))
 	}
 	for _, p := range patterns {
 		if strings.Contains(p, "stream") {
