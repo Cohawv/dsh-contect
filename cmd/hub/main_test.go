@@ -400,3 +400,108 @@ func TestSameOptionValue(t *testing.T) {
 		}
 	}
 }
+
+// TestCliOverridesNothingWhenNoFlagExplicit 是 D2 修复的核心证据。
+//
+// 一个 flag 都没表态时，覆盖表必须为空（连空插件段都不建）：CLI 默认值一旦
+// 混进覆盖表，hub.json 的 tcpgateway.addr / httpgateway.httpAddr /
+// discovery.bindAddr / hubName / noDiscovery / autobrowser.open 就永远不生效
+// ——这正是 V7c 真机冒烟抓到的缺陷现场。退回无条件合并，这条立刻红。
+func TestCliOverridesNothingWhenNoFlagExplicit(t *testing.T) {
+	f := cliFlags{
+		addr: ":8080", httpAddr: ":8081", discover: ":8082", hubName: "",
+		noDiscovery: false, openBrowser: true,
+		set: map[string]bool{}, // 全部走默认值 = 全部未表态
+	}
+	if got := cliOverrides(f); len(got) != 0 {
+		t.Fatalf("未表态时覆盖表 = %v，期望为空（CLI 默认值不得压过 hub.json）", got)
+	}
+}
+
+// TestCliOverridesExplicitLandsOnRightPlugin 断言六个 flag 各自落到正确的插件与键。
+//
+// 映射关系写错（例如 -http 落到 tcpgateway）的症状是「CLI 参数看似生效、
+// 实际改的是不相干的插件」，只有逐项断言才抓得住。
+func TestCliOverridesExplicitLandsOnRightPlugin(t *testing.T) {
+	f := cliFlags{
+		addr:        ":9000",
+		httpAddr:    ":9001",
+		discover:    "", // -discover="" 是合法表态：显式关闭发现
+		hubName:     "厨房Hub",
+		noDiscovery: true,
+		openBrowser: false,
+		set:         map[string]bool{"addr": true, "http": true, "discover": true, "name": true, "no-discovery": true, "open": true},
+	}
+	got := cliOverrides(f)
+	want := map[string]map[string]any{
+		"tcpgateway":  {"addr": ":9000"},
+		"httpgateway": {"httpAddr": ":9001"},
+		"discovery":   {"bindAddr": "", "hubName": "厨房Hub", "noDiscovery": true},
+		"autobrowser": {"open": false},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("覆盖表插件段 = %v，期望恰 4 段", got)
+	}
+	for name, opts := range want {
+		for k, w := range opts {
+			if got[name][k] != w {
+				t.Errorf("%s.%s = %v，期望 %v", name, k, got[name][k], w)
+			}
+		}
+	}
+}
+
+// TestCliExplicitBeatsFileBeatsDefault 验证完整优先级链：CLI 显式 > hub.json > 内置默认。
+//
+// 复刻真实链路的形状：文件值经 MergeDefaults 后全键都在（这里手工构造等价形状），
+// CLI 只显式给 -addr。期望 tcpgateway.addr 用 CLI 的 :9090，
+// httpgateway.httpAddr 保持文件值 :9091——若 CLI 默认值 :8081 混进覆盖表，
+// 这里会得到 :8081，即缺陷复现。
+func TestCliExplicitBeatsFileBeatsDefault(t *testing.T) {
+	options := map[string]map[string]any{
+		"tcpgateway":  {"addr": ":8080"}, // 文件里是默认值（MergeDefaults 补齐的形状）
+		"httpgateway": {"httpAddr": ":9091"},
+	}
+	mergeOptions(options, cliOverrides(cliFlags{
+		addr:     ":9090",
+		httpAddr: ":8081", // CLI 默认值：未表态
+		set:      map[string]bool{"addr": true},
+	}))
+	if v := options["tcpgateway"]["addr"]; v != ":9090" {
+		t.Errorf("tcpgateway.addr = %v，期望 :9090（CLI 显式参数必须胜出）", v)
+	}
+	if v := options["httpgateway"]["httpAddr"]; v != ":9091" {
+		t.Errorf("httpgateway.httpAddr = %v，期望 :9091（CLI 未表态的默认值压过了 hub.json——D2 缺陷复现）", v)
+	}
+}
+
+// TestOptionString 覆盖生效地址读取的回落语义。
+//
+// 预检 / Beacon 端口 / 启动日志三处都从合并后的 options 取地址，
+// 回落规则错了症状是「三处口径不一」：文件值类型被手改坏（JSON 里写成数字）
+// 时必须回落 flag 值，与插件侧 Context.String 的口径一致。
+func TestOptionString(t *testing.T) {
+	options := map[string]map[string]any{
+		"tcpgateway": {"addr": ":9090"},
+		"weird":      {"addr": 8080}, // 手改坏的类型
+		"empty":      {},
+	}
+	if got := optionString(options, "tcpgateway", "addr", ":8080"); got != ":9090" {
+		t.Errorf("正常路径 got=%s，期望 :9090", got)
+	}
+	if got := optionString(options, "weird", "addr", ":8080"); got != ":8080" {
+		t.Errorf("非字符串值 got=%s，期望回落 :8080", got)
+	}
+	if got := optionString(options, "empty", "addr", ":8080"); got != ":8080" {
+		t.Errorf("键缺席 got=%s，期望回落 :8080", got)
+	}
+	if got := optionString(options, "missing-plugin", "addr", ":8080"); got != ":8080" {
+		t.Errorf("插件段缺席 got=%s，期望回落 :8080", got)
+	}
+	// 显式空串是字符串类型断言成功 → 原样透传而不是回落默认值：
+	// 预检会以人话报「不是 host:port 形式」，静默回落反而掩盖配置错误。
+	bad := map[string]map[string]any{"tcpgateway": {"addr": ""}}
+	if got := optionString(bad, "tcpgateway", "addr", ":8080"); got != "" {
+		t.Errorf("显式空串 got=%q，期望原样透传（由预检报人话错误，不静默回落）", got)
+	}
+}

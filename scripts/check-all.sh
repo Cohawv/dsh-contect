@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键执行全部质量闸门：vet + test + 依赖方向守卫 + 控制台 sim。
+# 一键执行全部质量闸门：vet + test + 依赖方向守卫 + 控制台 sim + fitness 快照。
 # 用法：bash scripts/check-all.sh
 #
 # V2 引入本脚本，降低"漏跑某一项"的概率（尤其契约测试需要带/不带 -update 各跑一次）。
@@ -10,25 +10,25 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "=============================================="
-echo "[1/4] go vet ./..."
+echo "[1/5] go vet ./..."
 echo "=============================================="
 go vet ./...
 
 echo
 echo "=============================================="
-echo "[2/4] go test ./..."
+echo "[2/5] go test ./..."
 echo "=============================================="
 go test ./...
 
 echo
 echo "=============================================="
-echo "[3/4] bash scripts/check-deps.sh"
+echo "[3/5] bash scripts/check-deps.sh"
 echo "=============================================="
 bash scripts/check-deps.sh
 
 echo
 echo "=============================================="
-echo "[4/4] 控制台 sim（node，零依赖脚本）"
+echo "[4/5] 控制台 sim（node，零依赖脚本）"
 echo "=============================================="
 # node 缺失直接失败而不是跳过：dsh 插件本就要求 node >= 22，
 # 这个仓库已经是 Go + Node 混合工程；"跳过"会让前端门禁形同虚设。
@@ -42,6 +42,14 @@ for f in internal/plugins/webconsole/console*sim.cjs; do
   node "$f" >/dev/null
   echo "ok"
 done
+
+echo
+echo "=============================================="
+echo "[5/5] fitness 快照（scripts/fitness.sh）"
+echo "=============================================="
+# V25 重写版新增：依赖方向 / 契约基线 / TODO 存量三个数字，每次门禁都被看见。
+# 只展示不判决——脚本永远退出 0，真正的拦截仍是上面第 2、3 项。
+bash scripts/fitness.sh
 
 echo
 echo "全部通过 ✅"

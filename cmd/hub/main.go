@@ -47,6 +47,12 @@ func main() {
 	replaceFlag := flag.Bool("replace", false, "take over from an existing hub instance listening on the same ports (asks it to shut down gracefully; never touches non-hub processes)")
 	flag.Parse()
 
+	// D2 修复的前提：区分「CLI 显式表态」与「flag 默认值」。
+	// flag.Visit 只回调命令行上真正出现过的 flag——据此决定哪些值允许压过 hub.json
+	//（见 cliOverrides：默认值一旦混进覆盖表，hub.json 的同类配置永远不生效）。
+	explicitFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicitFlags[f.Name] = true })
+
 	// 让 /api/manifest 的版本与 -version 输出一致。
 	plugininfo.SetHubVersion(version)
 	// V5：健康详情（/api/health/detail）报的 version 来自框架侧副本，
@@ -71,13 +77,9 @@ func main() {
 		log.Fatalf("参数错误: %v", timeoutErr)
 	}
 
-	// V7d：端口预检放在一切耗时工作之前——占端口的错误越早暴露越好，
-	// 文案见 preflightOne：三条出路（关旧实例 / -replace / 换端口）写进错误里。
-	if err := preflightPorts(*addr, *httpAddr, *replaceFlag); err != nil {
-		log.Fatalf("端口预检失败: %v", err)
-	}
-
 	// ① 配置文件：读取（缺失则视为全默认），非只读模式且首次运行时生成模板。
+	// 必须先于端口预检：预检要探测的是**最终生效**的端口，而 hub.json 可以
+	// 覆盖 -addr/-http 的默认值（D2 修复后的合法行为）——用裸 flag 值预检会查错地方。
 	cfgPath := resolveConfigPath(*configFlag)
 	store := plugin.NewStore(cfgPath)
 	fileCfg, existed, err := store.LoadOrTemplate()
@@ -96,17 +98,21 @@ func main() {
 	log.Printf("配置文件: %s (readOnly=%t)", cfgPath, *configReadOnly)
 
 	hub := core.NewHub()
-	hub.TCPPort, hub.HTTPPort = portOf(*addr), portOf(*httpAddr)
 
 	// ② 合并配置：CLI 显式参数 > hub.json > Meta.DefaultOn/选项默认值。
+	// cliOverrides 只收**显式给出**的 flag：CLI 默认值一旦混进覆盖表，
+	// hub.json 的同类配置就永远不生效（D2 缺陷：默认值与显式表态不分）。
 	enabled, options := configToMaps(fileCfg)
 	applyToggles(enabled, *white, *black)
-	mergeOptions(options, map[string]map[string]any{
-		"tcpgateway":  {"addr": *addr},
-		"httpgateway": {"httpAddr": *httpAddr},
-		"discovery":   {"bindAddr": *discoverAddr, "hubName": *hubName, "noDiscovery": *noDiscovery},
-		"autobrowser": {"open": *openBrowserFlag},
-	})
+	mergeOptions(options, cliOverrides(cliFlags{
+		addr:        *addr,
+		httpAddr:    *httpAddr,
+		discover:    *discoverAddr,
+		hubName:     *hubName,
+		noDiscovery: *noDiscovery,
+		openBrowser: *openBrowserFlag,
+		set:         explicitFlags,
+	}))
 
 	// V8f：超时预设档只填「用户还没表态」的项（判定规则见 fillPresetOptions）。
 	// 顺序很重要：必须在 mergeOptions 之后（否则文件/CLI 的值会被当成"缺席"），
@@ -124,6 +130,19 @@ func main() {
 			log.Printf("超时预设档 -timeouts=%s 未应用任何项：httpgateway 的超时项均为显式配置",
 				strings.ToLower(strings.TrimSpace(*timeoutsFlag)))
 		}
+	}
+
+	// ③ 生效地址 = 合并后的最终值（CLI 显式 > hub.json > 内置默认）。
+	// 统一从这里取的三个消费方：端口预检、Beacon 端口（hub.TCPPort/HTTPPort 会进
+	// 发现信标——手机自动发现靠它连 Hub，取错来源手机就连到旧端口去了）、启动日志。
+	tcpAddr := optionString(options, "tcpgateway", "addr", *addr)
+	httpListen := optionString(options, httpgatewayPlugin, "httpAddr", *httpAddr)
+	hub.TCPPort, hub.HTTPPort = portOf(tcpAddr), portOf(httpListen)
+
+	// ④ 端口预检：占端口的错误越早暴露越好，文案见 preflightOne
+	//（三条出路：关旧实例 / -replace / 换端口）。探测的是生效地址而非裸 flag 值。
+	if err := preflightPorts(tcpAddr, httpListen, *replaceFlag); err != nil {
+		log.Fatalf("端口预检失败: %v", err)
 	}
 
 	mgr := plugin.NewManager()
@@ -157,7 +176,7 @@ func main() {
 
 	enabledList, disabledList := pluginStates(mgr)
 	log.Printf("enabled=[%s] disabled=[%s]", strings.Join(enabledList, ","), strings.Join(disabledList, ","))
-	log.Printf("LAN Agent Hub 启动完成 (tcp=%s http=%s)", *addr, *httpAddr)
+	log.Printf("LAN Agent Hub 启动完成 (tcp=%s http=%s)", tcpAddr, httpListen)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -353,7 +372,7 @@ func describeOptions(opts map[string]any) string {
 }
 
 // configToMaps 把文件配置展开成「每插件启用状态 + 配置项」两张表。
-// 未在文件中出现的插件走 Meta.DefaultOn 与空选项（再由 mergeOptions 补 CLI 值）。
+// 未在文件中出现的插件走 Meta.DefaultOn 与空选项（显式给出的 CLI 值再由 mergeOptions 补上）。
 func configToMaps(cfg plugin.Config) (enabled map[string]bool, options map[string]map[string]any) {
 	enabled = make(map[string]bool, len(plugin.All()))
 	options = make(map[string]map[string]any, len(plugin.All()))
@@ -374,7 +393,67 @@ func configToMaps(cfg plugin.Config) (enabled map[string]bool, options map[strin
 	return enabled, options
 }
 
+// cliFlags 汇集与插件选项对应的 CLI flag 值，以及每个 flag 是否被显式给出。
+//
+// set 来自 flag.Visit（只回调命令行上真正出现过的 flag）——它是「显式表态」
+// 与「默认值」的唯一区分手段。flag 标准包拿不到这个区别：f.Value.String()
+// 永远有值，哪怕是用户从没写过的默认值。
+type cliFlags struct {
+	addr        string // -addr      → tcpgateway.addr
+	httpAddr    string // -http      → httpgateway.httpAddr
+	discover    string // -discover  → discovery.bindAddr（留空即关闭发现）
+	hubName     string // -name      → discovery.hubName（留空用主机名）
+	noDiscovery bool   // -no-discovery → discovery.noDiscovery
+	openBrowser bool   // -open      → autobrowser.open
+
+	set map[string]bool
+}
+
+// cliOverrides 把**显式给出**的 CLI flag 换算成 mergeOptions 的覆盖表。
+//
+// 这是 D2 缺陷的修复点：此前 main 把 flag 值（含默认值）无条件交给 mergeOptions，
+// CLI 默认值永远压过 hub.json——用户在配置文件里改 tcpgateway.addr /
+// httpgateway.httpAddr / discovery.bindAddr / hubName / noDiscovery /
+// autobrowser.open 全部无效。修复后的优先级：CLI 显式参数 > hub.json > 内置默认值。
+//
+// 未表态的 flag 一律不进覆盖表（连空插件段都不建）：无端建段会让上游
+// 「这个插件有没有被 CLI 碰过」之类的判断产生假阳性。
+func cliOverrides(f cliFlags) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	add := func(flagName, pluginName, key string, v any) {
+		if !f.set[flagName] {
+			return
+		}
+		if out[pluginName] == nil {
+			out[pluginName] = map[string]any{}
+		}
+		out[pluginName][key] = v
+	}
+	add("addr", "tcpgateway", "addr", f.addr)
+	add("http", "httpgateway", "httpAddr", f.httpAddr)
+	add("discover", "discovery", "bindAddr", f.discover)
+	add("name", "discovery", "hubName", f.hubName)
+	add("no-discovery", "discovery", "noDiscovery", f.noDiscovery)
+	add("open", "autobrowser", "open", f.openBrowser)
+	return out
+}
+
+// optionString 从合并后的配置里读一个字符串选项；键缺席或类型不对时回落 fallback。
+//
+// 生效地址必须从**合并后的 options**取（单一事实来源），而不是 flag、文件各取一次：
+// 预检、Beacon 端口、启动日志三处读到的值才保证一致。类型不对（手改坏 JSON）时
+// 回落 flag 值，与插件侧 Context.String 对非法类型回落默认值的口径一致。
+func optionString(options map[string]map[string]any, pluginName, key, fallback string) string {
+	if opts, ok := options[pluginName]; ok {
+		if s, ok := opts[key].(string); ok {
+			return s
+		}
+	}
+	return fallback
+}
+
 // mergeOptions 把 CLI 提供的配置项合并进 options（CLI 优先），不引入新插件键。
+// override 由 cliOverrides 构造，保证只含**显式表态**的项——本函数不做二次过滤。
 func mergeOptions(options, override map[string]map[string]any) {
 	for name, opts := range override {
 		if _, ok := options[name]; !ok {
