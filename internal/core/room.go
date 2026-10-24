@@ -41,6 +41,12 @@ const (
 	RoomActionJoined  = "joined"
 	RoomActionLeft    = "left"
 	RoomActionDropped = "dropped"
+	// RoomActionDeleted / RoomActionRenamed 由房间管理端点（POST /api/rooms/*）触发。
+	// 系统没有权限体系（前置决策排除），因此这两个动作的入口必须刻意设在
+	// 「需要明确构造请求」的层面——控制台 UI 还要二次确认——把误删成本抬高到
+	// 不可能手滑触发，这是无权限体系下仅存的防线。
+	RoomActionDeleted = "deleted"
+	RoomActionRenamed = "renamed"
 )
 
 // RoomService 管理房间与成员。
@@ -173,6 +179,52 @@ func (s *RoomService) Drop(agentID string) {
 	for _, snap := range changed {
 		s.publish(RoomActionDropped, agentID, snap)
 	}
+}
+
+// Delete 删除整个房间并通知所有订阅方。
+//
+// 返回 false 表示房间不存在（幂等：对已删除的房间重复删除是 no-op 而不是错误——
+// 并发下两个删除请求只有一个能删到，另一个不该报 500）。
+//
+// 事件载荷是**删除前**的最后快照：订阅方（控制台/SSE）需要 id 才知道删的是谁，
+// 成员列表留作审计线索（"删的时候里面有谁"）。
+func (s *RoomService) Delete(roomID string) bool {
+	s.mu.Lock()
+	r, ok := s.rooms[roomID]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	snap := roomSnapshot(r)
+	delete(s.rooms, roomID)
+	s.mu.Unlock()
+
+	s.publish(RoomActionDeleted, "", snap)
+	return true
+}
+
+// Rename 修改房间显示名。返回 false 表示房间不存在。
+//
+// 房间 ID 刻意不变：ID 是成员端的接入锚点（join/leave/say 都拿 ID），
+// 改名只是显示层的事——如果连 ID 一起换，所有成员会话瞬间失效，
+// 那就不是改名而是重建。
+func (s *RoomService) Rename(roomID, newName string) bool {
+	s.mu.Lock()
+	r, ok := s.rooms[roomID]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	if r.Name == newName {
+		s.mu.Unlock()
+		return true // 同名改名：无变更不发布（避免噪声事件，与 Leave 的纪律一致）
+	}
+	r.Name = newName
+	snap := roomSnapshot(r)
+	s.mu.Unlock()
+
+	s.publish(RoomActionRenamed, "", snap)
+	return true
 }
 
 // publish 发布一条房间变更事件（锁外调用；bus 为 nil 时静默）。

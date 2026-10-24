@@ -1,4 +1,4 @@
-// Package httpgateway 是 REST/控制台 HTTP 网关插件，承载 11 个 /api 端点。
+// Package httpgateway 是 REST/控制台 HTTP 网关插件，承载 14 个 /api 端点。
 //
 // 端点路径、响应字段、回执文案、Header 与历史 internal/adapter/http.go 逐字节一致，
 // 以保证契约 golden 仍为绿。**迁移禁止项**：/api/discover 不得补 X-Proto-Version
@@ -68,7 +68,7 @@ func (p *HTTPGateway) Meta() plugin.Meta {
 	return plugin.Meta{
 		Name:        "httpgateway",
 		Version:     "1.1.0",
-		Description: "REST/控制台 HTTP 网关，承载 11 个 /api 端点与控制台根 /",
+		Description: "REST/控制台 HTTP 网关，承载 14 个 /api 端点与控制台根 /",
 		DefaultOn:   true,
 	}
 }
@@ -99,12 +99,12 @@ func (p *HTTPGateway) Options() []plugin.OptionDef {
 			Key:         "handlerTimeout",
 			Type:        plugin.OptionDuration,
 			Default:     "5s",
-			Description: "单个 API handler 的执行上限（如 5s），超时返回 503。只作用于本插件的 11 个端点，不影响流式端点",
+			Description: "单个 API handler 的执行上限（如 5s），超时返回 503。只作用于本插件的 14 个端点，不影响流式端点",
 		},
 	}
 }
 
-// Init 取出内核、HTTP 地址，从共享 KV 取 discovery 服务，并逐个注册 11 个端点
+// Init 取出内核、HTTP 地址，从共享 KV 取 discovery 服务，并逐个注册 14 个端点
 // （经 ctx.RegisterHTTP，触发框架的路由冲突预检）。同时把控制台地址交接给 autobrowser。
 func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 	hub, ok := ctx.Hub().(*core.Hub)
@@ -163,7 +163,7 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 
 // guard 给单个 API handler 套上「执行上限 + 慢 handler 日志」两层保护（V8 ⑤）。
 //
-// 为什么只包本插件自己的 11 个端点、而不是整个共享 mux：
+// 为什么只包本插件自己的 14 个端点、而不是整个共享 mux：
 // 共享 mux 上还有 realtime 的 /api/stream（SSE）和 logview 的日志流。
 // TimeoutHandler 的语义是「到点就返回 503 并丢弃后续写入」——套在 SSE 上
 // 等于给一条设计上要挂几小时的长连接设了 5 秒死刑。按插件自治划分边界，
@@ -264,12 +264,12 @@ func (p *HTTPGateway) SkipReload() (bool, string) {
 }
 
 // ---------------------------------------------------------------------------
-// 端点定义：registerRoutes 把 11 个端点逐一注册到给定 registrar。
+// 端点定义：registerRoutes 把 14 个端点逐一注册到给定 registrar。
 // registrar 在插件场景是 ctx.RegisterHTTP（带冲突预检），在测试/兼容场景是 mux.HandleFunc。
 // 行为与历史 adapter/http.go 逐字节一致。
 // ---------------------------------------------------------------------------
 
-// registerRoutes 应用 11 个历史契约端点到 registrar。
+// registerRoutes 应用 11 个历史契约端点 + 3 个房间管理端点到 registrar。
 // mgr 为框架管理器：仅用于 /api/status?features=plugins 的插件汇总（为 nil 时该能力不可用，
 // 默认响应保持逐字节不变）。
 func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub, disco *discovery.Service, mgr *plugin.Manager) {
@@ -406,6 +406,78 @@ func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub,
 		hub.Rooms.Leave(p.RoomID, p.From)
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
+
+	// 房间管理三件套（删 / 改名 / 踢人）。
+	//
+	// 为什么用动作式路径而不是 RESTful 的 DELETE /api/rooms/{id}：本插件的
+	// reg() 注册的是**精确路径**（V3 的路由冲突预检按整条 pattern 匹配），
+	// 本机工具链基于 go1.21 的 ServeMux 语义（无 {id} 通配），动作式与既有
+	// /api/create_room、/api/plugins/toggle 的风格也一致。
+	//
+	// 为什么没有权限校验：系统不含鉴权/ACL（前置决策排除）。这三个是
+	// **不可逆破坏性操作**，防线只剩两道——控制台 UI 的二次确认，
+	// 以及"必须明确构造请求才能触发"（不存在任何隐式触发路径）。
+	// 事件流（room.changed action=deleted/renamed）保留完整审计线索。
+	reg("/api/delete_room", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var p struct {
+			RoomID string `json:"roomId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.RoomID == "" {
+			http.Error(w, "need roomId", http.StatusBadRequest)
+			return
+		}
+		// 404 而不是幂等 200：删除是低频高危操作，"删的时候已经没了"
+		// 更可能是调用方拿错了 ID，如实报错比静默成功更利于排查。
+		if !hub.Rooms.Delete(p.RoomID) {
+			http.Error(w, "room not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]string{"status": "ok"})
+	})
+
+	reg("/api/rename_room", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var p struct {
+			RoomID string `json:"roomId"`
+			Name   string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.RoomID == "" || p.Name == "" {
+			http.Error(w, "need roomId and name", http.StatusBadRequest)
+			return
+		}
+		if !hub.Rooms.Rename(p.RoomID, p.Name) {
+			http.Error(w, "room not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]string{"status": "ok"})
+	})
+
+	reg("/api/kick", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var p struct {
+			RoomID string `json:"roomId"`
+			Agent  string `json:"agent"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil || p.RoomID == "" || p.Agent == "" {
+			http.Error(w, "need roomId and agent", http.StatusBadRequest)
+			return
+		}
+		// 复用 Leave：对内核来说"被踢"与"自己退出"产生同样的状态变更，
+		// 差别只在触发者语义——事件载荷里的 actor 记录的是被移除者，
+		// 谁调用的 API 由 HTTP 访问日志（hub_http_requests_total + logview）负责。
+		hub.Rooms.Leave(p.RoomID, p.Agent)
+		writeJSON(w, map[string]string{"status": "ok"})
+	})
 }
 
 // 更新通道的两个预留端点**故意不进 registerRoutes**：/api/plugins 的 v2 基线把
@@ -413,7 +485,7 @@ func registerRoutes(reg func(pattern string, h http.HandlerFunc), hub *core.Hub,
 // 事实契约不划算。它们直接挂在共享 mux 上（见 attachUpdateRoutes），
 // 待更新通道正式立项时再拆成独立 updates 插件并显式登记到基线。
 
-// NewMux 构造 REST 网关路由表（仅 11 个 /api 端点，不含控制台根 /）。
+// NewMux 构造 REST 网关路由表（仅 14 个 /api 端点，不含控制台根 /）。
 // 行为必须与历史 adapter.NewMux 的端点部分逐字节一致，以保证契约 golden 仍为绿。
 // 控制台根 / 由 webconsole 插件（或测试中的 webconsole.RegisterWeb）挂载。
 //

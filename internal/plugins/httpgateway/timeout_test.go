@@ -37,7 +37,7 @@ func TestGuardHandlerTimeout(t *testing.T) {
 // TestGuardPassesThroughFastHandler 验证正常路径逐字节不变。
 //
 // 这是回归护栏：guard 是包在所有端点外面的一层，一旦它改写了 header 或状态码，
-// 11 个端点的契约基线会成片变红，而根因只在中间件里。
+// 14 个端点的契约基线会成片变红，而根因只在中间件里。
 func TestGuardPassesThroughFastHandler(t *testing.T) {
 	p := &HTTPGateway{handlerTimeout: time.Second}
 	h := p.guard(func(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +81,7 @@ func TestGuardZeroDisablesTimeout(t *testing.T) {
 //
 // 这是本阶段最危险的一处边界：TimeoutHandler 的语义是「到点返回 503 并丢弃后续写入」，
 // 套在 SSE 上等于给一条设计上要挂几小时的长连接设了死刑。
-// 因此 guard 只包本插件自己的 11 个短端点，流式端点由各自的插件直接挂到共享 mux。
+// 因此 guard 只包本插件自己的 14 个短端点，流式端点由各自的插件直接挂到共享 mux。
 // 这个用例按真实装配方式搭（自己的端点经 guard，别人的流式端点不经 guard），
 // 若哪天有人图省事把 guard 提到共享 mux 上，这里会立刻变红。
 func TestStreamingEndpointNotGuarded(t *testing.T) {
@@ -131,7 +131,8 @@ func TestStreamingEndpointNotGuarded(t *testing.T) {
 // 上一条用例验证的是装配切分的结果，这一条验证的是它的前提：
 // 一旦 httpgateway 的端点列表里出现 /api/stream 这类路径，guard 就会真的套上去。
 //
-// 数量是 10：registerRoutes 只登记 10 个 /api 端点；更新通道的 2 个预留端点
+// 数量是 13：registerRoutes 登记 11 个历史契约端点 + 3 个房间管理端点
+// （delete_room / rename_room / kick）；更新通道的 2 个预留端点
 // （manifest / artifact）由 attachUpdateRoutes 直接挂到 mux，不计入本表。
 func TestRegisterRoutesStaysOffStreamPaths(t *testing.T) {
 	var patterns []string
@@ -139,8 +140,8 @@ func TestRegisterRoutesStaysOffStreamPaths(t *testing.T) {
 		patterns = append(patterns, pattern)
 	}, core.NewHub(), nil, nil)
 
-	if len(patterns) != 10 {
-		t.Fatalf("端点数量 = %d，期望 10（新增端点需同步更新本断言与契约基线）", len(patterns))
+	if len(patterns) != 13 {
+		t.Fatalf("端点数量 = %d，期望 13（新增端点需同步更新本断言与契约基线）", len(patterns))
 	}
 	for _, p := range patterns {
 		if strings.Contains(p, "stream") {

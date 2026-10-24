@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// newUpdateMux 构造只含更新预留端点的路由表，避免测试耦合 11 个历史端点。
+// newUpdateMux 构造只含更新预留端点的路由表，避免测试耦合 14 个历史端点。
 func newUpdateMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	registerUpdateRoutes(func(pattern string, h http.HandlerFunc) {
