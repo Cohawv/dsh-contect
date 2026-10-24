@@ -22,6 +22,13 @@ import (
 
 const sendBufferSize = 256
 
+// maxWriteBatch 是一次写出的最大帧数。
+//
+// 太小省不下系统调用；太大则单次 Write 的字节数上去了，尾延迟也会被拉长
+// （一批里最慢的那条决定整批什么时候出去）。64 条 × 约 200B ≈ 12KB，
+// 一次 Write 的量级合适，也不会让队头等太久。
+const maxWriteBatch = 64
+
 // TCPGateway 是 tcpgateway 插件实体。
 // deliverStats 是下发侧的丢弃统计。
 //
@@ -207,16 +214,42 @@ func (s *session) Close() error {
 }
 
 func (s *session) writeLoop() {
+	batch := make([]protocol.Envelope, 0, maxWriteBatch)
 	for {
 		select {
 		case env := <-s.sendCh:
-			if err := s.conn.Send(env); err != nil {
+			batch = append(batch[:0], env)
+			// 把队列里已有的尽量多取一些凑成一批：扇出场景下队列通常不止一条，
+			// 一次写出能省掉大量系统调用。只在「队列已空」时停手，不会为了凑数而等。
+		drain:
+			for len(batch) < maxWriteBatch {
+				select {
+				case more := <-s.sendCh:
+					batch = append(batch, more)
+				default:
+					break drain
+				}
+			}
+			if err := s.sendBatch(batch); err != nil {
 				return
 			}
 		case <-s.closed:
 			return
 		}
 	}
+}
+
+// sendBatch 优先走连接的批量发送能力；未实现时逐条退化（行为与历史一致）。
+func (s *session) sendBatch(envs []protocol.Envelope) error {
+	if bc, ok := s.conn.(transport.BatchConn); ok {
+		return bc.SendBatch(envs)
+	}
+	for _, e := range envs {
+		if err := s.conn.Send(e); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // readLoop 读帧 → 交给业务内核；退出时摘除在线记录。
