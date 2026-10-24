@@ -61,6 +61,11 @@ type Sample struct {
 	AgentsOnline  int   `json:"agentsOnline"`  // 在线 Agent 数
 	Rooms         int   `json:"rooms"`         // 房间数
 	MessagesTotal int64 `json:"messagesTotal"` // 累计路由消息数
+	// V8 ④ 新增：让控制台的「性能」曲线与 /metrics 的当前值**同源同刻**。
+	// 两者都来自 plugin.ReadRuntimeStats（有 pprof 插件时由它提供同一份数据），
+	// 因此「曲线末端」与「gauge 当前值」永远对得上。
+	HeapAllocBytes uint64 `json:"heapAllocBytes"`
+	Goroutines     int    `json:"goroutines"`
 }
 
 // Metrics 是 metrics 插件实体。
@@ -266,11 +271,14 @@ func (p *Metrics) sample() {
 	if p.hub == nil {
 		return
 	}
+	rt := p.runtimeStats()
 	s := Sample{
-		TS:            time.Now().UnixMilli(),
-		AgentsOnline:  len(p.hub.ListAgentsDetailed()),
-		Rooms:         len(p.hub.Rooms.List()),
-		MessagesTotal: p.msgTotal.Load(),
+		TS:             time.Now().UnixMilli(),
+		AgentsOnline:   len(p.hub.ListAgentsDetailed()),
+		Rooms:          len(p.hub.Rooms.List()),
+		MessagesTotal:  p.msgTotal.Load(),
+		HeapAllocBytes: rt.HeapAllocBytes,
+		Goroutines:     rt.Goroutines,
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -337,6 +345,17 @@ func (p *Metrics) render() string {
 	writeCounter(&b, "hub_deliver_dropped_total", "发送队列满被丢弃的消息数", float64(deliverDropped))
 	writeCounter(&b, "hub_deliver_closed_total", "连接已关闭后仍尝试下发而被丢弃的消息数", float64(deliverClosed))
 
+	// 运行时资源（V8 ④）：长期运行的内存曲线靠这几族看。
+	// 与 /api/runtime 同源（见 cachedRuntimeStats），且渲染路径零 STW。
+	rt := p.cachedRuntimeStats()
+	writeGauge(&b, "hub_goroutines", "当前 goroutine 数（泄漏的第一信号）", float64(rt.Goroutines))
+	writeGauge(&b, "hub_heap_alloc_bytes", "存活堆对象占用字节数", float64(rt.HeapAllocBytes))
+	writeGauge(&b, "hub_heap_objects", "存活堆对象数", float64(rt.HeapObjects))
+	writeCounter(&b, "hub_gc_total", "累计 GC 次数", float64(rt.NumGC))
+	writeCounter(&b, "hub_gc_pause_seconds_total", "累计 GC 停顿秒数", float64(rt.GCPauseTotalNs)/1e9)
+	writeGauge(&b, "hub_memory_limit_bytes", "堆占用告警阈值字节数（0 = 未启用告警）", float64(rt.MemLimitBytes))
+	writeCounter(&b, "hub_mem_high_total", "堆占用进入超阈值状态的累计次数", float64(rt.MemHighTotal))
+
 	// HTTP 请求数（按 path 标签）：基数有上限，超出归入 other。
 	p.mu.Lock()
 	paths := make([]string, 0, len(p.httpByPath))
@@ -400,6 +419,46 @@ func (p *Metrics) render() string {
 	return b.String()
 }
 
+// runtimeStats 读取运行时资源快照（**采样路径**，允许一次 STW）。
+//
+// 优先用 pprof 插件经共享 KV 提供的版本（它附带阈值状态，且自身也只读缓存），
+// 没有提供者时做一次刷新——**绝不能因为某个插件被关掉就让指标整族消失**：
+// 内存问题恰恰最容易在「为了省资源而关掉一些插件」的部署里出现。
+func (p *Metrics) runtimeStats() plugin.RuntimeStats {
+	if st, ok := p.providerStats(); ok {
+		return st
+	}
+	return plugin.RefreshRuntimeStats()
+}
+
+// cachedRuntimeStats 读取缓存快照（**渲染路径**，零 STW）。
+//
+// /metrics 被抓取的频率由外部决定（Prometheus 默认 15s，排查时可能 1s），
+// 渲染里现读 MemStats 会 STW，在扇出场景下直接表现为丢消息——
+// 监控不该改变被测系统（实测：带抓取丢弃 1360 条 vs 不抓取 42 条）。
+func (p *Metrics) cachedRuntimeStats() plugin.RuntimeStats {
+	if st, ok := p.providerStats(); ok {
+		return st
+	}
+	return plugin.CachedRuntimeStats()
+}
+
+// providerStats 尝试从共享 KV 取 pprof 插件提供的快照。
+func (p *Metrics) providerStats() (plugin.RuntimeStats, bool) {
+	if p.ctx == nil {
+		return plugin.RuntimeStats{}, false
+	}
+	v, ok := p.ctx.GetShared(plugin.RuntimeStatsKey)
+	if !ok {
+		return plugin.RuntimeStats{}, false
+	}
+	fn, isFn := v.(plugin.RuntimeStatsProvider)
+	if !isFn || fn == nil {
+		return plugin.RuntimeStats{}, false
+	}
+	return fn(), true
+}
+
 // sseStats 从共享 KV 读取 realtime 插件的统计（未启用 realtime 时 ok=false）。
 func (p *Metrics) sseStats() (clients int, dropped int64, ok bool) {
 	if p.ctx == nil {
@@ -435,6 +494,11 @@ func writeCounter(b *strings.Builder, name, help string, value float64) {
 func formatFloat(v float64) string {
 	if v == float64(int64(v)) {
 		return strconv.FormatInt(int64(v), 10)
+	}
+	// 小于 1 的值（典型是 GC 停顿累计秒数）用 6 位小数：
+	// 3 位会把 2.5ms 四舍五入成 0.003，counter 的单位换算直接失真。
+	if v > -1 && v < 1 {
+		return strconv.FormatFloat(v, 'f', 6, 64)
 	}
 	return strconv.FormatFloat(v, 'f', 3, 64)
 }

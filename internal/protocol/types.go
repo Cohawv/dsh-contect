@@ -52,7 +52,27 @@ const (
 	TopicGroupChanged = "group.changed"
 	// TopicHTTPRequest 一次 HTTP 请求进入共享 mux（探针端点除外）。
 	TopicHTTPRequest = "http.request"
+	// TopicMemHigh 进程堆占用跨越告警阈值（V8 ④ pprof 插件发布）。
+	//
+	// 只在**跨越**阈值时发一次（带 90% 迟滞），不按采样周期重复——
+	// 订阅方拿到的是「事件」而不是「心跳」，可以放心地弹一次横幅。
+	// 与 msg.content 同样属于 opt-in：不在 realtime 的默认订阅集合里。
+	TopicMemHigh = "mem.high"
 )
+
+// MemHigh 是 protocol.TopicMemHigh 的事件载荷（V8 ④ 内存阈值告警）。
+//
+// 只带判定所需的最小数字：运维关心的是「多高、上限多少、多少个 goroutine」，
+// 不需要也不应该从事件里拿走整个堆内容（那要走 pprof 快照）。
+type MemHigh struct {
+	HeapAllocBytes uint64 `json:"heapAllocBytes"`
+	LimitBytes     uint64 `json:"limitBytes"`
+	Goroutines     int    `json:"goroutines"`
+	HeapObjects    uint64 `json:"heapObjects"`
+	NumGC          uint32 `json:"numGC"`
+	Count          int64  `json:"count"` // 本次是第几次进入超阈值状态
+	TS             int64  `json:"ts"`    // 采样时刻（毫秒）
+}
 
 // MsgContent 是 protocol.TopicMsgContent 的事件载荷（聊天正文，供控制台展示）。
 //
@@ -91,6 +111,7 @@ func AllTopics() []string {
 		TopicMsgContent,
 		TopicGroupChanged,
 		TopicHTTPRequest,
+		TopicMemHigh,
 	}
 }
 

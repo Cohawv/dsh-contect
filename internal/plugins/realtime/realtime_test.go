@@ -492,3 +492,64 @@ func TestMsgRoutedIsOptIn(t *testing.T) {
 		t.Fatalf("busTopics 应含 %q（V7 ① 事件流依赖）", protocol.TopicMsgRouted)
 	}
 }
+
+// TestMemHighIsOptIn：内存告警 mem.high 同样是 opt-in（V8 ④）。
+//
+// 为什么必须进 busTopics：不在订阅列表里的 topic **永远不会**被转发，
+// 即使客户端显式 ?topics=mem.high —— 这个失败是静默的（客户端只等不到事件），
+// 所以要用测试钉住「订阅表里确实有它」。
+func TestMemHighIsOptIn(t *testing.T) {
+	rig := newSSERig(t, map[string]any{"heartbeat": "50ms", "statsInterval": "10s"})
+	defer rig.close()
+
+	sub := rig.stream(t, "?topics="+protocol.TopicMemHigh, nil)
+	defer sub.Close()
+	def := rig.stream(t, "", nil)
+	defer def.Close()
+
+	rig.hub.Bus.Publish(protocol.TopicMemHigh, protocol.MemHigh{
+		HeapAllocBytes: 2 << 30,
+		LimitBytes:     1 << 30,
+		Goroutines:     12,
+		Count:          1,
+		TS:             1,
+	})
+
+	got := ""
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f := sub.readFrame(t)
+		if f.Ping {
+			continue
+		}
+		got = f.Event
+		break
+	}
+	if got != protocol.TopicMemHigh {
+		t.Fatalf("显式订阅者应收到 %q，实得 %q", protocol.TopicMemHigh, got)
+	}
+
+	// 默认订阅集合不该被内存告警污染（默认只推上下线/房间/插件状态）。
+	deadline = time.Now().Add(700 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		f := def.readFrame(t)
+		if !f.Ping && f.Event == protocol.TopicMemHigh {
+			t.Fatalf("默认订阅集合不应含 %q", protocol.TopicMemHigh)
+		}
+	}
+
+	found := false
+	for _, tp := range rig.rt.busTopics() {
+		if tp == protocol.TopicMemHigh {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("busTopics 应含 %q，否则显式订阅也收不到", protocol.TopicMemHigh)
+	}
+	for _, tp := range defaultTopics {
+		if tp == protocol.TopicMemHigh {
+			t.Fatalf("defaultTopics 不应含 %q", protocol.TopicMemHigh)
+		}
+	}
+}

@@ -319,6 +319,9 @@ func (p *Realtime) Apply(options map[string]any) error {
 //
 // msg.routed 同理（V7 ①）：高频事件，默认不推；控制台的「事件流」视图显式带
 // ?topics=msg.routed 订阅后才下发——满足 V7 事件流验收，又不放大默认 SSE 流量。
+//
+// mem.high（V8 ④）同样 opt-in：内存告警是低频但重要的事件，
+// 订阅方显式带 ?topics=mem.high 才收（默认集合不含，避免给只想看上下线的客户端加噪声）。
 func (p *Realtime) busTopics() []string {
 	return []string{
 		protocol.TopicAgentOnline,
@@ -326,6 +329,7 @@ func (p *Realtime) busTopics() []string {
 		protocol.TopicRoomChanged,
 		protocol.TopicMsgContent,
 		protocol.TopicMsgRouted,
+		protocol.TopicMemHigh,
 		plugin.TopicState,
 	}
 }

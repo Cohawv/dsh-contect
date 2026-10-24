@@ -15,6 +15,7 @@ import (
 	_ "lan-agent-hub/internal/plugins/logview"     // 服务端日志环形缓冲（/api/logs）
 	_ "lan-agent-hub/internal/plugins/metrics"     // Prometheus 指标与概览趋势
 	_ "lan-agent-hub/internal/plugins/plugininfo"  // 管理 API（插件清单/开关/设置/部署清单）
+	_ "lan-agent-hub/internal/plugins/pprof"       // 内存治理：pprof 诊断 + 堆快照 + 阈值告警（V8 ④）
 	_ "lan-agent-hub/internal/plugins/realtime"    // SSE 实时推送（/api/stream）
 	_ "lan-agent-hub/internal/plugins/ack"         // 投递确认与对账（V6 ②）
 	_ "lan-agent-hub/internal/plugins/capdir"      // 能力目录与按能力选人（V6 ②）
