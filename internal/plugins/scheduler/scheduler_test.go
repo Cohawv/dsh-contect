@@ -37,6 +37,18 @@ func (s *stubPub) last() protocol.Envelope {
 	return s.sent[len(s.sent)-1]
 }
 
+// all 返回已发送信封的副本。
+//
+// 加锁 + 拷贝而不是让测试直接读 s.sent：调度循环在自己的协程里追加，
+// 测试侧无锁读是数据竞争（-race 下会直接报，本机 386 跑不了 -race 不等于没问题）。
+func (s *stubPub) all() []protocol.Envelope {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]protocol.Envelope, len(s.sent))
+	copy(out, s.sent)
+	return out
+}
+
 // probePlugin 是带一个端点的探针插件（call-api 与 plugin-action 两类任务的靶子）。
 type probePlugin struct{}
 
@@ -258,15 +270,28 @@ func TestSendMessageToAndBroadcast(t *testing.T) {
 	waitFor(t, "两条都执行", func() bool {
 		return snapshotTask(p, "dm").RunCount == 1 && snapshotTask(p, "bc").RunCount == 1
 	})
-	// dm：点对点
-	env1 := p.pub.(*stubPub).sent[0]
-	if env1.To != "agent-x" {
-		t.Fatalf("dm 应点对点发 agent-x，实得 %q", env1.To)
+	// dm：点对点；bc：广播（to 被清空）
+	//
+	// 刻意不按 sent[0]/sent[1] 下标取：dm 与 bc 的到期时刻相同（都是 now+20），
+	// 调度循环用 `for id, t := range p.tasks` 遍历到期任务，而 Go 的 map 迭代
+	// 顺序是随机的——按下标取会随机把广播当成点对点。这不是产品缺陷，
+	// 是测试对"执行顺序"的错误假设：实测 -count=6 有 2 次红。
+	// 因此只断言语义存在性（各恰好一条），不引入任何顺序要求。
+	sent := p.pub.(*stubPub).all()
+	if len(sent) != 2 {
+		t.Fatalf("应发出 2 条信封，实得 %d 条：%+v", len(sent), sent)
 	}
-	// bc：广播（to 被清空）
-	env2 := p.pub.(*stubPub).sent[1]
-	if env2.To != "" {
-		t.Fatalf("广播应清空 to，实得 %q", env2.To)
+	var dm, bc int
+	for i := range sent {
+		switch sent[i].To {
+		case "agent-x":
+			dm++
+		case "":
+			bc++
+		}
+	}
+	if dm != 1 || bc != 1 {
+		t.Fatalf("应各有一条点对点(to=agent-x)与一条广播(to 空)，实得 dm=%d bc=%d：%+v", dm, bc, sent)
 	}
 }
 
