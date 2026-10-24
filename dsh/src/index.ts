@@ -915,13 +915,23 @@ export function apply(ctx: Context, initialConfig: Config) {
       name: 'hub_config',
       description:
         'Read or change lan-hub runtime policy (auto-reply on/off, room wake policy, temporary mute). Changes apply immediately without reconnecting.',
+      // 可选参数一律**省略** required 键，不写 required: false。
+      // 宿主的 dsh-tools 在编译工具的 JSON Schema 时有这条硬规则：
+      //   「属性上只要带了 required，它的值就必须严格等于 true」
+      // 写成 required: false 会让整条插件注册直接失败——真机表现是
+      //   JsonSchemaError: unsupported JSON schema:
+      //     parameters.autoRespond.required must be true when present
+      //   dsh: warning: 1 entry did not activate
+      // 症状极具迷惑性：连接协商照常成功、Agent 照常上线，
+      // 但 10 个 hub_* 工具一个都没注册（模型根本调不到）。
+      // 回归测试见 test/schema-check.ts（用真实 dsh-tools 校验器兜底）。
       parameters: {
-        autoRespond: { type: 'boolean', required: false, description: 'Turn auto-reply on/off' },
-        wakeRoom: { type: 'string', required: false, description: 'Room wake policy: mention | all | off' },
-        muteForSec: { type: 'number', required: false, description: 'Mute auto-reply for N seconds (all, or only `room`)' },
-        room: { type: 'string', required: false, description: 'Room id to scope muteForSec to' },
-        unmute: { type: 'boolean', required: false, description: 'Clear all mutes' },
-        reset: { type: 'boolean', required: false, description: 'Reset turn counters and mute state' },
+        autoRespond: { type: 'boolean', description: 'Turn auto-reply on/off' },
+        wakeRoom: { type: 'string', description: 'Room wake policy: mention | all | off' },
+        muteForSec: { type: 'number', description: 'Mute auto-reply for N seconds (all, or only `room`)' },
+        room: { type: 'string', description: 'Room id to scope muteForSec to' },
+        unmute: { type: 'boolean', description: 'Clear all mutes' },
+        reset: { type: 'boolean', description: 'Reset turn counters and mute state' },
       },
       output: out,
       async execute(args, exec) {
