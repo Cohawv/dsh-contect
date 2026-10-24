@@ -4,7 +4,7 @@
 > **读法**：直接跳到第 0 节抄命令。若出问题，按第 9 节决策树走。
 > **价值**：本文记录的所有路径均已实测通过。按本文执行可跳过约 60+ 次无效探索（`adb root` / `run-as` / token 认证 / HTTP 直链 / TS 源码发布等都是死路）。
 >
-> **本文件位置**：手机 `/sdcard/DSHA_PLAYBOOK.md`（PC 侧副本，仓库根 `D:/AI-Agent/vibe/Agent-core-contect`：`dsh/DSHA_PLAYBOOK.md`）。
+> **本文件位置**：手机 `/sdcard/DSHA_PLAYBOOK.md`（PC 侧副本，仓库根 `D:/AI-Agent/vibe/dsh-contect`：`dsh/DSHA_PLAYBOOK.md`）。
 > 读取：`adb -s <target> shell cat /sdcard/DSHA_PLAYBOOK.md`
 > 若担心 /sdcard 被清理，可在容器终端持久化一份：
 > `cp /sdcard/DSHA_PLAYBOOK.md /root/local-plugins/DSHA_PLAYBOOK.md`
@@ -254,7 +254,7 @@ dumpsys power | grep mWakefulness      →   mWakefulness=Awake（屏幕没睡�
 ### 6.1 打包（PC 侧）
 
 ```bash
-cd D:/AI-Agent/vibe/Agent-core-contect/dsh
+cd D:/AI-Agent/vibe/dsh-contect/dsh
 npm pack      # → dsh-plugin-lan-hub-0.1.0.tgz
 ```
 
@@ -588,7 +588,7 @@ Hub 在线表里 agent **照样在**（因为连接是在 `ctx.effect` 里先建
 去校验每个注册工具的 `parameters`，并断言 10 个工具齐全：
 
 ```bash
-cd D:/AI-Agent/vibe/Agent-core-contect/dsh
+cd D:/AI-Agent/vibe/dsh-contect/dsh
 node --experimental-strip-types test/schema-check.ts
 # 反向验证：把 required:false 加回 autoRespond → 测试当场变红，
 # 报错信息与真机日志逐字一致
@@ -641,7 +641,7 @@ curl -s "http://127.0.0.1:13539/api/tools?token=$TOK"
 > 都返回 `unauthorized`，**工具清单这条路当时没走通**。判断插件是否激活，
 > 用 §13.2 的日志信号更省事。
 
-参考资料（PC 侧仓库，根 `D:/AI-Agent/vibe/Agent-core-contect`）：
+参考资料（PC 侧仓库，根 `D:/AI-Agent/vibe/dsh-contect`）：
 - `dsh/README.md` —— DSHA 安装章节、配置写法
 - `dsh/build.mjs` —— esbuild 编译（`external: @deepseek-ai/*`）
 - `dsh/tools/wb_*.sh` —— 本文用到的全部容器脚本
