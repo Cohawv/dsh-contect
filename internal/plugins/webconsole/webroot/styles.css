@@ -1072,3 +1072,31 @@ html, body { -webkit-tap-highlight-color: transparent; }
   .skip-link { transition: none; }
   .skip-link:focus { top: 12px; }
 }
+
+/* =====================================================================
+   V8f 性能视图
+   —— 只新增「概览没有的那几个视觉语义」（告警态、参考线、双图并排），
+   其余配色/间距/字号/曲线样式全部复用既有令牌与 .metric-card / .trend。
+   ===================================================================== */
+/* 两张曲线并排；窄屏自动堆叠（auto-fit 不需要额外媒体查询） */
+.perf-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: var(--sp-4); }
+/* KPI 行本身用 .metrics-grid 的栅格，这里只补一个与卡片间距一致的底边距 */
+.perf-kpis { margin-bottom: var(--sp-4); }
+
+/* 告警态：边框与数值变色 **只作为增强**，文案里同时有 ⚠ 与「告警」字样，
+   所以色盲/灰度打印下信息不丢失。 */
+.metric-card.is-warn {
+  border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface-2));
+}
+.metric-card.is-warn .metric-card__value { color: var(--danger); }
+.metric-card.is-warn .metric-card__sub { color: var(--danger); }
+
+/* 明细表的告警行：同样"颜色 + ⚠ 符号"双通道 */
+.table tbody tr.is-warn td, .table tbody tr.is-warn th { color: var(--danger); }
+.table tbody tr.is-warn th { font-weight: 600; }
+.table tbody th[scope="row"] { text-align: left; font-weight: 600; color: var(--text-muted); }
+
+/* 参考线（内存告警阈值）：与曲线共用同一 Y 轴，虚线 + 浅描边便于与数据线区分 */
+.trend__ref { stroke: var(--warning); stroke-width: 1; stroke-dasharray: 6 4; }
+.trend__ref-label { fill: var(--warning); font-size: 10px; font-family: var(--font-mono); }

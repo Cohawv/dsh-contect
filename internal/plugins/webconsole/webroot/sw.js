@@ -17,7 +17,9 @@
   'use strict';
 
   // 缓存版本：升级前端即应改此值（与 app.js 的 APP_VERSION 保持一致）。
-  const SW_VERSION = '7.3';
+  // V8f 加了「性能」视图并改了 app.js/index.html/styles.css —— 不 bump 的话
+  // 老用户刷新拿到的仍是缓存里的旧壳，界面上根本看不到新视图。
+  const SW_VERSION = '7.4';
   const CACHE_NAME = 'lanhub-shell-v' + SW_VERSION;
 
   // app shell：离线启动所需的最小集合（全部为静态资源）

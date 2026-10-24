@@ -138,6 +138,12 @@
       const key = el.getAttribute && el.getAttribute('data-i18n-title');
       if (key && el.setAttribute) el.setAttribute('title', t(key));
     });
+    // aria-label 也是"文案"，但它是属性不是文本节点：单独走一个标记，
+    // 否则读屏标签会永远停在首屏的中文上（V8f 性能视图的 KPI 组与曲线需要它）。
+    $$('[data-i18n-aria-label]').forEach((el) => {
+      const key = el.getAttribute && el.getAttribute('data-i18n-aria-label');
+      if (key && el.setAttribute) el.setAttribute('aria-label', t(key));
+    });
     // lang/dir 框架就位：RTL 语言只需在语言包里出现即可自动翻转。
     const html = document.documentElement;
     if (html && html.setAttribute) {
@@ -199,6 +205,7 @@
       function () { if (settingsCache) renderSettings(); },
       function () { if (lastMetrics) renderMetrics(lastMetrics); },
       function () { renderTrend(lastSamples, msgRateSamples); },
+      function () { renderPerf(); }, // V8f：性能视图（无缓存数据时 renderPerf 自己早退）
       function () { renderEvents(); },
       function () { renderLogs(); },
     ];
@@ -357,6 +364,9 @@
   // 后两项是「语言包未就绪」时的兜底原文 —— 首屏永远是正确的中文，不会闪出键名。
   const pageMeta = {
     overview:  ['view.overview.title', 'view.overview.sub', '概览', '局域网多 Agent 通信中枢运行状态'],
+    // V8f：性能视图。登记在这里 = 同时获得导航/hash 深链/命令面板/切语言重绘，
+    // 四处（pageMeta、setView、rerenderAllViews、renderers）任缺一处都会出现"切语言后视图空白"。
+    perf:      ['view.perf.title', 'view.perf.sub', '性能', '吞吐、丢弃与内存的实时同源视图（每 2 秒采样）'],
     agents:    ['view.agents.title', 'view.agents.sub', '在线 Agent', '当前连接到 Hub 的全部 Agent'],
     rooms:     ['view.rooms.title', 'view.rooms.sub', '聊天室', '创建、加入与管理聊天室'],
     messaging: ['view.messaging.title', 'view.messaging.sub', '发送消息', '向 Agent / 房间发送或广播消息——实时时间线'],
@@ -394,6 +404,8 @@
       location.hash = name; // 深链：刷新后仍停在当前视图
     }
     if (name === 'overview') { loadStatus(true); loadMetrics(true); }
+    // V8f：性能视图自带 2 秒采样；进入时立刻取一次，避免首屏等 2 秒才有数。
+    if (name === 'perf') { loadPerf(true); perfStartPolling(); }
     if (name === 'agents') loadAgents();
     if (name === 'rooms') loadRooms();
     if (name === 'events') renderEvents(); // 切回事件流时按当前过滤条件重画一次
@@ -403,6 +415,8 @@
     if (name === 'about') renderAbout();
     // 离开日志视图时断开日志流：不在看的连接不该占着服务端名额。
     if (name !== 'logs') closeLogStream();
+    // 同理，离开性能视图立刻停表：后台标签页不该每 2 秒打一次接口。
+    if (name !== 'perf') perfStopPolling();
   }
 
   /* ---------------- 概览 + 状态 ---------------- */
@@ -1707,6 +1721,59 @@
     renderTrend(lastSamples, msgRateSamples);
   }
 
+  /* ---------- SVG 折线的公共坐标算法（概览与 V8f 性能视图共用） ----------
+     抽出来的唯一原因：性能视图要画两条同规格曲线，照抄两份"几乎一样"的实现
+     必然会漂移（改了一处忘另一处）。这里只提取**纯几何**，概览的标记顺序、
+     class、归一化规则一概不动 —— overview 曲线的外观必须零变化。 */
+  const TREND_W = 600, TREND_H = 120, TREND_PAD = 6;
+
+  // seriesY 把数值映射为 Y：大值在上（SVG 原点在左上）。
+  function seriesY(v, maxV) {
+    return TREND_H - TREND_PAD - (v / maxV) * (TREND_H - TREND_PAD * 2);
+  }
+
+  // seriesPoints 把数值序列映射为坐标点；长度 1 时 step=0（单点退化，不除零）。
+  function seriesPoints(values, maxV) {
+    const step = values.length > 1 ? (TREND_W - TREND_PAD * 2) / (values.length - 1) : 0;
+    return values.map((v, i) => [TREND_PAD + i * step, seriesY(v, maxV)]);
+  }
+
+  // pointsAttr 生成 polyline 的 points 属性（保留 1 位小数，避免长浮点撑大 DOM）。
+  function pointsAttr(pts) {
+    return pts.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
+  }
+
+  // areaPath 生成「折线 + 底边闭合」的面积路径（与概览面积完全同形）。
+  function areaPath(pts) {
+    if (!pts.length) return '';
+    const base = TREND_H - TREND_PAD;
+    return 'M' + pts[0][0].toFixed(1) + ',' + base +
+      ' L' + pts.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' L') +
+      ' L' + pts[pts.length - 1][0].toFixed(1) + ',' + base + ' Z';
+  }
+
+  // dotsCircle 生成点标记；radius 由调用方给（概览主序列 2.5，速率线 2）。
+  function dotsCircle(pts, radius) {
+    return pts.map((p) =>
+      '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="' + radius + '" />').join('');
+  }
+
+  // trendGridLines 生成 0 / 50% / 100% 三条水平虚线。
+  function trendGridLines() {
+    return [0, 0.5, 1].map((f) =>
+      '<line x1="0" x2="' + TREND_W + '" y1="' + (TREND_PAD + f * (TREND_H - TREND_PAD * 2)).toFixed(1) +
+      '" y2="' + (TREND_PAD + f * (TREND_H - TREND_PAD * 2)).toFixed(1) + '" />').join('');
+  }
+
+  // seriesMax 取序列最大值作为归一化基准（下限 1，避免全 0 时除零）；
+  // extraMax 让调用方把"参考线"也纳入同一 Y 轴（例如内存告警阈值）。
+  function seriesMax(values, extraMax) {
+    const list = values && values.length ? values : [0];
+    let maxV = Math.max.apply(null, list);
+    if (extraMax && extraMax > maxV) maxV = extraMax;
+    return Math.max(1, maxV);
+  }
+
   // renderTrend 用原生 SVG 画折线 + 面积（不引图表库）。
   // 两条线：在线 Agent 数（服务端采样）+ 消息速率（客户端按窗口计数，单位 条/秒）。
   function renderTrend(samples, msgRates) {
@@ -1720,50 +1787,28 @@
       return;
     }
 
-    const W = 600, H = 120, PAD = 6;
     const values = samples.map((s) => (s.agentsOnline || 0));
-    const maxV = Math.max(1, Math.max.apply(null, values.length ? values : [0]));
-    const step = values.length > 1 ? (W - PAD * 2) / (values.length - 1) : 0;
-
-    const pts = values.map((v, i) => {
-      const x = PAD + i * step;
-      const y = H - PAD - (v / maxV) * (H - PAD * 2);
-      return [x, y];
-    });
-    const line = pts.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
-    const area = pts.length
-      ? 'M' + pts[0][0].toFixed(1) + ',' + (H - PAD) + ' L' + line.split(' ').join(' L') +
-        ' L' + pts[pts.length - 1][0].toFixed(1) + ',' + (H - PAD) + ' Z'
-      : '';
-
-    const dots = pts.map((p) =>
-      '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="2.5" />').join('');
-    const grid = [0, 0.5, 1].map((f) =>
-      '<line x1="0" x2="' + W + '" y1="' + (PAD + f * (H - PAD * 2)).toFixed(1) +
-      '" y2="' + (PAD + f * (H - PAD * 2)).toFixed(1) + '" />').join('');
+    const maxV = seriesMax(values);
+    const pts = seriesPoints(values, maxV);
+    const line = pointsAttr(pts);
+    const area = areaPath(pts);
 
     // 第二条线：消息速率（条/秒），按自己的最大值归一化，独立 Y 轴。
     let rateLine = '';
     if (msgRates.length) {
+      // 下限取 0.01（而不是 1）：速率常年很小，按 1 归一化会把曲线压成一条直线。
       const maxR = Math.max(0.01, Math.max.apply(null, msgRates));
-      const rStep = msgRates.length > 1 ? (W - PAD * 2) / (msgRates.length - 1) : 0;
-      const rPts = msgRates.map((v, i) => {
-        const x = PAD + i * rStep;
-        const y = H - PAD - (v / maxR) * (H - PAD * 2);
-        return [x, y];
-      });
+      const rPts = seriesPoints(msgRates, maxR);
       rateLine = '<polyline class="trend__line trend__line--rate" points="' +
-        rPts.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ') + '" />' +
-        '<g class="trend__dots trend__dots--rate">' +
-        rPts.map((p) => '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="2" />').join('') +
-        '</g>';
+        pointsAttr(rPts) + '" />' +
+        '<g class="trend__dots trend__dots--rate">' + dotsCircle(rPts, 2) + '</g>';
     }
 
     svg.innerHTML =
-      '<g class="trend__grid">' + grid + '</g>' +
+      '<g class="trend__grid">' + trendGridLines() + '</g>' +
       (area ? '<path class="trend__area" d="' + area + '" />' : '') +
       '<polyline class="trend__line" points="' + line + '" />' +
-      '<g class="trend__dots">' + dots + '</g>' +
+      '<g class="trend__dots">' + dotsCircle(pts, 2.5) + '</g>' +
       rateLine;
 
     if (axis) {
@@ -1785,6 +1830,405 @@
     const d = new Date(ms);
     return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) +
       ':' + ('0' + d.getSeconds()).slice(-2);
+  }
+
+  /* =====================================================================
+     V8f 性能视图（吞吐 / 丢弃 / 内存的同一份 summary 视图）
+     ---------------------------------------------------------------------
+     数据只来自既有的 GET /api/metrics/summary（V8 起追加了丢弃与内存字段），
+     不新增端点、不引图表库：曲线复用 renderTrend 的坐标算法（seriesPoints 等）。
+     采样策略：视图可见时每 2 秒拉一次，本地保留 120 点（≈4 分钟窗口）；
+     离开视图立刻停表 —— 后台标签页持续打接口本身就是一种性能问题。
+     ===================================================================== */
+  const PERF_POLL_MS = 2000;   // 采样周期：与「每 2 秒」的对外承诺一致
+  const PERF_WIN_CAP = 120;    // 滑动窗口上限：120 点 × 2 秒 ≈ 4 分钟
+
+  const perfState = {
+    timer: null,                 // 轮询定时器（null = 未轮询）
+    win: [],                     // 本地窗口：{ ts, rate, heap, gor }
+    last: null,                  // 最近一次 summary 原始响应
+    prev: null,                  // 上一次 summary（算「较上次」增量用）
+    error: '',                   // 最近一次失败原因（空 = 正常）
+    live: { drops: false, mem: false }, // a11y 播报去重：只在状态跃迁时说话
+  };
+
+  // perfNum 把任意输入收敛成有限数字：字段缺失（后端尚未升级）时一律当 0，
+  // 否则 NaN 会一路渗进 SVG 坐标，把整条曲线画成空白。
+  function perfNum(v) {
+    const n = typeof v === 'number' ? v : Number(v);
+    return isFinite(n) ? n : 0;
+  }
+
+  // perfModel 是**纯函数**：把 summary 响应收敛成视图用的模型（含告警判定）。
+  // 之所以抽出来：console-perf-sim.cjs 可以不碰 DOM 就验证判定与格式化逻辑。
+  function perfModel(raw) {
+    const m = raw || {};
+    const deliverDropped = perfNum(m.deliverDropped);
+    const deliverClosed = perfNum(m.deliverClosed);
+    const memLimit = perfNum(m.memLimitBytes);
+    const heapAlloc = perfNum(m.heapAllocBytes);
+    return {
+      rate: perfNum(m.messagesPerSecond),
+      deliverDropped: deliverDropped,
+      deliverClosed: deliverClosed,
+      // 「丢弃总数」= 队列满 + 连接已关闭：用户关心的是"有多少消息没能送到"，
+      // 两者的拆分放在 sub / 明细表里，KPI 上只给一个总数。
+      dropsTotal: deliverDropped + deliverClosed,
+      goroutines: perfNum(m.goroutines),
+      heapAlloc: heapAlloc,
+      heapInuse: perfNum(m.heapInuseBytes),
+      gcTotal: perfNum(m.gcTotal),
+      sseClients: perfNum(m.sseClients),
+      eventsDropped: perfNum(m.eventsDropped),
+      memLimit: memLimit,
+      memHigh: !!m.memHigh,
+      memHighTotal: perfNum(m.memHighTotal),
+      // 占用率只在启用阈值时有意义：0 = 未启用，既不能算 0% 也不能算无穷大。
+      heapPct: memLimit > 0 ? Math.round((heapAlloc / memLimit) * 100) : null,
+      warnDrops: deliverDropped + deliverClosed > 0,
+      warnMem: !!m.memHigh,
+    };
+  }
+
+  // fmtBytes 用 1024 进制换算成人读的字节数；数字部分走 Intl（随语言变千分位/小数点）。
+  function fmtBytes(n) {
+    const v0 = perfNum(n);
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let v = Math.abs(v0);
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    let s;
+    try {
+      s = new Intl.NumberFormat(i18n.lang, { maximumFractionDigits: i === 0 ? 0 : 1 }).format(v);
+    } catch (_) {
+      s = i === 0 ? String(Math.round(v)) : v.toFixed(1);
+    }
+    return (v0 < 0 ? '-' : '') + s + ' ' + units[i];
+  }
+
+  // fmtRate 统一速率文案（两位小数）：KPI、曲线 aria-label、坐标轴共用，避免各处精度不一。
+  function fmtRate(v) {
+    return perfNum(v).toFixed(2);
+  }
+
+  // perfPushPoint 往本地窗口追加一个采样点。速率取服务端窗口值，堆与 goroutine
+  // 与 /metrics 的 gauge **同源同刻**（同一份 summary），因此曲线末端与当前值永远对得上。
+  function perfPushPoint(m) {
+    perfState.win.push({
+      ts: Date.now(),
+      rate: perfNum(m.messagesPerSecond),
+      heap: perfNum(m.heapAllocBytes),
+      gor: perfNum(m.goroutines),
+    });
+    // 定长淘汰：长时间挂机会把数组撑成无界内存，这正是本视图要防的问题本身。
+    if (perfState.win.length > PERF_WIN_CAP) perfState.win.shift();
+  }
+
+  async function loadPerf(silent) {
+    const r = await api('GET', '/api/metrics/summary');
+    if (!r.ok) {
+      perfState.error = r.error || ts('common.networkError', '网络错误');
+      if (!silent) toast(ts('perf.loadFailed', '性能数据加载失败：') + perfState.error, 'error');
+      if (activeView === 'perf') renderPerfAlert();
+      return;
+    }
+    perfState.error = '';
+    perfState.prev = perfState.last;
+    perfState.last = r.data || {};
+    perfPushPoint(perfState.last);
+    requestRender('perf');
+  }
+
+  // perfStartPolling / perfStopPolling 是性能视图轮询的唯一开关。
+  // 定时器回调里再判一次 activeView：即便某条路径漏了 stop，也绝不会继续发请求。
+  function perfStartPolling() {
+    if (perfState.timer) return;
+    perfState.timer = setInterval(function () {
+      if (activeView !== 'perf') { perfStopPolling(); return; }
+      if (document && document.hidden) return; // 标签页在后台：不采样（省 CPU 也省服务端）
+      loadPerf(true);
+    }, PERF_POLL_MS);
+  }
+
+  function perfStopPolling() {
+    if (!perfState.timer) return;
+    clearInterval(perfState.timer);
+    perfState.timer = null;
+  }
+
+  // perfTrendText 把增量渲染成「符号 + 数值」：符号不是装饰，是**不依赖颜色**的方向信号
+  // （色盲用户同样能读出升降），读屏也会把 ▲/▼ 读成"上升/下降"。
+  function perfTrendText(delta, formatted) {
+    if (!isFinite(delta) || Math.abs(delta) < 1e-9) return '● ' + ts('perf.trend.flat', '持平');
+    return (delta > 0 ? '▲ ' : '▼ ') + formatted;
+  }
+
+  // perfKpiCard 生成一张 KPI 卡：复用概览 .metric-card 的视觉，告警时加 .is-warn。
+  function perfKpiCard(o) {
+    return '<div class="metric-card' + (o.warn ? ' is-warn' : '') + '"' +
+      (o.warn ? ' data-warn="1"' : '') + '>' +
+      '<div class="metric-card__label">' + esc(o.label) + '</div>' +
+      '<div class="metric-card__value">' + esc(o.value) + '</div>' +
+      '<div class="metric-card__sub">' + esc(o.sub) + '</div>' +
+    '</div>';
+  }
+
+  function renderPerfKpis(model) {
+    const host = $('#perf-kpis');
+    if (!host) return;
+    const win = perfState.win;
+    const lastPt = win.length ? win[win.length - 1] : null;
+    const prevPt = win.length > 1 ? win[win.length - 2] : null;
+    // 增量优先用本地窗口的两点（同口径、同间隔），窗口不足时退化为 0（显示"持平"）。
+    const rateDelta = (lastPt && prevPt) ? (lastPt.rate - prevPt.rate) : 0;
+    const gorNow = model.goroutines;
+    const gorDelta = (lastPt && prevPt) ? (lastPt.gor - prevPt.gor) : 0;
+
+    const dropsSub = model.warnDrops
+      ? '⚠ ' + ts('perf.flag.warn', '告警') + ' · ' +
+        tsp('perf.kpi.drops.sub', '队列满 {queued} · 已关闭 {closed}',
+          { queued: fmtInt(model.deliverDropped), closed: fmtInt(model.deliverClosed) })
+      : '● ' + ts('perf.kpi.drops.ok', '无丢弃');
+
+    const heapSub = model.memLimit > 0
+      ? tsp('perf.kpi.heap.pct', '占告警阈值 {pct}%', { pct: fmtInt(model.heapPct == null ? 0 : model.heapPct) }) +
+        (model.warnMem ? ' · ⚠ ' + ts('perf.flag.high', '超阈值') : ' · ● ' + ts('perf.flag.normal', '正常'))
+      : '● ' + ts('perf.kpi.heap.noLimit', '未启用告警阈值');
+
+    const cards = [
+      perfKpiCard({
+        label: ts('perf.kpi.rate.label', '当前速率'),
+        value: fmtRate(model.rate),
+        sub: perfTrendText(rateDelta, tsp('perf.delta.rate', '较上次 {n}', { n: fmtRate(Math.abs(rateDelta)) })) +
+          ' · ' + ts('perf.unit.perSec', '条/秒'),
+        warn: false,
+      }),
+      perfKpiCard({
+        label: ts('perf.kpi.drops.label', '丢弃总数'),
+        value: fmtInt(model.dropsTotal),
+        sub: dropsSub,
+        warn: model.warnDrops,
+      }),
+      perfKpiCard({
+        label: ts('perf.kpi.goroutines.label', 'goroutine'),
+        value: fmtInt(gorNow),
+        sub: perfTrendText(gorDelta, tsp('perf.delta.goroutines', '较上次 {n}', { n: fmtInt(Math.abs(gorDelta)) })),
+        warn: false,
+      }),
+      perfKpiCard({
+        label: ts('perf.kpi.heap.label', '堆占用'),
+        value: fmtBytes(model.heapAlloc),
+        sub: heapSub,
+        warn: model.warnMem,
+      }),
+    ];
+    host.innerHTML = cards.join('');
+  }
+
+  // paintSeries 把一条序列画进给定 SVG。标记顺序、class 与概览曲线完全一致，
+  // 因此两块曲线的观感同源（不另起一套视觉语言）。refValue > 0 时画一条虚线参考线。
+  function paintSeries(svg, values, maxV, refValue) {
+    if (!svg) return;
+    const pts = seriesPoints(values, maxV);
+    let ref = '';
+    if (perfNum(refValue) > 0) {
+      const y = seriesY(perfNum(refValue), maxV);
+      // 参考线必须在同一 Y 轴上：否则「堆一路逼近阈值」看起来仍贴着底部。
+      ref = '<line class="trend__ref" x1="0" x2="' + TREND_W + '" y1="' + y.toFixed(1) +
+        '" y2="' + y.toFixed(1) + '" />' +
+        '<text class="trend__ref-label" x="4" y="' + (y - 4).toFixed(1) + '">' +
+        esc(ts('perf.trend.refLimit', '告警阈值')) + '</text>';
+    }
+    svg.innerHTML = '<g class="trend__grid">' + trendGridLines() + '</g>' +
+      (pts.length ? '<path class="trend__area" d="' + areaPath(pts) + '" />' : '') +
+      (pts.length ? '<polyline class="trend__line" points="' + pointsAttr(pts) + '" />' : '') +
+      '<g class="trend__dots">' + dotsCircle(pts, 2.5) + '</g>' +
+      ref;
+  }
+
+  // setSvgLabel 给 SVG 写 role/aria-label：曲线是数据表达而不是装饰，
+  // 读屏必须能听到"从多少到多少、几个点"这一句，而不是被跳过。
+  function setSvgLabel(el, text) {
+    if (!el || typeof el.setAttribute !== 'function') return;
+    el.setAttribute('role', 'img');
+    el.setAttribute('aria-label', text);
+  }
+
+  function renderPerfCharts(model) {
+    const win = perfState.win;
+    const rates = win.map((p) => p.rate);
+    const heaps = win.map((p) => p.heap);
+
+    const rateSvg = $('#perf-rate-svg');
+    const rateMax = seriesMax(rates);
+    paintSeries(rateSvg, rates, rateMax, 0);
+    if (!rates.length) {
+      setSvgLabel(rateSvg, ts('perf.trend.aria.empty', '曲线：暂无采样点'));
+    } else {
+      setSvgLabel(rateSvg, tsp('perf.trend.aria.rate',
+        '消息速率曲线：最近 {n} 个采样点，从 {from} 条/秒 到 {to} 条/秒',
+        { n: rates.length, from: fmtRate(rates[0]), to: fmtRate(rates[rates.length - 1]) }));
+    }
+
+    const heapSvg = $('#perf-heap-svg');
+    // 阈值也纳入归一化基准：参考线不能被裁掉到画布外。
+    const heapMax = seriesMax(heaps, model.memLimit);
+    paintSeries(heapSvg, heaps, heapMax, model.memLimit);
+    if (!heaps.length) {
+      setSvgLabel(heapSvg, ts('perf.trend.aria.empty', '曲线：暂无采样点'));
+    } else {
+      setSvgLabel(heapSvg, tsp('perf.trend.aria.heap',
+        '堆占用曲线：最近 {n} 个采样点，从 {from} 到 {to}{limit}',
+        {
+          n: heaps.length,
+          from: fmtBytes(heaps[0]),
+          to: fmtBytes(heaps[heaps.length - 1]),
+          limit: model.memLimit > 0
+            ? tsp('perf.trend.aria.limit', '；告警阈值 {v}', { v: fmtBytes(model.memLimit) })
+            : '',
+        }));
+    }
+
+    // 坐标轴三格：起点时刻 / 峰值 / 终点时刻（与概览的 .trend__axis 同结构）。
+    const first = win.length ? win[0].ts : 0;
+    const last = win.length ? win[win.length - 1].ts : 0;
+    const rateAxis = $('#perf-rate-axis');
+    if (rateAxis) {
+      rateAxis.innerHTML = '<span>' + esc(fmtClock(first)) + '</span>' +
+        '<span>' + esc(tsp('perf.axis.peakRate', '峰值 {n} 条/秒', { n: fmtRate(rates.length ? rateMax : 0) })) + '</span>' +
+        '<span>' + esc(fmtClock(last)) + '</span>';
+    }
+    const heapAxis = $('#perf-heap-axis');
+    if (heapAxis) {
+      heapAxis.innerHTML = '<span>' + esc(fmtClock(first)) + '</span>' +
+        '<span>' + esc(tsp('perf.axis.peakHeap', '峰值 {n}', {
+          n: fmtBytes(heaps.length ? Math.max.apply(null, heaps) : 0),
+        })) + '</span>' +
+        '<span>' + esc(fmtClock(last)) + '</span>';
+    }
+  }
+
+  function renderPerfTable(model) {
+    const body = $('#perf-tbody');
+    if (!body) return;
+    // 每行：{ 标签, 值, 说明, 是否告警 }。告警行同时给 class 与 ⚠ 文本（不只靠颜色）。
+    const rows = [
+      {
+        label: ts('perf.row.deliverDropped', '丢弃 · 发送队列满'),
+        value: fmtInt(model.deliverDropped),
+        note: ts('perf.note.deliverDropped', '连接发送队列满导致消息被丢弃（消费端过慢）'),
+        warn: model.deliverDropped > 0,
+      },
+      {
+        label: ts('perf.row.deliverClosed', '丢弃 · 连接已关闭'),
+        value: fmtInt(model.deliverClosed),
+        note: ts('perf.note.deliverClosed', '连接已关闭后仍尝试下发而被丢弃（正常下线也会计入）'),
+        warn: model.deliverClosed > 0,
+      },
+      {
+        label: ts('perf.row.gcTotal', 'GC 次数（累计）'),
+        value: fmtInt(model.gcTotal),
+        note: ts('perf.note.gcTotal', '累计 GC 轮次；短窗口内快速上涨说明分配压力大'),
+        warn: false,
+      },
+      {
+        label: ts('perf.row.heapInuse', '堆 inuse'),
+        value: fmtBytes(model.heapInuse),
+        note: ts('perf.note.heapInuse', '已向操作系统申请并正在使用的堆字节'),
+        warn: false,
+      },
+      {
+        label: ts('perf.row.sseClients', 'SSE 客户端'),
+        value: fmtInt(model.sseClients),
+        note: ts('perf.note.sseClients', '当前订阅实时事件流的浏览器连接数'),
+        warn: false,
+      },
+      {
+        label: ts('perf.row.eventsDropped', '事件丢弃（总线）'),
+        value: fmtInt(model.eventsDropped),
+        note: ts('perf.note.eventsDropped', '事件总线缓冲满被丢弃的事件数'),
+        warn: model.eventsDropped > 0,
+      },
+      {
+        label: ts('perf.row.memHigh', '内存告警状态'),
+        value: model.memHigh
+          ? ts('perf.flag.high', '超阈值')
+          : ts('perf.flag.normal', '正常'),
+        note: model.memLimit > 0
+          ? tsp('perf.note.memHigh', '堆走势相对告警阈值 {v} 的比较结果', { v: fmtBytes(model.memLimit) })
+          : ts('perf.note.memNoLimit', '未启用告警阈值（memLimitBytes = 0）'),
+        warn: model.memHigh,
+      },
+      {
+        label: ts('perf.row.memHighTotal', '内存告警累计次数'),
+        value: fmtInt(model.memHighTotal),
+        note: ts('perf.note.memHighTotal', '进入"超阈值"状态的累计次数（回落后再次越线会再计一次）'),
+        warn: false,
+      },
+    ];
+    body.innerHTML = rows.map((r) =>
+      '<tr' + (r.warn ? ' class="is-warn"' : '') + '>' +
+        '<th scope="row">' + esc(r.label) + '</th>' +
+        '<td>' + (r.warn ? '<span aria-hidden="true">⚠</span> ' : '') + esc(r.value) + '</td>' +
+        '<td class="muted">' + esc(r.note) + '</td>' +
+      '</tr>'
+    ).join('');
+  }
+
+  // renderPerfAlert 只画错误横幅，不清空已有曲线（旧数据比空白有用）。
+  function renderPerfAlert() {
+    const host = $('#perf-alert');
+    if (!host) return;
+    if (!perfState.error) { host.innerHTML = ''; return; }
+    host.innerHTML = '<div class="error-banner">' + esc(ts('perf.loadFailed', '性能数据加载失败：')) +
+      esc(perfState.error) + '</div>';
+  }
+
+  // renderPerfLive 只在**状态跃迁**时播报：每 2 秒播一次数值会把人烦死，
+  // 而"丢弃从 0 变正""堆进入告警"这两个跃迁才是运维真正需要被叫醒的时刻。
+  function renderPerfLive(model) {
+    const el = $('#perf-live');
+    let msg = '';
+    if (model.warnDrops && !perfState.live.drops) {
+      msg = tsp('perf.live.dropsOn', '开始出现消息丢弃：队列满 {queued} 条，连接已关闭 {closed} 条',
+        { queued: fmtInt(model.deliverDropped), closed: fmtInt(model.deliverClosed) });
+    }
+    perfState.live.drops = model.warnDrops;
+    if (!msg && model.warnMem && !perfState.live.mem) {
+      msg = tsp('perf.live.memHigh', '堆占用已超过告警阈值（{pct}%）',
+        { pct: fmtInt(model.heapPct == null ? 0 : model.heapPct) });
+    } else if (!msg && !model.warnMem && perfState.live.mem) {
+      msg = ts('perf.live.memOk', '堆占用已回落至告警阈值以下');
+    }
+    perfState.live.mem = model.warnMem;
+    if (!msg) return;           // 没有跃迁：不动 live 区域
+    if (el) el.textContent = msg;
+  }
+
+  function renderPerf() {
+    const m = perfState.last;
+    // 还没拿到第一份摘要：保留 HTML 里的骨架/空态（renderPerf 也服务于切语言重绘，
+    // 此时无缓存数据必须安全早退，不能抛错）。
+    if (!m) return;
+    const model = perfModel(m);
+    renderPerfKpis(model);
+    renderPerfCharts(model);
+    renderPerfTable(model);
+    renderPerfAlert();
+    renderPerfLive(model);
+
+    const updated = $('#perf-updated');
+    if (updated) {
+      updated.textContent = tsp('perf.updated', '最近更新 {time}', { time: fmtTime(Date.now()) });
+    }
+    const winEl = $('#perf-window');
+    if (winEl) {
+      winEl.textContent = tsp('perf.window', '本地窗口 {n} / {cap} 点（约 {sec} 秒窗口）', {
+        n: perfState.win.length,
+        cap: PERF_WIN_CAP,
+        sec: Math.round((PERF_WIN_CAP * PERF_POLL_MS) / 1000),
+      });
+    }
   }
 
   /* =====================================================================
@@ -1953,6 +2397,7 @@
       if (activeView === 'logs') loadLogs(true);
       if (activeView === 'settings') loadSettings(false);
       if (activeView === 'overview') loadMetrics(true);
+      if (activeView === 'perf') loadPerf(true); // V8f：手动刷新要能立刻重取，而不是等下一拍
     });
     $('#auto-refresh').addEventListener('change', (e) => setAutoRefresh(!!e.target.checked));
 
@@ -2297,6 +2742,7 @@
     metrics: function () { if (lastMetrics) renderMetrics(lastMetrics); },
     stats: function () { if (lastStatus) renderStatCards(lastStatus); },
     trend: function () { renderTrend(lastSamples, msgRateSamples); },
+    perf: function () { renderPerf(); }, // V8f：冻结期间只标脏，解冻后一次性补画
     timeline: function () { renderInbox(); },
   };
   function requestRender(name) {
@@ -2799,7 +3245,7 @@
      ===================================================================== */
 
   // 与 sw.js 的 SW_VERSION 同值（缓存版本 / 设置页展示的版本号）
-  const APP_VERSION = '7.3';
+  const APP_VERSION = '7.4';
   const INSTALL_STATES = ['idle', 'available', 'installing', 'installed', 'unsupported'];
   const INSTALL_LABEL = '安装应用';
   const OFFLINE_TEXT = '已离线：正在显示最近一次缓存的数据，恢复网络后会自动刷新。';
@@ -3179,6 +3625,27 @@
     missingCount: i18nMissingCount,
     state: i18n,
     CONST: { FALLBACK: I18N_FALLBACK, RTL: I18N_RTL },
+  };
+
+  /* V8f：性能视图的可测入口——供 console-perf-sim.cjs 在 Node vm 里驱动断言
+     （视图注册 / 渲染 / 曲线 / 轮询开关 / 纯函数模型）。生产行为不变。 */
+  window.LanHubPerf = {
+    state: perfState,
+    CONST: { POLL_MS: PERF_POLL_MS, WIN_CAP: PERF_WIN_CAP, TREND_W: TREND_W, TREND_H: TREND_H },
+    setView: setView,
+    viewFromHash: viewFromHash,
+    activeView: function () { return activeView; },
+    loadPerf: loadPerf,
+    renderPerf: renderPerf,
+    perfModel: perfModel,
+    perfNum: perfNum,
+    perfPushPoint: perfPushPoint,
+    fmtBytes: fmtBytes,
+    startPolling: perfStartPolling,
+    stopPolling: perfStopPolling,
+    seriesPoints: seriesPoints,
+    pointsAttr: pointsAttr,
+    seriesMax: seriesMax,
   };
 
   if (document.readyState === 'loading') {

@@ -35,6 +35,10 @@
         <button class="nav__item is-active" data-view="overview" type="button">
           <span class="nav__icon">▦</span><span class="nav__label" data-i18n="nav.overview">概览</span>
         </button>
+        <!-- V8f：性能视图（排在概览之后：运维第一眼是「好不好」，第二眼是「为什么」） -->
+        <button class="nav__item" data-view="perf" type="button">
+          <span class="nav__icon">◷</span><span class="nav__label" data-i18n="nav.perf">性能</span>
+        </button>
         <button class="nav__item" data-view="agents" type="button">
           <span class="nav__icon">☻</span><span class="nav__label" data-i18n="nav.agents">在线 Agent</span>
         </button>
@@ -148,6 +152,101 @@
             <button class="btn btn--primary" data-goto="messaging" type="button" data-i18n="overview.quick.messaging">发送一条消息</button>
             <button class="btn btn--ghost" data-goto="logs" type="button" data-i18n="overview.quick.logs">查看服务端日志</button>
             <button class="btn btn--ghost" data-goto="about" type="button" data-i18n="overview.quick.about">查看服务信息</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 性能（V8f）：吞吐 / 丢弃 / 内存都取自同一份 /api/metrics/summary，曲线末端与 KPI 永远同源同刻 -->
+      <section class="view" data-view="perf" hidden>
+        <!-- 健康摘要：4 张 KPI 卡。role=group 让读屏把它们当成一组播报，而不是四段孤立文本。 -->
+        <div class="metrics-grid perf-kpis" id="perf-kpis" role="group"
+             data-i18n-aria-label="perf.aria.kpis" aria-label="健康摘要：速率、丢弃、goroutine、堆占用">
+          <div class="metric-card skeleton"><div class="skeleton-line"></div></div>
+          <div class="metric-card skeleton"><div class="skeleton-line"></div></div>
+          <div class="metric-card skeleton"><div class="skeleton-line"></div></div>
+          <div class="metric-card skeleton"><div class="skeleton-line"></div></div>
+        </div>
+
+        <div class="card">
+          <div class="card__head">
+            <h2><span data-i18n="perf.trend.title">性能曲线</span> <span class="muted" id="perf-updated">—</span></h2>
+            <div class="card__tools">
+              <span class="muted" id="perf-window"></span>
+              <span class="muted" data-i18n="perf.hint.poll">每 2 秒采样；离开本视图即停止采样</span>
+            </div>
+          </div>
+          <div class="card__body">
+            <div id="perf-alert"></div>
+            <div class="perf-grid">
+              <div class="trend">
+                <div class="trend__head">
+                  <span class="trend__title" data-i18n="perf.trend.rate.title">消息速率（条 / 秒）</span>
+                  <span class="trend__legend">
+                    <span class="trend__dot"></span><span data-i18n="perf.legend.rate">消息速率</span>
+                  </span>
+                </div>
+                <svg class="trend__svg" id="perf-rate-svg" viewBox="0 0 600 120" preserveAspectRatio="none"
+                     role="img" data-i18n-aria-label="perf.trend.aria.rateIdle" aria-label="消息速率曲线"></svg>
+                <div class="trend__axis" id="perf-rate-axis"><span>—</span></div>
+              </div>
+              <div class="trend">
+                <div class="trend__head">
+                  <span class="trend__title" data-i18n="perf.trend.heap.title">堆占用与告警阈值</span>
+                  <span class="trend__legend">
+                    <span class="trend__dot"></span>heap_alloc
+                    <span class="trend__dot trend__dot--rate"></span><span data-i18n="perf.legend.limit">告警阈值</span>
+                  </span>
+                </div>
+                <svg class="trend__svg" id="perf-heap-svg" viewBox="0 0 600 120" preserveAspectRatio="none"
+                     role="img" data-i18n-aria-label="perf.trend.aria.heapIdle" aria-label="堆占用曲线"></svg>
+                <div class="trend__axis" id="perf-heap-axis"><span>—</span></div>
+              </div>
+            </div>
+            <!-- 只在状态跃迁（丢弃 0→正、进出内存告警）时写入，避免每 2 秒播报一次 -->
+            <div class="sr-only" id="perf-live" role="status" aria-live="polite" aria-atomic="true"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card__head">
+            <h2 data-i18n="perf.table.title">性能明细</h2>
+          </div>
+          <div class="card__body">
+            <div class="table-wrap">
+              <table class="table" id="perf-table">
+                <caption class="sr-only" data-i18n="perf.table.caption">性能明细：丢弃、GC 次数、堆占用、SSE 客户端、事件丢弃与内存告警</caption>
+                <thead>
+                  <tr>
+                    <th scope="col" data-i18n="perf.table.metric">指标</th>
+                    <th scope="col" data-i18n="perf.table.value">当前值</th>
+                    <th scope="col" data-i18n="perf.table.note">说明</th>
+                  </tr>
+                </thead>
+                <tbody id="perf-tbody">
+                  <tr class="skeleton"><td colspan="3"><div class="skeleton-line"></div></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card__head">
+            <h2 data-i18n="perf.pprof.title">pprof 诊断</h2>
+            <div class="card__tools">
+              <span class="badge" data-i18n="perf.pprof.loopback">默认仅本机可访问</span>
+            </div>
+          </div>
+          <div class="card__body">
+            <p class="hint" data-i18n="perf.pprof.desc">远程打开被拒绝是设计如此，不是坏了：pprof 端点默认只允许 Hub 所在机器（127.0.0.1）访问。请在服务器本机用浏览器或 curl 打开；需要远程抓取时请用 SSH 端口转发，或显式开启 pprof 插件的 allowRemote（本系统无鉴权，开启等于把堆内容暴露给局域网）。</p>
+            <ul class="endpoint-list">
+              <li><a href="/debug/pprof/" target="_blank" rel="noopener"><code>/debug/pprof/</code></a><span class="muted" data-i18n="perf.pprof.index">总览：全部可用 profile</span></li>
+              <li><a href="/debug/pprof/heap" target="_blank" rel="noopener"><code>/debug/pprof/heap</code></a><span class="muted" data-i18n="perf.pprof.heap">堆分配（加 ?debug=1 看文本）</span></li>
+              <li><a href="/debug/pprof/goroutine" target="_blank" rel="noopener"><code>/debug/pprof/goroutine</code></a><span class="muted" data-i18n="perf.pprof.goroutine">goroutine 栈</span></li>
+              <li><a href="/debug/pprof/profile?seconds=30" target="_blank" rel="noopener"><code>/debug/pprof/profile</code></a><span class="muted" data-i18n="perf.pprof.profile">CPU 采样 30 秒</span></li>
+              <li><a href="/api/runtime" target="_blank" rel="noopener"><code>/api/runtime</code></a><span class="muted" data-i18n="perf.pprof.runtime">本视图数据来源（JSON，可远程访问）</span></li>
+            </ul>
+            <p class="hint" data-i18n="perf.pprof.hint">未启用 pprof 插件时上述端点返回 404；启用后本页的堆 / goroutine 数据也更完整。</p>
           </div>
         </div>
       </section>

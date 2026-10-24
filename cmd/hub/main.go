@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -37,6 +38,10 @@ func main() {
 	black := flag.String("disable-plugin", "", "comma-separated plugin blacklist")
 	configFlag := flag.String("config", "", "path to hub.json (default: next to the executable, else in the working directory)")
 	configReadOnly := flag.Bool("config-readonly", false, "read-only mode: never write hub.json or its changelog")
+	// V8f：超时预设档。留空 = 完全不干预（一律走插件自己声明的默认值）。
+	// 注意语义是「只填补未显式配置的项」，见 timeoutPresetOptions 上方的说明。
+	timeoutsFlag := flag.String("timeouts", "",
+		"HTTP timeout preset: strict|relaxed|off (empty = leave plugin defaults); only fills options you did not set explicitly")
 	flag.Parse()
 
 	// 让 /api/manifest 的版本与 -version 输出一致。
@@ -53,6 +58,14 @@ func main() {
 			fmt.Printf("  - %s %s\n", m.Name, m.Version)
 		}
 		return
+	}
+
+	// V8f：超时预设档先解析。放在读配置之前是刻意的——参数拼错必须**立刻**报错退出，
+	// 不能先把 hub.json 模板生成出来再退出：一次手误就在用户目录里留下一个
+	// 看起来正常的配置文件，反而掩盖了真正的问题（参数错了）。
+	timeoutFill, timeoutErr := timeoutPresetOptions(*timeoutsFlag)
+	if timeoutErr != nil {
+		log.Fatalf("参数错误: %v", timeoutErr)
 	}
 
 	// ① 配置文件：读取（缺失则视为全默认），非只读模式且首次运行时生成模板。
@@ -85,6 +98,24 @@ func main() {
 		"discovery":   {"bindAddr": *discoverAddr, "hubName": *hubName, "noDiscovery": *noDiscovery},
 		"autobrowser": {"open": *openBrowserFlag},
 	})
+
+	// V8f：超时预设档只填「用户还没表态」的项（判定规则见 fillPresetOptions）。
+	// 顺序很重要：必须在 mergeOptions 之后（否则文件/CLI 的值会被当成"缺席"），
+	// 且在 ApplyConfig / InitAll 之前（否则 httpgateway 已经按默认值解析完了）。
+	if len(timeoutFill) > 0 {
+		applied := fillPresetOptions(options, httpgatewayPlugin,
+			declaredDefaults(httpgatewayPlugin), timeoutFill)
+		if len(applied) > 0 {
+			// 日志只报**实际应用**的项，不报整个预设档：
+			// 用户看到 readHeaderTimeout=5s 却明明配了 30s 时，第一反应就是"被覆盖了"，
+			// 而真相是那一项根本没被碰过。日志必须能自证这一点。
+			log.Printf("超时预设档 -timeouts=%s 已应用: %s（未列出的项已被显式配置，保持原值）",
+				strings.ToLower(strings.TrimSpace(*timeoutsFlag)), describeOptions(applied))
+		} else {
+			log.Printf("超时预设档 -timeouts=%s 未应用任何项：httpgateway 的超时项均为显式配置",
+				strings.ToLower(strings.TrimSpace(*timeoutsFlag)))
+		}
+	}
 
 	mgr := plugin.NewManager()
 	mgr.SetConfigPath(cfgPath, *configReadOnly)
@@ -152,6 +183,164 @@ func resolveConfigPath(explicit string) string {
 		}
 	}
 	return candidate
+}
+
+// httpgatewayPlugin 是 httpgateway 插件名（超时预设档的唯一作用目标）。
+//
+// 用常量而不是各处写字面量：插件名拼错的症状是「预设档静默不生效」，
+// 而启动日志里看起来一切正常——这类失效最难发现。
+const httpgatewayPlugin = "httpgateway"
+
+// timeoutPresetOptions 返回 -timeouts 预设档对应的配置项集合（nil = 不干预）。
+//
+// 三档的语义是「面向什么客户端」，不是三组魔法数字：
+//   - strict：公网 / 不可信客户端。任何人连上来都能用「只发半个请求头」占一个协程一个 fd
+//     （Slowloris，V8e 实测 50 条这样的连接就把 goroutine 从 21 顶到 71 且永不自愈），
+//     因此读头与 handler 都收紧（5s / 15s），空闲连接 30s 就收割；
+//   - relaxed：内网大扇出。控制台轮询、SSE、批量调用都在内网，读头放宽到 10s，
+//     空闲 120s（与插件默认一致），handler 60s —— 给大房间扇出的慢端点留余量，
+//     否则一个 600 人社群的 broadcast 就可能撞上 15s 上限；
+//   - off：全部填 0（关闭）。专用于排查「是不是超时把连接掐了」——
+//     此时要的是一个不加任何超时干预的基线，数字难看也没关系。
+//
+// **刻意不携带 writeTimeout / readIdleTimeout（更不含全局 ReadTimeout / WriteTimeout）**：
+// WriteTimeout 从读完请求头开始计时、覆盖整个响应写出过程，SSE 挂到第 N 秒就会被硬切；
+// ReadTimeout 到期会给连接打上永久的读截止时间，长连接的后续读全部失败。
+// V8e 已经为这两个字段踩过坑（它们是历史行为里"故意没有"的东西，不是遗漏），
+// 因此预设档永远不带这两个键——将来若真要为它们加档位，必须先改这段注释与测试。
+//
+// 另注：httpgateway 目前只声明了 readHeaderTimeout / idleTimeout / handlerTimeout 三个
+// 超时选项。此处只写它真正声明的键，绝不顺手塞一个"看起来该有"的键：
+// 未声明的键会被 Context 静默忽略——预设档写了却没有效果，比没写更糟。
+func timeoutPresetOptions(name string) (map[string]any, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "":
+		// 留空 = 不干预：连空 map 都不返回，调用方据此完全跳过这一步。
+		return nil, nil
+	case "strict":
+		return map[string]any{
+			"readHeaderTimeout": "5s",
+			"idleTimeout":       "30s",
+			"handlerTimeout":    "15s",
+		}, nil
+	case "relaxed":
+		return map[string]any{
+			"readHeaderTimeout": "10s",
+			"idleTimeout":       "120s",
+			"handlerTimeout":    "60s",
+		}, nil
+	case "off":
+		// 显式 0：httpgateway 侧把 <=0 视为关闭（不设 ReadHeaderTimeout/IdleTimeout、
+		// 不套 TimeoutHandler）。用 "0s" 而不是数字 0，是为了在 hub.json 与日志里
+		// 保持"时长"的写法一致（其它档位也是 "5s" 这种形态）。
+		return map[string]any{
+			"readHeaderTimeout": "0s",
+			"idleTimeout":       "0s",
+			"handlerTimeout":    "0s",
+		}, nil
+	default:
+		return nil, fmt.Errorf("-timeouts=%q 不认识：只接受 strict / relaxed / off（留空表示不干预，走插件默认值）", name)
+	}
+}
+
+// declaredDefaults 返回某个插件声明的配置项默认值（键 → OptionDef.Default）。
+//
+// 预设档需要它来区分「用户表过态的项」与「只是被默认值补齐的项」——
+// 见 fillPresetOptions 上方的说明。插件不存在时返回 nil。
+func declaredDefaults(pluginName string) map[string]any {
+	for _, p := range plugin.All() {
+		if p.Meta().Name != pluginName {
+			continue
+		}
+		o, ok := p.(plugin.Optioner)
+		if !ok {
+			return nil
+		}
+		defs := o.Options()
+		out := make(map[string]any, len(defs))
+		for _, d := range defs {
+			out[d.Key] = d.Default
+		}
+		return out
+	}
+	return nil
+}
+
+// fillPresetOptions 把预设档的值填进 options[pluginName]，返回**本次真正应用**的项。
+//
+// 判定「这一项要不要填」的标准有两条，缺一不可：
+//  1. 键不存在 → 填（最简单的缺席情形）；
+//  2. 键存在但值 == 插件声明的默认值 → 也填。
+//
+// 第 2 条是本任务真正的难点，也是踩过的坑：main 读配置走的是
+// Store.LoadOrTemplate()，它内部会 MergeDefaults——**每个已声明选项都会被补齐**
+// （值来自 OptionDef.Default）。所以 options 里永远"存在"这些键：
+// 按键存在性判断的话，预设档一次都不会生效，而且失效方式是**静默的**
+// （功能看起来实现了，跑起来毫无作用；首次运行生成的 hub.json 模板本身也写全了默认值）。
+// 用「值 == 默认值」来判定"用户还没对这项表态"，正好把这两种来源都认成"未表态"。
+//
+// 反过来，只要值与默认值不同（用户写了 readHeaderTimeout: 30s，或显式写 0 表示关闭），
+// 就一律认为是用户的显式意图，**预设档不碰**。
+// 失效现场是运行期的连接行为，根因却在启动参数里——「我明明设了 30s 却被改成 5s」
+// 是排查成本最高的一类问题，因此这条优先级绝不能倒过来：
+// 预设档是**默认值集合**，不是策略强制。
+//
+// 已知边界（无法区分意图的客观限制）：用户显式写了与默认值完全相同的值
+// （例如把 readHeaderTimeout 写成插件默认的 10s）会被当成"未表态"从而被改写。
+// 需要绝对控制时的办法是 -timeouts=off（彻底不干预）或改成一个与默认值不同的数。
+//
+// defaults 为 nil（插件未注册/不声明选项）时退化为「只看键是否存在」。
+func fillPresetOptions(options map[string]map[string]any, pluginName string, defaults, fill map[string]any) map[string]any {
+	applied := make(map[string]any, len(fill))
+	if len(fill) == 0 {
+		return applied
+	}
+	if _, ok := options[pluginName]; !ok {
+		options[pluginName] = map[string]any{}
+	}
+	for k, v := range fill {
+		cur, exists := options[pluginName][k]
+		if exists {
+			// 插件没声明过这个键 → 无法判断默认值 → 保守起见视为用户配置，不覆盖。
+			def, declared := defaults[k]
+			if !declared || !sameOptionValue(cur, def) {
+				continue
+			}
+		}
+		options[pluginName][k] = v
+		applied[k] = v
+	}
+	return applied
+}
+
+// sameOptionValue 比较两个配置值是否等价。
+//
+// 走 fmt.Sprint 而不是 ==：== 对 any 会在底层类型不同时直接 false，
+// 而 JSON 数字解析成 float64、默认值可能是 int——同一个 100 会被判成"不同"，
+// 于是把本该被预设档接管的默认项误判成用户配置（预设档静默失效）。
+// 这里只用于默认值比较（类型可控），但保持宽松更稳妥。
+func sameOptionValue(a, b any) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return fmt.Sprint(a) == fmt.Sprint(b)
+}
+
+// describeOptions 把配置项拼成稳定的日志文案（键名升序）。
+//
+// 排序是必要的：map 遍历顺序随机，不排序的话同一份配置每次启动的日志都不一样，
+// 事后对照日志与 hub.json 时会被顺序差异干扰。
+func describeOptions(opts map[string]any) string {
+	keys := make([]string, 0, len(opts))
+	for k := range opts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, opts[k]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // configToMaps 把文件配置展开成「每插件启用状态 + 配置项」两张表。
