@@ -637,8 +637,8 @@ lan-hub (dsh-plugin-lan-hub): JsonSchemaError: unsupported JSON schema:
 Hub 在线表里 agent 照常在，但模型一个工具都调不到。
 **验收要看「did not activate」有没有出现，不能只看「加载完成」。**
 
-回归测试见 `test/schema-check.ts`——它直接用宿主同款校验器
-`assertSupportedJsonSchema` 校验每个注册工具的 parameters。
+回归要点：必须用宿主同款校验器 `assertSupportedJsonSchema` 校验每个注册工具的
+parameters——关键陷阱是「带 `required` 时必须严格等于 `true`」，可选参数要省略该键。
 
 ## 收信流水线（设计要点）
 

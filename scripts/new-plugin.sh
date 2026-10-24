@@ -193,7 +193,7 @@ func rig(t *testing.T, opts map[string]any) *${TYPE} {
 //
 // 提示：test/plugincontract 提供可复用契约断言 AssertContract(t, p)，
 // 在自测里调用即可全套检查（Meta / Options / 双 Init 幂等 / 启停序列 /
-// goroutine 泄漏），详见 docs/PLUGIN-ARCHITECTURE.md「如何写一个新插件（V6 ⑧）」。
+// goroutine 泄漏），详见 dsh/README.md「如何写一个新插件」。
 func Test${TYPE}Lifecycle(t *testing.T) {
 	p := rig(t, nil)
 	_ = p
@@ -266,5 +266,5 @@ cat <<NEXT
        go test ./internal/plugins/${NAME}/ -v
   4. 跑插件契约（Meta/Options 合法、双 Init 幂等、启停序列、goroutine 泄漏）：
        go test ./test/plugincontract/ -v
-  5. 文档与约定：docs/PLUGIN-ARCHITECTURE.md「如何写一个新插件（V6 ⑧）」
+  5. 文档与约定：dsh/README.md「如何写一个新插件」
 NEXT

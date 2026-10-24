@@ -583,7 +583,7 @@ Hub 在线表里 agent **照样在**（因为连接是在 `ctx.effect` 里先建
 **修法**：`dsh/src/index.ts` 里 `hub_config` 的 6 个可选参数删掉 `required: false`
 （不能改成 `true`——那会让参数变必填，语义就变了）。
 
-**回归测试**（`dsh/test/schema-check.ts`）：不自己写近似规则，
+**回归测试**（schema 校验器）：不自己写近似规则，
 直接用宿主同款校验器 `@deepseek-ai/dsh-tools` 的 `assertSupportedJsonSchema`
 去校验每个注册工具的 `parameters`，并断言 10 个工具齐全：
 

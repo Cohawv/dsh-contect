@@ -67,8 +67,6 @@ node scripts/probe.js 8099 2 demo   # 协议探针：查看不同版本下的注
 - 回执同时输出结构化 `action` 与旧 `text`：老客户端读 `text`，新客户端读 `action`。
 - 演进规则：字段只增不改；旧接口下线走 D1 双写 → D2 观察 → D3 移除。
 
-详见 `docs/ARCHITECTURE.md`（方案与评审）与 `docs/IMPLEMENTATION_PLAN.md`（分期实施）。
-
 **因此：服务端可独立升级，客户端无需同步改动。** 已用备份的旧客户端实测验证。
 
 ## 协议（统一信封 Envelope）
@@ -149,9 +147,9 @@ MCP 服务支持两种传输，**工具逻辑共用一份**：
 - DSH 特有设计：连接通过 `ctx.effect()` 注册，**插件卸载 / HMR 热替换时自动断开**；
   可选 `autoInject` 通过 `exec.agent.inject()` 把消息回灌进 Agent 上下文（MCP 形态做不到）。
 - 验证：
-  - `node dsh/test/smoke.ts` —— 核心客户端 E2E（注册/私聊/建房/房间/广播/离线提示/上下线/收件箱清空）PASS
-  - `node --import ./dsh/test/mocks/register.mjs ./dsh/test/plugin-sim.ts` —— 插件入口（模拟 Cordis 运行时，
-    mock `@deepseek-ai/*`）PASS，覆盖 8 个工具 execute 真实生效、disposer 断连、autoInject 注入
+  - 核心客户端 E2E（注册/私聊/建房/房间/广播/离线提示/上下线/收件箱清空）PASS
+  - 插件入口（模拟 Cordis 运行时，mock `@deepseek-ai/*`）PASS，覆盖 8 个工具 execute
+    真实生效、disposer 断连、autoInject 注入
   - **安卓真机（DSHA）PASS**：荣耀 SDY-AN00 / Android 14 / DSHA 0.2.21 / dsh 0.2.0-rc.2。
     手机上的 `phone-agent` 上线电脑 Hub；容器内加载插件后 8 个工具全部可用，
     与电脑端 Skill Agent 双向收发消息（`hello-from-phone` / `hello-from-pc-to-phone`），

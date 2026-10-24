@@ -27,3 +27,18 @@ bin/
 
 # AI 会话数据（非项目源码）
 .workbuddy/
+
+# ---- 本仓库只发布源码，以下内容不入库（文件保留在本地磁盘）----
+# 工作过程记录（AI 会话日志）
+/实施记录.md
+# 过程性文档（方案/规划/审计）
+/docs/
+# 测试套件（dsh 前端 sim；Go 契约与集成测试）
+# 注：test/plugincontract/ 是断言库，被 scripts/new-plugin.sh 生成的模板 import，必须入库
+/dsh/test/
+/test/contract/
+/test/integration/
+/test/pluginidem/
+# 一次性排障脚本
+/scripts/adb-audit.sh
+/scripts/adb-audit2.sh
