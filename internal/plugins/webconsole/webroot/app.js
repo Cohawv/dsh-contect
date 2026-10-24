@@ -1867,6 +1867,7 @@
     const deliverClosed = perfNum(m.deliverClosed);
     const memLimit = perfNum(m.memLimitBytes);
     const heapAlloc = perfNum(m.heapAllocBytes);
+    const nextGC = perfNum(m.nextGCBytes);
     return {
       rate: perfNum(m.messagesPerSecond),
       deliverDropped: deliverDropped,
@@ -1883,8 +1884,13 @@
       memLimit: memLimit,
       memHigh: !!m.memHigh,
       memHighTotal: perfNum(m.memHighTotal),
+      // NextGC 是 Go 自己算的"下次就 GC"水位 —— 它比 memLimit（默认 1GiB 阈值）
+      // 低一个数量级，因此**堆的真实压力要看 heapAlloc/nextGC**，而不是 heapAlloc/memLimit。
+      nextGC: nextGC,
       // 占用率只在启用阈值时有意义：0 = 未启用，既不能算 0% 也不能算无穷大。
       heapPct: memLimit > 0 ? Math.round((heapAlloc / memLimit) * 100) : null,
+      // GC 水位：nextGC=0（未设置/插件未提供）时为 null，界面显示「—」而不是编一个 0%。
+      gcPct: nextGC > 0 ? Math.round((heapAlloc / nextGC) * 100) : null,
       warnDrops: deliverDropped + deliverClosed > 0,
       warnMem: !!m.memHigh,
     };
@@ -1990,10 +1996,19 @@
           { queued: fmtInt(model.deliverDropped), closed: fmtInt(model.deliverClosed) })
       : '● ' + ts('perf.kpi.drops.ok', '无丢弃');
 
-    const heapSub = model.memLimit > 0
-      ? tsp('perf.kpi.heap.pct', '占告警阈值 {pct}%', { pct: fmtInt(model.heapPct == null ? 0 : model.heapPct) }) +
-        (model.warnMem ? ' · ⚠ ' + ts('perf.flag.high', '超阈值') : ' · ● ' + ts('perf.flag.normal', '正常'))
-      : '● ' + ts('perf.kpi.heap.noLimit', '未启用告警阈值');
+    // 堆卡片的副文案：把「GC 水位」放在最前 —— 它是堆压力的真实信号
+    // （heapAlloc 常年远低于 memLimit，只看后者会以为一直很空闲）。
+    const heapParts = [];
+    if (model.gcPct !== null) {
+      heapParts.push(tsp('perf.kpi.heap.gcPct', 'GC 水位 {pct}%', { pct: fmtInt(model.gcPct) }));
+    }
+    if (model.memLimit > 0) {
+      heapParts.push(tsp('perf.kpi.heap.pct', '占告警阈值 {pct}%', { pct: fmtInt(model.heapPct == null ? 0 : model.heapPct) }));
+      heapParts.push(model.warnMem ? '⚠ ' + ts('perf.flag.high', '超阈值') : '● ' + ts('perf.flag.normal', '正常'));
+    } else {
+      heapParts.push('● ' + ts('perf.kpi.heap.noLimit', '未启用告警阈值'));
+    }
+    const heapSub = heapParts.join(' · ');
 
     const cards = [
       perfKpiCard({
@@ -2026,24 +2041,32 @@
   }
 
   // paintSeries 把一条序列画进给定 SVG。标记顺序、class 与概览曲线完全一致，
-  // 因此两块曲线的观感同源（不另起一套视觉语言）。refValue > 0 时画一条虚线参考线。
-  function paintSeries(svg, values, maxV, refValue) {
+  // 因此两块曲线的观感同源（不另起一套视觉语言）。
+  //
+  // refs 是参考线数组（[{ value, mod, label }]）：
+  //   · value <= 0 一律不画 —— 0 代表"未设置"，画出来就是一条贴底的假线；
+  //   · mod 给 CSS 修饰类（例如 trend__ref--gc），**虚线样式与颜色都不同**，
+  //     只用颜色区分对色盲用户等于没区分，所以虚线段长度也必须不一样。
+  function paintSeries(svg, values, maxV, refs) {
     if (!svg) return;
     const pts = seriesPoints(values, maxV);
-    let ref = '';
-    if (perfNum(refValue) > 0) {
-      const y = seriesY(perfNum(refValue), maxV);
-      // 参考线必须在同一 Y 轴上：否则「堆一路逼近阈值」看起来仍贴着底部。
-      ref = '<line class="trend__ref" x1="0" x2="' + TREND_W + '" y1="' + y.toFixed(1) +
-        '" y2="' + y.toFixed(1) + '" />' +
-        '<text class="trend__ref-label" x="4" y="' + (y - 4).toFixed(1) + '">' +
-        esc(ts('perf.trend.refLimit', '告警阈值')) + '</text>';
-    }
+    let refMarkup = '';
+    (refs || []).forEach((ref) => {
+      const v = perfNum(ref.value);
+      if (!(v > 0)) return;
+      const y = seriesY(v, maxV);
+      const mod = ref.mod ? ' ' + ref.mod : '';
+      // 参考线必须在同一 Y 轴上：否则「堆一路逼近水位」看起来仍贴着底部。
+      refMarkup += '<line class="trend__ref' + mod + '" x1="0" x2="' + TREND_W +
+        '" y1="' + y.toFixed(1) + '" y2="' + y.toFixed(1) + '" />' +
+        '<text class="trend__ref-label' + mod + '" x="4" y="' + (y - 4).toFixed(1) + '">' +
+        esc(ref.label) + '</text>';
+    });
     svg.innerHTML = '<g class="trend__grid">' + trendGridLines() + '</g>' +
       (pts.length ? '<path class="trend__area" d="' + areaPath(pts) + '" />' : '') +
       (pts.length ? '<polyline class="trend__line" points="' + pointsAttr(pts) + '" />' : '') +
       '<g class="trend__dots">' + dotsCircle(pts, 2.5) + '</g>' +
-      ref;
+      refMarkup;
   }
 
   // setSvgLabel 给 SVG 写 role/aria-label：曲线是数据表达而不是装饰，
@@ -2061,7 +2084,7 @@
 
     const rateSvg = $('#perf-rate-svg');
     const rateMax = seriesMax(rates);
-    paintSeries(rateSvg, rates, rateMax, 0);
+    paintSeries(rateSvg, rates, rateMax, []);
     if (!rates.length) {
       setSvgLabel(rateSvg, ts('perf.trend.aria.empty', '曲线：暂无采样点'));
     } else {
@@ -2071,20 +2094,31 @@
     }
 
     const heapSvg = $('#perf-heap-svg');
-    // 阈值也纳入归一化基准：参考线不能被裁掉到画布外。
-    const heapMax = seriesMax(heaps, model.memLimit);
-    paintSeries(heapSvg, heaps, heapMax, model.memLimit);
+    // 两条参考线都纳入归一化基准：任何一条被裁到画布外，读者就无法判断"离它还有多远"。
+    // NextGC 通常比 memLimit 低一个数量级 —— 它才是堆压力的真实刻度。
+    const heapMax = seriesMax(heaps, Math.max(model.memLimit, model.nextGC));
+    paintSeries(heapSvg, heaps, heapMax, [
+      { value: model.memLimit, mod: '', label: ts('perf.trend.refLimit', '告警阈值') },
+      { value: model.nextGC, mod: 'trend__ref--gc', label: ts('perf.trend.refGc', 'GC 水位') },
+    ]);
     if (!heaps.length) {
       setSvgLabel(heapSvg, ts('perf.trend.aria.empty', '曲线：暂无采样点'));
     } else {
       setSvgLabel(heapSvg, tsp('perf.trend.aria.heap',
-        '堆占用曲线：最近 {n} 个采样点，从 {from} 到 {to}{limit}',
+        '堆占用曲线：最近 {n} 个采样点，从 {from} 到 {to}{limit}{gc}',
         {
           n: heaps.length,
           from: fmtBytes(heaps[0]),
           to: fmtBytes(heaps[heaps.length - 1]),
           limit: model.memLimit > 0
             ? tsp('perf.trend.aria.limit', '；告警阈值 {v}', { v: fmtBytes(model.memLimit) })
+            : '',
+          // 读屏用户看不到虚线，所以把「GC 水位多少、当前占了多少」直接说出来。
+          gc: model.nextGC > 0
+            ? tsp('perf.trend.aria.gc', '；GC 水位 {v}（当前占用 {pct}%）', {
+              v: fmtBytes(model.nextGC),
+              pct: fmtInt(model.gcPct == null ? 0 : model.gcPct),
+            })
             : '',
         }));
     }
@@ -2135,6 +2169,17 @@
         label: ts('perf.row.heapInuse', '堆 inuse'),
         value: fmtBytes(model.heapInuse),
         note: ts('perf.note.heapInuse', '已向操作系统申请并正在使用的堆字节'),
+        warn: false,
+      },
+      {
+        label: ts('perf.row.heapGcPct', '堆 / GC 水位'),
+        // nextGC=0 表示 runtime 没给出目标值（或插件缺失）：显示「—」，
+        // 绝不能拿 0 当分母算出一个 0% 或 Infinity 骗人。
+        value: model.gcPct === null ? '—' : fmtInt(model.gcPct) + '%',
+        note: model.nextGC > 0
+          ? tsp('perf.note.heapGcPct', '堆 alloc 相对下一次 GC 目标 {v}；接近 100% 说明马上就要 GC',
+            { v: fmtBytes(model.nextGC) })
+          : ts('perf.note.heapGcNone', 'runtime 未提供 NextGC 目标（显示 —，不画 GC 水位线）'),
         warn: false,
       },
       {
@@ -3245,7 +3290,7 @@
      ===================================================================== */
 
   // 与 sw.js 的 SW_VERSION 同值（缓存版本 / 设置页展示的版本号）
-  const APP_VERSION = '7.4';
+  const APP_VERSION = '7.5';
   const INSTALL_STATES = ['idle', 'available', 'installing', 'installed', 'unsupported'];
   const INSTALL_LABEL = '安装应用';
   const OFFLINE_TEXT = '已离线：正在显示最近一次缓存的数据，恢复网络后会自动刷新。';

@@ -1100,3 +1100,15 @@ html, body { -webkit-tap-highlight-color: transparent; }
 /* 参考线（内存告警阈值）：与曲线共用同一 Y 轴，虚线 + 浅描边便于与数据线区分 */
 .trend__ref { stroke: var(--warning); stroke-width: 1; stroke-dasharray: 6 4; }
 .trend__ref-label { fill: var(--warning); font-size: 10px; font-family: var(--font-mono); }
+
+/* V8f 收口：第二条参考线（NextGC / GC 水位）
+   —— 与「告警阈值」线**颜色与线型都不同**：颜色区分对色盲用户无效，
+   所以虚线段长也必须不一样（阈值 6 4 长虚线 vs GC 水位 2 3 点线），并各自带文字标签。 */
+.trend__ref--gc { stroke: var(--accent-2); stroke-dasharray: 2 3; stroke-width: 1.5; }
+.trend__ref-label--gc { fill: var(--accent-2); }
+/* 图例里的线型示意（比圆点更能表达"这是虚线参考线"） */
+.trend__dash {
+  display: inline-block; width: 16px; height: 0; margin-left: var(--sp-2);
+  border-top: 2px dashed var(--warning); vertical-align: middle;
+}
+.trend__dash--gc { border-top-style: dotted; border-top-color: var(--accent-2); }

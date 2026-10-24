@@ -31,7 +31,7 @@
         </span>
         <span class="brand__text">LAN Agent Hub</span>
       </div>
-      <nav class="nav" aria-label="主导航">
+      <nav class="nav" data-i18n-aria-label="a11y.nav" aria-label="主导航">
         <button class="nav__item is-active" data-view="overview" type="button">
           <span class="nav__icon">▦</span><span class="nav__label" data-i18n="nav.overview">概览</span>
         </button>
@@ -137,7 +137,7 @@
                   <span class="trend__dot trend__dot--rate"></span>消息速率（条/秒）
                 </span>
               </div>
-              <svg class="trend__svg" id="trend-svg" viewBox="0 0 600 120" preserveAspectRatio="none" role="img" aria-label="在线 Agent 数量趋势"></svg>
+              <svg class="trend__svg" id="trend-svg" viewBox="0 0 600 120" preserveAspectRatio="none" role="img" data-i18n-aria-label="a11y.trendAgents" aria-label="在线 Agent 数量趋势"></svg>
               <div class="trend__axis" id="trend-axis"><span>—</span></div>
             </div>
           </div>
@@ -194,7 +194,9 @@
                   <span class="trend__title" data-i18n="perf.trend.heap.title">堆占用与告警阈值</span>
                   <span class="trend__legend">
                     <span class="trend__dot"></span>heap_alloc
-                    <span class="trend__dot trend__dot--rate"></span><span data-i18n="perf.legend.limit">告警阈值</span>
+                    <!-- 两条参考线用「颜色 + 线型」双重区分：只看颜色的话色盲用户分不出哪条是 GC 水位 -->
+                    <span class="trend__dash trend__dash--limit"></span><span data-i18n="perf.legend.limit">告警阈值</span>
+                    <span class="trend__dash trend__dash--gc"></span><span data-i18n="perf.legend.gc">GC 水位</span>
                   </span>
                 </div>
                 <svg class="trend__svg" id="perf-heap-svg" viewBox="0 0 600 120" preserveAspectRatio="none"
@@ -257,7 +259,7 @@
           <div class="card__head">
             <h2><span data-i18n="agents.title">在线 Agent</span> <span class="count-badge" id="agents-count" aria-live="polite">0</span></h2>
             <div class="card__tools">
-              <input class="input input--search" id="agents-search" type="search" placeholder="筛选 ID / 名称…" data-i18n-placeholder="agents.search" aria-label="筛选 Agent" />
+              <input class="input input--search" id="agents-search" type="search" placeholder="筛选 ID / 名称…" data-i18n-placeholder="agents.search" data-i18n-aria-label="a11y.agentsFilter" aria-label="筛选 Agent" />
             </div>
           </div>
           <div class="card__body">
@@ -429,9 +431,9 @@
               点击任意一条展开完整 JSON 载荷；暂停期间事件照常缓冲，恢复后一次性补显。
             </p>
             <div class="ev-filters">
-              <div class="ev-chips" id="event-type-filters" role="group" aria-label="事件类型过滤（可多选）"></div>
+              <div class="ev-chips" id="event-type-filters" role="group" data-i18n-aria-label="a11y.eventsTypeFilter" aria-label="事件类型过滤（可多选）"></div>
               <input class="input input--search" id="events-agent" type="search"
-                     placeholder="按 Agent 筛选…" aria-label="按 Agent 筛选事件" data-i18n-placeholder="ev.agentFilter" />
+                     placeholder="按 Agent 筛选…" data-i18n-aria-label="a11y.eventsAgentFilter" aria-label="按 Agent 筛选事件" data-i18n-placeholder="ev.agentFilter" />
             </div>
             <div class="ev-list" id="event-list">
               <div class="empty-state">
@@ -484,7 +486,7 @@
           <div class="card__head">
             <h2><span data-i18n="logs.title">服务端日志</span> <span class="count-badge" id="logs-count">0</span></h2>
             <div class="card__tools">
-              <select class="select select--sm" id="logs-level" aria-label="日志级别过滤">
+              <select class="select select--sm" id="logs-level" data-i18n-aria-label="a11y.logLevelFilter" aria-label="日志级别过滤">
                 <option value="" data-i18n="logs.levelAll">全部级别</option>
                 <option value="info" data-i18n="logs.levelInfo">info 及以上</option>
                 <option value="warn" data-i18n="logs.levelWarn">warn 及以上</option>
@@ -568,12 +570,12 @@
   </div>
 
   <!-- 命令面板（V7 ① / ⑤：Ctrl+⌘K 打开，全程键盘可达，关闭后焦点还原） -->
-  <div class="cmdk" id="cmdk" hidden role="dialog" aria-modal="true" aria-label="命令面板">
+  <div class="cmdk" id="cmdk" hidden role="dialog" aria-modal="true" data-i18n-aria-label="a11y.cmdk" aria-label="命令面板">
     <div class="cmdk__backdrop" data-cmdk-close></div>
     <div class="cmdk__panel">
       <input class="cmdk__input" id="cmdk-input" type="text" placeholder="搜索视图或操作…" data-i18n-placeholder="cmd.searchPlaceholder"
-             aria-label="命令面板搜索框" autocomplete="off" spellcheck="false" />
-      <ul class="cmdk__list" id="cmdk-list" role="listbox" aria-label="命令结果"></ul>
+             data-i18n-aria-label="a11y.cmdkInput" aria-label="命令面板搜索框" autocomplete="off" spellcheck="false" />
+      <ul class="cmdk__list" id="cmdk-list" role="listbox" data-i18n-aria-label="a11y.cmdkList" aria-label="命令结果"></ul>
       <div class="cmdk__hint">
         <span><kbd class="kbd">↑</kbd><kbd class="kbd">↓</kbd> 选择</span>
         <span><kbd class="kbd">Enter</kbd> 执行</span>
