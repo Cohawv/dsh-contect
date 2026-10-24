@@ -525,11 +525,14 @@ type perfSummary struct {
 	DeliverClosed  flexInt `json:"deliverClosed"`
 	HeapAllocBytes flexInt `json:"heapAllocBytes"`
 	HeapInuseBytes flexInt `json:"heapInuseBytes"`
-	Goroutines     flexInt `json:"goroutines"`
-	GCTotal        flexInt `json:"gcTotal"`
-	MemLimitBytes  flexInt `json:"memLimitBytes"`
-	MemHigh        bool    `json:"memHigh"`
-	MemHighTotal   flexInt `json:"memHighTotal"`
+	// NextGCBytes 是下一次 GC 的目标堆：heapAlloc/nextGC 才是真实内存压力比，
+	// 只看 heapAlloc 无从判断「300 MiB 是轻松还是马上要 GC」。
+	NextGCBytes   flexInt `json:"nextGCBytes"`
+	Goroutines    flexInt `json:"goroutines"`
+	GCTotal       flexInt `json:"gcTotal"`
+	MemLimitBytes flexInt `json:"memLimitBytes"`
+	MemHigh       bool    `json:"memHigh"`
+	MemHighTotal  flexInt `json:"memHighTotal"`
 }
 
 // flexInt 是一个宽容的整数：接受 12、12.0、"12"、null。
@@ -640,7 +643,7 @@ func (a *app) perfSnapshot() (any, perfSummary, error) {
 
 // renderPerf 单次渲染：json 模式透传服务端响应（保留未知字段），table 模式走键值表。
 func (a *app) renderPerf(raw any, typed perfSummary) error {
-	return a.print(raw, []string{"KEY", "VALUE"}, perfRows(typed))
+	return a.print(raw, []string{"KEY", "VALUE"}, a.perfRows(typed))
 }
 
 // redrawPerf 是跟随模式下的单帧输出。
@@ -673,7 +676,10 @@ func (a *app) redrawPerf(raw any, typed perfSummary, first bool) error {
 // 两类丢弃刻意分成两行：deliverDropped 是队列满（该加缓冲/降速，属背压），
 // deliverClosed 是往已关闭的订阅写（属泄漏或竞态，要改代码）——处置动作完全不同，
 // 合成一个总数就等于把故障线索扔掉。
-func perfRows(p perfSummary) [][]string {
+//
+// 是 app 的方法而非自由函数：堆压力那行需要 renderer 着色，而着色策略
+// （TTY / -color）本来就挂在 renderer 上。
+func (a *app) perfRows(p perfSummary) [][]string {
 	rows := [][]string{
 		{"uptime", fmtDuration(int64(p.UptimeMs))},
 		{"agentsOnline", strconv.FormatInt(int64(p.AgentsOnline), 10)},
@@ -689,12 +695,52 @@ func perfRows(p perfSummary) [][]string {
 		{"deliverClosed(已关闭)", strconv.FormatInt(int64(p.DeliverClosed), 10)},
 		{"heapAlloc", fmtBytes(int64(p.HeapAllocBytes))},
 		{"heapInuse", fmtBytes(int64(p.HeapInuseBytes))},
+		{"nextGC", nextGCText(p)},
+		{"heapPressure(堆/GC 水位)", a.heapPressureText(p)},
 		{"goroutines", strconv.FormatInt(int64(p.Goroutines), 10)},
 		{"gcTotal", strconv.FormatInt(int64(p.GCTotal), 10)},
 		{"memLimit", memLimitText(p)},
 		{"memHigh", memHighText(p)},
 	}
 	return rows
+}
+
+// heapPressureCriticalPct 是「堆已逼近 GC 目标」的判定线。
+// 90% 取自 Go 的 GC 触发阈值语义：到 100% 就触发 GC，90% 已在临界区内。
+const heapPressureCriticalPct = 90.0
+
+// heapPressurePct 返回 heapAlloc 占 nextGC 的百分比；nextGC 不可用时 ok=false。
+func heapPressurePct(p perfSummary) (float64, bool) {
+	next := int64(p.NextGCBytes)
+	if next <= 0 {
+		return 0, false
+	}
+	return float64(int64(p.HeapAllocBytes)) / float64(next) * 100, true
+}
+
+// nextGCText 渲染下一次 GC 的目标堆。
+// 0 表示 runtime 尚未给出目标（或该服务端没有这项），故写「未设置」而不是 0 B。
+func nextGCText(p perfSummary) string {
+	if int64(p.NextGCBytes) <= 0 {
+		return "未设置"
+	}
+	return fmtBytes(int64(p.NextGCBytes))
+}
+
+// heapPressureText 渲染堆/GC 水位。
+//
+// 超过临界线时同时给「颜色 + 文字」双重信号：颜色在管道、日志、无色终端里
+// 全都会丢，只靠颜色等于没有告警。
+func (a *app) heapPressureText(p perfSummary) string {
+	pct, ok := heapPressurePct(p)
+	if !ok {
+		return "—" // 没有分母就不编造比例
+	}
+	s := strconv.FormatFloat(pct, 'f', 1, 64) + "%"
+	if pct < heapPressureCriticalPct {
+		return s
+	}
+	return a.out.paint(ansiRed, s+"（临界：堆已逼近 GC 目标）")
 }
 
 // memLimitText 渲染内存阈值：未配置时显式写「未启用」而不是 0 B。

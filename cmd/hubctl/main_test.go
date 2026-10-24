@@ -559,11 +559,67 @@ func TestPerfMemHighOverThreshold(t *testing.T) {
 	}
 }
 
+func TestPerfNextGCAndHeapPressure(t *testing.T) {
+	f := newFakeHub(t)
+	// 已用 3 MiB / 目标 4 MiB → 75.0%
+	f.json(perfPath, `{"uptimeMs":60000,"heapAllocBytes":3145728,"heapInuseBytes":4194304,"nextGCBytes":4194304}`)
+
+	code, out, errb := f.run("-fmt", "table", "perf")
+	assertExit(t, code, exitOK, errb)
+
+	mustContain(t, out, "75.0%", "4.0 MiB")
+	if got := perfCell(t, out, "nextGC"); got != "4.0 MiB" {
+		t.Errorf("nextGC = %q，期望 4.0 MiB（复用 fmtBytes 的 MiB 一位小数）", got)
+	}
+	if got := perfCell(t, out, "heapPressure(堆/GC 水位)"); got != "75.0%" {
+		t.Errorf("heapPressure = %q，期望 75.0%%", got)
+	}
+	// 75% 还没到临界线，不该喊临界（否则告警一响就没人看了）。
+	mustNotContain(t, out, "临界")
+}
+
+func TestPerfHeapPressureCriticalHasTextSignal(t *testing.T) {
+	f := newFakeHub(t)
+	// 4089446 / 4194304 ≈ 97.5%，已进临界区。
+	f.json(perfPath, `{"uptimeMs":60000,"heapAllocBytes":4089446,"heapInuseBytes":4194304,"nextGCBytes":4194304}`)
+
+	// 无色模式（管道/日志/NO_COLOR）：文字信号必须独立成立——颜色不能是唯一信号。
+	code, out, errb := f.run("-fmt", "table", "-color", "never", "perf")
+	assertExit(t, code, exitOK, errb)
+	mustContain(t, out, "97.5%", "临界")
+	mustNotContain(t, out, "\x1b[")
+
+	// 有色模式：颜色与文字同时出现。
+	code, out, errb = f.run("-fmt", "table", "-color", "always", "perf")
+	assertExit(t, code, exitOK, errb)
+	mustContain(t, out, "\x1b[", "97.5%", "临界")
+}
+
+func TestPerfNextGCUnsetShowsNotSetAndDash(t *testing.T) {
+	f := newFakeHub(t)
+	// nextGCBytes=0 与 memLimitBytes=0：两处都不能渲染成 "0 B"。
+	f.json(perfPath, `{"uptimeMs":60000,"heapAllocBytes":3145728,"heapInuseBytes":4194304,"nextGCBytes":0,"memLimitBytes":0}`)
+
+	code, out, errb := f.run("-fmt", "table", "perf")
+	assertExit(t, code, exitOK, errb)
+
+	if got := perfCell(t, out, "nextGC"); got != "未设置" {
+		t.Errorf("nextGC = %q，期望 未设置", got)
+	}
+	if got := perfCell(t, out, "heapPressure(堆/GC 水位)"); got != "—" {
+		t.Errorf("heapPressure = %q，期望 —（没有分母就不编造比例）", got)
+	}
+	mustContain(t, out, "未设置", "—")
+	mustNotContain(t, out, "0 B")
+	mustNotContain(t, out, "0.0%") // 0 也不能当成「压力是 0%」
+}
+
 func TestPerfJSONPassesThroughUnknownFields(t *testing.T) {
 	f := newFakeHub(t)
 	// futureField / 未定义的 samples 子结构都必须活着出现在输出里：
 	// 这证明 json 模式是原样透传，而不是重新构造结构体（那会静默丢字段）。
-	f.json(perfPath, `{"uptimeMs":5000,"deliverDropped":7,"futureField":1,"samples":[{"ts":1,"messagesTotal":2}]}`)
+	// nextGCBytes 也是同一逻辑：后端加字段时客户端 zero-change 就有。
+	f.json(perfPath, `{"uptimeMs":5000,"deliverDropped":7,"nextGCBytes":4194304,"futureField":1,"samples":[{"ts":1,"messagesTotal":2}]}`)
 
 	code, out, errb := f.run("-fmt", "json", "perf")
 	assertExit(t, code, exitOK, errb)
@@ -575,7 +631,10 @@ func TestPerfJSONPassesThroughUnknownFields(t *testing.T) {
 	if v["deliverDropped"] != float64(7) {
 		t.Errorf("deliverDropped = %v，期望 7", v["deliverDropped"])
 	}
-	mustContain(t, out, "futureField", "samples")
+	if v["nextGCBytes"] != float64(4194304) {
+		t.Errorf("nextGCBytes = %v，期望 4194304（新字段应随透传自动出现）", v["nextGCBytes"])
+	}
+	mustContain(t, out, "futureField", "samples", "nextGCBytes")
 }
 
 func TestPerfFailOnDropExitCode(t *testing.T) {
