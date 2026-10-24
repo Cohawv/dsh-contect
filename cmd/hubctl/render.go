@@ -29,6 +29,10 @@ const (
 	ansiCyan   = "\x1b[36m"
 )
 
+// ansiClearHome 是「回到左上角 + 清屏」，跟随模式原地重绘用。
+// 只写 TTY：这类控制符会破坏管道下游（jq 读到 ESC 直接报错）。
+const ansiClearHome = "\x1b[H\x1b[2J"
+
 // renderer 负责把「值」变成人读的表格或机器读的 JSON。
 // 输出目标、格式、是否着色全部可注入，因此单测可以断言字节级结果。
 type renderer struct {
@@ -191,6 +195,57 @@ func fmtAge(ms int64, now time.Time) string {
 		return strconv.FormatInt(int64(d/time.Hour), 10) + "h"
 	default:
 		return strconv.FormatInt(int64(d/(24*time.Hour)), 10) + "d"
+	}
+}
+
+// fmtDuration 渲染「一段持续了多久」（uptime），精度到相邻两级单位。
+//
+// 为什么不复用 fmtAge：fmtAge 回答的是"多久之前"，只给一级单位（3h / 5m），
+// 适合 lastSeen 那种粗读列；uptime 要能一眼看出"1 小时 02 分"，两级单位才有信息量。
+func fmtDuration(ms int64) string {
+	if ms < 0 {
+		ms = 0
+	}
+	d := time.Duration(ms) * time.Millisecond
+	switch {
+	case d < time.Minute:
+		return strconv.FormatInt(int64(d/time.Second), 10) + "s"
+	case d < time.Hour:
+		return strconv.FormatInt(int64(d/time.Minute), 10) + "m" +
+			pad2(int64(d/time.Second)%60) + "s"
+	case d < 24*time.Hour:
+		return strconv.FormatInt(int64(d/time.Hour), 10) + "h" +
+			pad2(int64(d/time.Minute)%60) + "m"
+	default:
+		return strconv.FormatInt(int64(d/(24*time.Hour)), 10) + "d" +
+			pad2(int64(d/time.Hour)%24) + "h"
+	}
+}
+
+// pad2 把 0..59 补成两位（1h02m 而不是 1h2m），便于列对齐阅读。
+func pad2(n int64) string {
+	if n < 10 {
+		return "0" + strconv.FormatInt(n, 10)
+	}
+	return strconv.FormatInt(n, 10)
+}
+
+// fmtBytes 渲染字节数（B/KiB/MiB/GiB）。
+// 换算基准用 1024 而非 1000：这些值来自 runtime.MemStats，本来就是二进制单位。
+func fmtBytes(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	const k = 1024
+	switch {
+	case n < k:
+		return strconv.FormatInt(n, 10) + " B"
+	case n < k*k:
+		return strconv.FormatFloat(float64(n)/k, 'f', 1, 64) + " KiB"
+	case n < k*k*k:
+		return strconv.FormatFloat(float64(n)/(k*k), 'f', 1, 64) + " MiB"
+	default:
+		return strconv.FormatFloat(float64(n)/(k*k*k), 'f', 2, 64) + " GiB"
 	}
 }
 

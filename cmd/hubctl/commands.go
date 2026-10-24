@@ -117,6 +117,14 @@ type app struct {
 	now  func() time.Time
 	ctx  context.Context
 	mu   sync.Mutex // watch 同时跑两条 SSE，输出必须串行化
+
+	// isTTY 记录 stdout 是否为字符设备。perf -w 据此决定「原地重绘」还是
+	// 「一行一个快照」——ANSI 清屏码写进管道会把下游 jq 直接毒掉。
+	isTTY bool
+
+	// perfEvery 是 perf -w 的轮询间隔；0 表示用 defaultPerfInterval。
+	// 单独开一个字段是为了让单测能把 2s 压到 1ms，而不是靠 sleep 等时钟。
+	perfEvery time.Duration
 }
 
 // fetch 取回一个端点：raw 用于 json 模式原样透传（契约透明），typed 用于表格渲染。
@@ -479,6 +487,244 @@ func messageText(content string) string {
 		return m.Text
 	}
 	return content
+}
+
+// ---------------------------------------------------------------------------
+// perf
+// ---------------------------------------------------------------------------
+
+// perfPath 是性能快照端点（metrics 插件提供）。
+const perfPath = "/api/metrics/summary"
+
+// defaultPerfInterval 是 perf -w 的刷新周期。
+// 2s 是折中：比采样间隔（intervalMs）长，保证每次都能拿到新样本；
+// 又短到人眼能看出趋势，同时不会把终端刷到无法阅读。
+const defaultPerfInterval = 2 * time.Second
+
+// perfSummary 对应 GET /api/metrics/summary。
+//
+// 字段名与后端逐字一致。前 9 个是 V5 就有的，后 9 个是 V8「性能与规模」新增：
+// 老服务端不返回它们时零值兜底，表格里 memLimitBytes=0 显示「未启用」——
+// 「没配阈值」和「阈值是 0 字节」是两件事，运维排障时不能混为一谈。
+//
+// 故意不定义 samples：趋势点不在表格里展示，而 JSON 模式走 raw 原样透传，
+// 所以这里少定义字段不会丢数据。
+type perfSummary struct {
+	UptimeMs          flexInt `json:"uptimeMs"`
+	AgentsOnline      flexInt `json:"agentsOnline"`
+	Rooms             flexInt `json:"rooms"`
+	MessagesTotal     flexInt `json:"messagesTotal"`
+	MessagesPerSecond float64 `json:"messagesPerSecond"`
+	HTTPRequestsTotal flexInt `json:"httpRequestsTotal"`
+	EventsDropped     flexInt `json:"eventsDropped"`
+	SSEClients        flexInt `json:"sseClients"`
+	IntervalMs        flexInt `json:"intervalMs"`
+
+	// V8 新增：投递丢弃（拆两种成因）、内存、GC、阈值告警。
+	DeliverDropped flexInt `json:"deliverDropped"`
+	DeliverClosed  flexInt `json:"deliverClosed"`
+	HeapAllocBytes flexInt `json:"heapAllocBytes"`
+	HeapInuseBytes flexInt `json:"heapInuseBytes"`
+	Goroutines     flexInt `json:"goroutines"`
+	GCTotal        flexInt `json:"gcTotal"`
+	MemLimitBytes  flexInt `json:"memLimitBytes"`
+	MemHigh        bool    `json:"memHigh"`
+	MemHighTotal   flexInt `json:"memHighTotal"`
+}
+
+// flexInt 是一个宽容的整数：接受 12、12.0、"12"、null。
+//
+// 为什么不用 int64：这些字段的 Go 类型在后端还没钉死（gcTotal 可能是 uint32，
+// 也可能被写成浮点计数器）。整份摘要共用一次 json.Unmarshal，一个字段类型不符
+// 就会让其余字段一起归零——那比少一个字段难查得多。
+type flexInt int64
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "" || s == "null" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		*f = 0 // 解析不出就当没有：单字段脏数据不该让整份快照失败
+		return nil
+	}
+	*f = flexInt(int64(v))
+	return nil
+}
+
+// dropTotal 是三类丢弃之和——CI 只关心「有没有丢」，拆分留给屏幕上的两行。
+func (p perfSummary) dropTotal() int64 {
+	return int64(p.DeliverDropped) + int64(p.DeliverClosed) + int64(p.EventsDropped)
+}
+
+func (a *app) cmdPerf(args []string) error {
+	fs := newFlagSet("perf")
+	watch := fs.Bool("w", false, "跟随模式：每 2 秒刷新一次快照")
+	fs.BoolVar(watch, "watch", false, "同 -w")
+	failOnDrop := fs.Bool("fail-on-drop", false, "检测到任何丢弃时以退出码 3 结束（CI 用）")
+	if err := fs.Parse(args); err != nil {
+		return usageErr("hubctl perf [-w] [--fail-on-drop]：%v", err)
+	}
+	if fs.NArg() > 0 {
+		return usageErr("perf 不接受位置参数（多余：%s）", strings.Join(fs.Args(), " "))
+	}
+	if *watch {
+		return a.perfWatch(*failOnDrop)
+	}
+	return a.perfOnce(*failOnDrop)
+}
+
+// perfOnce 取一次快照并渲染，随后按需做降级判定。
+// 先输出再判定：即使要退出 3，也要让人看到「丢了多少」的证据。
+func (a *app) perfOnce(failOnDrop bool) error {
+	raw, typed, err := a.perfSnapshot()
+	if err != nil {
+		return err
+	}
+	if err := a.renderPerf(raw, typed); err != nil {
+		return err
+	}
+	if failOnDrop && typed.dropTotal() > 0 {
+		return degradedErr(typed)
+	}
+	return nil
+}
+
+// perfWatch 轮询快照：TTY 上原地重绘，非 TTY 输出 NDJSON。
+//
+// 用 a.ctx（由 signal.NotifyContext 派生）作为唯一退出信号：Ctrl-C 后
+// 定时器随之作废，不残留 goroutine——本循环本身就在调用方 goroutine 里跑。
+func (a *app) perfWatch(failOnDrop bool) error {
+	interval := a.perfInterval()
+	first := true
+	for {
+		raw, typed, err := a.perfSnapshot()
+		if err != nil {
+			return err
+		}
+		if err := a.redrawPerf(raw, typed, first); err != nil {
+			return err
+		}
+		first = false
+		// 跟随模式下判到即退：CI 等待的是「出现即失败」，不是「退出时才有结论」。
+		if failOnDrop && typed.dropTotal() > 0 {
+			return degradedErr(typed)
+		}
+		select {
+		case <-a.ctx.Done():
+			return nil
+		case <-time.After(interval):
+		}
+	}
+}
+
+// perfInterval 返回本次调用的刷新周期（测试会注入更短的值）。
+func (a *app) perfInterval() time.Duration {
+	if a.perfEvery > 0 {
+		return a.perfEvery
+	}
+	return defaultPerfInterval
+}
+
+// perfSnapshot 取一次快照：raw 供 JSON 原样透传，typed 供表格渲染。
+func (a *app) perfSnapshot() (any, perfSummary, error) {
+	var typed perfSummary
+	raw, err := a.fetch(a.ctx, perfPath, nil, &typed)
+	if err != nil {
+		return nil, perfSummary{}, err
+	}
+	return raw, typed, nil
+}
+
+// renderPerf 单次渲染：json 模式透传服务端响应（保留未知字段），table 模式走键值表。
+func (a *app) renderPerf(raw any, typed perfSummary) error {
+	return a.print(raw, []string{"KEY", "VALUE"}, perfRows(typed))
+}
+
+// redrawPerf 是跟随模式下的单帧输出。
+//
+// TTY：先清屏再整屏重绘，避免表格逐帧往下堆。
+// 非 TTY：绝不出 ANSI——那里是 `hubctl perf -w | jq -c .` 的行流（NDJSON）。
+func (a *app) redrawPerf(raw any, typed perfSummary, first bool) error {
+	if a.out.isJSON() {
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return err
+		}
+		return a.out.line(string(b))
+	}
+	if a.isTTY {
+		if err := a.out.line(ansiClearHome); err != nil {
+			return err
+		}
+	} else if !first {
+		// 纯文本串流：用空行分帧，保持每帧仍是同一种表格形状。
+		if err := a.out.line(""); err != nil {
+			return err
+		}
+	}
+	return a.renderPerf(raw, typed)
+}
+
+// perfRows 把快照摊平成键值行。
+//
+// 两类丢弃刻意分成两行：deliverDropped 是队列满（该加缓冲/降速，属背压），
+// deliverClosed 是往已关闭的订阅写（属泄漏或竞态，要改代码）——处置动作完全不同，
+// 合成一个总数就等于把故障线索扔掉。
+func perfRows(p perfSummary) [][]string {
+	rows := [][]string{
+		{"uptime", fmtDuration(int64(p.UptimeMs))},
+		{"agentsOnline", strconv.FormatInt(int64(p.AgentsOnline), 10)},
+		{"rooms", strconv.FormatInt(int64(p.Rooms), 10)},
+		{"messagesTotal", strconv.FormatInt(int64(p.MessagesTotal), 10)},
+		{"messagesPerSecond", strconv.FormatFloat(p.MessagesPerSecond, 'f', 1, 64) + " msg/s"},
+		// 速率是「最近一个采样窗口内」的增量，窗口多长直接决定这个数怎么读。
+		{"sampleInterval", fmtDuration(int64(p.IntervalMs))},
+		{"httpRequestsTotal", strconv.FormatInt(int64(p.HTTPRequestsTotal), 10)},
+		{"sseClients", strconv.FormatInt(int64(p.SSEClients), 10)},
+		{"eventsDropped", strconv.FormatInt(int64(p.EventsDropped), 10)},
+		{"deliverDropped(队列满)", strconv.FormatInt(int64(p.DeliverDropped), 10)},
+		{"deliverClosed(已关闭)", strconv.FormatInt(int64(p.DeliverClosed), 10)},
+		{"heapAlloc", fmtBytes(int64(p.HeapAllocBytes))},
+		{"heapInuse", fmtBytes(int64(p.HeapInuseBytes))},
+		{"goroutines", strconv.FormatInt(int64(p.Goroutines), 10)},
+		{"gcTotal", strconv.FormatInt(int64(p.GCTotal), 10)},
+		{"memLimit", memLimitText(p)},
+		{"memHigh", memHighText(p)},
+	}
+	return rows
+}
+
+// memLimitText 渲染内存阈值：未配置时显式写「未启用」而不是 0 B。
+func memLimitText(p perfSummary) string {
+	if int64(p.MemLimitBytes) <= 0 {
+		return "未启用"
+	}
+	return fmtBytes(int64(p.MemLimitBytes))
+}
+
+// memHighText 渲染阈值状态；累计次数一并给出，便于判断是刚越线还是长期越线。
+func memHighText(p perfSummary) string {
+	if int64(p.MemLimitBytes) <= 0 {
+		return "未启用"
+	}
+	total := "累计 " + strconv.FormatInt(int64(p.MemHighTotal), 10) + " 次"
+	if p.MemHigh {
+		return "超阈值（" + total + "）"
+	}
+	return "正常（" + total + "）"
+}
+
+// degradedErr 构造降级退出（退出码 3）。
+// 文案把三个计数拆开写：日志里也要能看出是哪一类丢弃触发的。
+func degradedErr(p perfSummary) error {
+	return &degradedError{msg: "检测到丢弃：" +
+		"deliverDropped=" + strconv.FormatInt(int64(p.DeliverDropped), 10) +
+		" deliverClosed=" + strconv.FormatInt(int64(p.DeliverClosed), 10) +
+		" eventsDropped=" + strconv.FormatInt(int64(p.EventsDropped), 10) +
+		"（合计 " + strconv.FormatInt(p.dropTotal(), 10) + "）"}
 }
 
 // ---------------------------------------------------------------------------

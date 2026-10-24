@@ -56,6 +56,15 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("服务端返回 HTTP %d（%s）：%s", e.status, e.path, body)
 }
 
+// degradedError 表示命令跑通了、但服务端处于降级状态 → 退出码 3。
+//
+// 和 statusError/connError 的区别在于「输出是否已经有效」：降级时 stdout 的
+// 快照是完整可用的（可能已被 CI 解析），所以 reportError 只往 stderr 写一行说明，
+// 不打印「连不上 Hub」那种指引，也不把退出码混成 2。
+type degradedError struct{ msg string }
+
+func (e *degradedError) Error() string { return e.msg }
+
 // client 是 hubctl 与 Hub 通信的唯一入口：只有 REST + SSE，不碰任何内部包。
 type client struct {
 	baseURL string

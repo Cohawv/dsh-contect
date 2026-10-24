@@ -26,6 +26,9 @@ const (
 	exitOK    = 0
 	exitUsage = 1
 	exitNet   = 2
+	// exitDegraded 表示「命令成功、但服务端处于降级状态」。
+	// 目前只有 perf --fail-on-drop 用到：丢弃计数 > 0 就算降级。
+	exitDegraded = 3
 )
 
 // envHubAddr 是 Hub 地址的环境变量名（免除每次敲 -addr）。
@@ -59,6 +62,7 @@ func init() {
 		{"plugins", "hubctl plugins [start|stop NAME]", "插件列表与启停（GET /api/plugins、POST /api/plugins/toggle）", (*app).cmdPlugins},
 		{"logs", "hubctl logs [-f] [-n N] [-level L]", "日志查询与跟随（GET /api/logs、SSE /api/logs/stream）", (*app).cmdLogs},
 		{"messages", "hubctl messages [--since SEQ]", "历史消息（GET /api/messages）", (*app).cmdMessages},
+		{"perf", "hubctl perf [-w] [--fail-on-drop]", "性能快照：吞吐/丢弃/内存/GC（GET /api/metrics/summary）", (*app).cmdPerf},
 		{"watch", "hubctl watch [-level L]", "一键跟随事件流（等价于 agents -w + logs -f 合并）", (*app).cmdWatch},
 		{"fmt", "hubctl fmt [json|table] [子命令]", "查看或指定输出格式（等价于全局 --fmt）", (*app).cmdFmt},
 		{"completion", "hubctl completion bash|zsh|powershell", "生成 shell 补全脚本", (*app).cmdCompletion},
@@ -190,11 +194,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	term := isTerminal(stdout)
 	out := newRenderer(stdout, resolveFormat(g.format, term), resolveColor(g.color, term))
 	a := &app{
-		out:  out,
-		errw: stderr,
-		cl:   cl,
-		now:  time.Now,
-		ctx:  ctx,
+		out:   out,
+		errw:  stderr,
+		cl:    cl,
+		now:   time.Now,
+		ctx:   ctx,
+		isTTY: term,
 	}
 
 	if err := runCommand(a, rest[0], rest[1:]); err != nil {
@@ -203,12 +208,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return exitOK
 }
 
-// reportError 把错误翻译成人读信息 + 退出码：用法错误 1，网络/服务端错误 2。
+// reportError 把错误翻译成人读信息 + 退出码：用法错误 1，网络/服务端错误 2，降级 3。
 func reportError(stderr io.Writer, err error, baseURL string) int {
 	var ue *usageError
 	if errors.As(err, &ue) {
 		fmt.Fprintf(stderr, "hubctl: 用法错误: %s\n", ue.msg)
 		return exitUsage
+	}
+	// 降级不是失败：stdout 上的快照已经完整输出，这里只留一行给 CI 日志定位。
+	var de *degradedError
+	if errors.As(err, &de) {
+		fmt.Fprintf(stderr, "hubctl: 降级: %s；按 --fail-on-drop 判定（退出码 %d）\n", de.msg, exitDegraded)
+		return exitDegraded
 	}
 	fmt.Fprintf(stderr, "hubctl: %v\n", err)
 	// 连不上服务端是最常见的一类失败，给出可直接复制的启动命令，
@@ -241,11 +252,15 @@ func runCommand(a *app, name string, args []string) error {
 
 // printUsage 输出帮助文本。
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, usageText)
+	fmt.Fprint(w, buildUsageText())
 }
 
-// usageText 由 commandListText 拼装（含变量，故不能是 const）。
-var usageText = `hubctl —— LAN Agent Hub 命令行客户端（REST + SSE 契约，零外部依赖）
+// usageHeader / usageTrailer 是帮助文本的固定部分；中间的命令列表由 commands 派生。
+//
+// 必须拆成"每次打印时拼装"而不是一个包级 var：commands 在 init 里才赋值，
+// 包级 var 的求值发生在 init 之前，那样拼出来的命令列表会是空段
+// （历史 bug：`hubctl help` 的「子命令」一栏一直是空的）。
+const usageHeader = `hubctl —— LAN Agent Hub 命令行客户端（REST + SSE 契约，零外部依赖）
 
 用法：
   hubctl [全局参数] <子命令> [参数...]
@@ -258,22 +273,29 @@ var usageText = `hubctl —— LAN Agent Hub 命令行客户端（REST + SSE 契
   --version       显示版本
 
 子命令：
-` + commandListText + `
-示例：
+`
+
+const usageTrailer = `示例：
   hubctl status                      # 服务状态
   hubctl agents -w                   # 实时监听 Agent 上下线
   hubctl send --to A --text "hi"     # 点对点
   hubctl messages --since 100        # 序号 100 之后的历史消息
+  hubctl perf                        # 性能快照（吞吐/丢弃/内存/GC）
+  hubctl perf -w --fail-on-drop      # 跟随观察；出现丢弃即退出码 3
   hubctl --fmt json agents | jq .    # 管道场景自动 JSON
   source <(hubctl completion bash)   # 启用 bash 补全
 
 退出码：
   0 成功   1 用法错误   2 网络或服务端错误
+  3 降级（与 --fail-on-drop 连用时检测到丢弃）
 `
 
-// commandListText 由 commands 派生，避免帮助文本与实际命令表漂移。
-var commandListText = buildCommandList()
+// buildUsageText 拼装完整帮助文本。
+func buildUsageText() string {
+	return usageHeader + buildCommandList() + usageTrailer
+}
 
+// buildCommandList 由 commands 派生，避免帮助文本与实际命令表漂移。
 func buildCommandList() string {
 	var sb strings.Builder
 	for _, c := range commands {

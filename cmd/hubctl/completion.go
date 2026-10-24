@@ -11,7 +11,7 @@ _hubctl() {
     local cur cmd i
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
-    local commands="status agents rooms send say bcast plugins logs messages watch fmt completion help"
+    local commands="status agents rooms send say bcast plugins logs messages perf watch fmt completion help"
     local globals="--addr --fmt --color --help --version"
 
     cmd=""
@@ -37,6 +37,7 @@ _hubctl() {
         agents)    COMPREPLY=($(compgen -W "-w --watch" -- "$cur")) ;;
         logs)      COMPREPLY=($(compgen -W "-f --follow -n --limit --level --since" -- "$cur")) ;;
         messages)  COMPREPLY=($(compgen -W "--since --limit --from --to --room" -- "$cur")) ;;
+        perf)      COMPREPLY=($(compgen -W "-w --watch --fail-on-drop" -- "$cur")) ;;
         watch)     COMPREPLY=($(compgen -W "-level --no-agents" -- "$cur")) ;;
         status|rooms|help) COMPREPLY=() ;;
         *)         COMPREPLY=($(compgen -W "$commands" -- "$cur")) ;;
@@ -62,6 +63,7 @@ _hubctl() {
     'plugins:插件列表与启停（/api/plugins）'
     'logs:日志查询与跟随（/api/logs）'
     'messages:历史消息（GET /api/messages）'
+    'perf:性能快照：吞吐/丢弃/内存/GC（GET /api/metrics/summary）'
     'watch:合并跟随事件流（agents -w + logs -f）'
     'fmt:查看或指定输出格式（json|table）'
     'completion:生成 shell 补全脚本'
@@ -92,6 +94,7 @@ _hubctl() {
         agents)    _arguments '-w[监听模式]' '--watch[监听模式]' ;;
         logs)      _arguments '-f[跟随模式]' '--follow[跟随模式]' '-n[条数]:n:' '--level[级别]:level:(info warn error)' '--since[毫秒时间戳]:since:' ;;
         messages)  _arguments '--since[seq 游标]:since:' '--limit[条数]:limit:' '--from[发送方]:from:' '--to[接收方]:to:' '--room[房间]:room:' ;;
+        perf)      _arguments '-w[监听模式]' '--watch[监听模式]' '--fail-on-drop[检测到丢弃时以退出码 3 结束]' ;;
         watch)     _arguments '--level[级别]:level:(info warn error)' '--no-agents[不打印 Agent 快照]' ;;
       esac
       ;;
@@ -107,7 +110,7 @@ Register-ArgumentCompleter -CommandName hubctl -Native -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
 
     $commands = @('status', 'agents', 'rooms', 'send', 'say', 'bcast', 'plugins',
-                  'logs', 'messages', 'watch', 'fmt', 'completion', 'help')
+                  'logs', 'messages', 'perf', 'watch', 'fmt', 'completion', 'help')
     $globals = @('--addr', '--fmt', '--color', '--help', '--version')
 
     $tokens = $commandAst.CommandElements | ForEach-Object { $_.ToString() }
@@ -137,6 +140,7 @@ Register-ArgumentCompleter -CommandName hubctl -Native -ScriptBlock {
         'agents'     { $next = @('-w', '--watch') }
         'logs'       { $next = @('-f', '--follow', '-n', '--limit', '--level', '--since') }
         'messages'   { $next = @('--since', '--limit', '--from', '--to', '--room') }
+        'perf'       { $next = @('-w', '--watch', '--fail-on-drop') }
         'watch'      { $next = @('--level', '--no-agents') }
         default      { $next = $commands }
     }

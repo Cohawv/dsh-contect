@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -473,6 +474,308 @@ func TestMessagesSinceSeq(t *testing.T) {
 	if v["lastSeq"] != float64(101) {
 		t.Errorf("lastSeq = %v，期望 101", v["lastSeq"])
 	}
+}
+
+// ---------------------------------------------------------------------------
+// perf
+// ---------------------------------------------------------------------------
+
+// perfFixture 是固定的一份 /api/metrics/summary 响应。
+//
+// 两个丢弃数刻意取不同的值（7 / 2）：如果实现把它们相加成 9，下面的单元格断言会立刻红。
+// memLimitBytes=0 而堆用量非零：保证输出里唯一可能出现的 "0 B" 只能来自「未启用阈值」，
+// 于是 mustNotContain(out, "0 B") 才是对「0 与没配是两件事」的有效约束。
+const perfFixture = `{"uptimeMs":3723000,"agentsOnline":2,"rooms":1,"messagesTotal":1234,` +
+	`"messagesPerSecond":3.5,"httpRequestsTotal":88,"eventsDropped":0,"sseClients":4,"intervalMs":5000,` +
+	`"deliverDropped":7,"deliverClosed":2,"heapAllocBytes":12582912,"heapInuseBytes":20971520,` +
+	`"goroutines":42,"gcTotal":17,"memLimitBytes":0,"memHigh":false,"memHighTotal":0,"samples":[]}`
+
+// perfCell 从键值表输出里取出某个键的取值单元格。
+// tabwriter 用 ≥2 个空格分列，所以「键 + 空格」之后的部分就是取值。
+func perfCell(t *testing.T, out, key string) string {
+	t.Helper()
+	for _, ln := range nonEmptyLines(out) {
+		if !strings.HasPrefix(ln, key) {
+			continue
+		}
+		rest := ln[len(key):]
+		if !strings.HasPrefix(rest, "  ") { // 前缀撞车（如 memHigh/memHighTotal）不算命中
+			continue
+		}
+		return strings.TrimSpace(rest)
+	}
+	t.Fatalf("输出里找不到键 %q 的行：\n%s", key, out)
+	return ""
+}
+
+func TestPerfTableSeparatesDropCausesAndUnsetLimit(t *testing.T) {
+	f := newFakeHub(t)
+	f.json(perfPath, perfFixture)
+
+	code, out, errb := f.run("-fmt", "table", "perf")
+	assertExit(t, code, exitOK, errb)
+
+	mustContain(t, out, "KEY", "VALUE", "deliverDropped(队列满)", "deliverClosed(已关闭)", "未启用")
+	if got := perfCell(t, out, "deliverDropped(队列满)"); got != "7" {
+		t.Errorf("队列满丢弃 = %q，期望 7（不得与 deliverClosed 相加）", got)
+	}
+	if got := perfCell(t, out, "deliverClosed(已关闭)"); got != "2" {
+		t.Errorf("已关闭丢弃 = %q，期望 2", got)
+	}
+	if got := perfCell(t, out, "messagesPerSecond"); got != "3.5 msg/s" {
+		t.Errorf("当前速率 = %q，期望 3.5 msg/s（保留 1 位小数）", got)
+	}
+	if got := perfCell(t, out, "uptime"); got != "1h02m" {
+		t.Errorf("运行时长 = %q，期望 1h02m（两级单位）", got)
+	}
+	if got := perfCell(t, out, "heapAlloc"); got != "12.0 MiB" {
+		t.Errorf("heapAlloc = %q，期望 12.0 MiB", got)
+	}
+	if got := perfCell(t, out, "goroutines"); got != "42" {
+		t.Errorf("goroutines = %q，期望 42", got)
+	}
+	// memLimitBytes=0：阈值与告警状态都必须是「未启用」，且绝不能渲染成 "0 B"。
+	if n := strings.Count(out, "未启用"); n != 2 {
+		t.Errorf("「未启用」应出现 2 次（memLimit 与 memHigh 各一次），实际 %d 次：\n%s", n, out)
+	}
+	mustNotContain(t, out, "0 B")
+}
+
+func TestPerfMemHighOverThreshold(t *testing.T) {
+	f := newFakeHub(t)
+	// 64 MiB 阈值 + 已越线 + 累计 3 次。
+	f.json(perfPath, `{"uptimeMs":60000,"memLimitBytes":67108864,"memHigh":true,"memHighTotal":3}`)
+
+	code, out, errb := f.run("-fmt", "table", "perf")
+	assertExit(t, code, exitOK, errb)
+
+	mustContain(t, out, "超阈值")
+	mustNotContain(t, out, "未启用")
+	if got := perfCell(t, out, "memLimit"); got != "64.0 MiB" {
+		t.Errorf("memLimit = %q，期望 64.0 MiB", got)
+	}
+	if got := perfCell(t, out, "memHigh"); got != "超阈值（累计 3 次）" {
+		t.Errorf("memHigh = %q，期望 超阈值（累计 3 次）", got)
+	}
+}
+
+func TestPerfJSONPassesThroughUnknownFields(t *testing.T) {
+	f := newFakeHub(t)
+	// futureField / 未定义的 samples 子结构都必须活着出现在输出里：
+	// 这证明 json 模式是原样透传，而不是重新构造结构体（那会静默丢字段）。
+	f.json(perfPath, `{"uptimeMs":5000,"deliverDropped":7,"futureField":1,"samples":[{"ts":1,"messagesTotal":2}]}`)
+
+	code, out, errb := f.run("-fmt", "json", "perf")
+	assertExit(t, code, exitOK, errb)
+
+	v := mustJSON(t, out)
+	if v["futureField"] != float64(1) {
+		t.Errorf("futureField = %v，期望 1（未知字段被丢弃说明不是透传）", v["futureField"])
+	}
+	if v["deliverDropped"] != float64(7) {
+		t.Errorf("deliverDropped = %v，期望 7", v["deliverDropped"])
+	}
+	mustContain(t, out, "futureField", "samples")
+}
+
+func TestPerfFailOnDropExitCode(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"无丢弃", `{"deliverDropped":0,"deliverClosed":0,"eventsDropped":0}`, exitOK},
+		{"队列满丢弃", `{"deliverDropped":3,"deliverClosed":0,"eventsDropped":0}`, exitDegraded},
+		{"已关闭丢弃", `{"deliverDropped":0,"deliverClosed":1,"eventsDropped":0}`, exitDegraded},
+		{"事件丢弃", `{"deliverDropped":0,"deliverClosed":0,"eventsDropped":2}`, exitDegraded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeHub(t)
+			f.json(perfPath, tc.body)
+			code, out, errb := f.run("-fmt", "json", "perf", "--fail-on-drop")
+			assertExit(t, code, tc.want, errb)
+			// 退出 3 时 stdout 仍是完整可用快照（CI 要能在同一份输出上定位问题）。
+			mustJSON(t, out)
+			if tc.want == exitDegraded {
+				mustContain(t, errb, "降级")
+			} else if errb != "" {
+				t.Errorf("无丢弃时 stderr 应为空，实际=%q", errb)
+			}
+		})
+	}
+
+	// 不带 --fail-on-drop：同样的响应必须是 0（默认语义不变）。
+	f := newFakeHub(t)
+	f.json(perfPath, `{"deliverDropped":5,"deliverClosed":5,"eventsDropped":5}`)
+	code, _, errb := f.run("-fmt", "json", "perf")
+	assertExit(t, code, exitOK, errb)
+}
+
+func TestPerfUsageErrorsExit1(t *testing.T) {
+	f := newFakeHub(t)
+	f.json(perfPath, perfFixture)
+
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"未知标志", []string{"perf", "--bogus"}},
+		{"--fail-on-drop 拼错", []string{"perf", "--fail-on-drops"}},
+		{"位置参数", []string{"perf", "now"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, errb := f.run(tc.args...)
+			assertExit(t, code, exitUsage, errb)
+			mustContain(t, errb, "用法错误")
+		})
+	}
+}
+
+// captureWriter 在缓冲区里数到 marker 出现 need 次时调用 cancel。
+// 这样 perf -w 的轮询在"断言够用的帧数"之后自然收尾：既不用 sleep 等时钟，
+// 也不会因为取消 httptest 响应读取而把请求搞成 connError。
+type captureWriter struct {
+	buf    bytes.Buffer
+	marker string
+	need   int
+	seen   int
+	cancel context.CancelFunc
+}
+
+func (w *captureWriter) Write(p []byte) (int, error) {
+	n, err := w.buf.Write(p)
+	if w.cancel != nil {
+		w.seen += strings.Count(string(p), w.marker)
+		if w.seen >= w.need {
+			w.cancel()
+			w.cancel = nil
+		}
+	}
+	return n, err
+}
+
+func (w *captureWriter) String() string { return w.buf.String() }
+
+// newPerfApp 构造一个只跑 perf 的最小 app：间隔压到 1ms，输出目标可注入。
+func newPerfApp(f *fakeHub, out io.Writer, format string, isTTY bool, ctx context.Context) *app {
+	return &app{
+		out:       newRenderer(out, format, false),
+		errw:      io.Discard,
+		cl:        newClient(f.addr()),
+		now:       time.Now,
+		ctx:       ctx,
+		isTTY:     isTTY,
+		perfEvery: time.Millisecond,
+	}
+}
+
+func TestPerfWatchNonTTYEmitsNDJSON(t *testing.T) {
+	f := newFakeHub(t)
+	f.json(perfPath, perfFixture)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 两帧即停：第二行写完时取消 ctx，select 立刻走退出分支。
+	lw := &captureWriter{marker: "\n", need: 2, cancel: cancel}
+	a := newPerfApp(f, lw, formatJSON, false, ctx)
+
+	if err := a.cmdPerf([]string{"-w"}); err != nil {
+		t.Fatalf("perf -w 应正常结束，实际错误：%v", err)
+	}
+	lines := nonEmptyLines(lw.String())
+	if len(lines) != 2 {
+		t.Fatalf("非 TTY 下 -w 应输出 2 行 NDJSON，实际 %d 行：%q", len(lines), lw.String())
+	}
+	for i, ln := range lines {
+		v := mustJSON(t, ln) // 每行必须能独立解析，才能 | jq -c 逐行消费
+		if _, ok := v["uptimeMs"]; !ok {
+			t.Errorf("第 %d 行缺少 uptimeMs：%q", i+1, ln)
+		}
+	}
+	mustNotContain(t, lw.String(), "\x1b[") // 管道里绝不能出现 ANSI 控制符
+}
+
+func TestPerfWatchTTYRedrawsInPlace(t *testing.T) {
+	f := newFakeHub(t)
+	f.json(perfPath, perfFixture)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 清屏码出现 2 次即停：一帧一个清屏，说明是「同一屏重绘」而不是往下追加。
+	lw := &captureWriter{marker: ansiClearHome, need: 2, cancel: cancel}
+	a := newPerfApp(f, lw, formatTable, true, ctx)
+
+	if err := a.cmdPerf([]string{"-w"}); err != nil {
+		t.Fatalf("perf -w 应正常结束，实际错误：%v", err)
+	}
+	if n := strings.Count(lw.String(), ansiClearHome); n != 2 {
+		t.Fatalf("TTY 下每帧应先清屏再重绘，清屏次数=%d，期望 2", n)
+	}
+	// 每帧都是完整的同一张表（2 帧 → 两个丢弃行各 2 次）。
+	if n := strings.Count(lw.String(), "deliverDropped(队列满)"); n != 2 {
+		t.Errorf("deliverDropped 行应出现 2 次（每帧一次），实际 %d 次", n)
+	}
+}
+
+func TestPerfServerErrorAndBadJSONExit2(t *testing.T) {
+	// 非 200：走既有 statusError 路径（退出码 2 + 状态码进 stderr）。
+	f := newFakeHub(t)
+	f.handle(perfPath, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	code, out, errb := f.run("perf")
+	assertExit(t, code, exitNet, errb)
+	mustContain(t, errb, "500")
+	if out != "" {
+		t.Errorf("失败时 stdout 应为空，实际=%q", out)
+	}
+
+	// 坏 JSON：解析失败也必须退出 2，不能当成「全零快照」静默返回 0。
+	f2 := newFakeHub(t)
+	f2.json(perfPath, `{"uptimeMs": 12,`)
+	code, _, errb = f2.run("perf")
+	assertExit(t, code, exitNet, errb)
+	mustContain(t, errb, "解析失败")
+}
+
+func TestFmtDurationAndBytes(t *testing.T) {
+	durations := map[int64]string{
+		0:        "0s",
+		42000:    "42s",
+		3723000:  "1h02m",
+		90061000: "1d01h",
+		3599000:  "59m59s",
+	}
+	for ms, want := range durations {
+		if got := fmtDuration(ms); got != want {
+			t.Errorf("fmtDuration(%d) = %q，期望 %q", ms, got, want)
+		}
+	}
+
+	sizes := map[int64]string{
+		0:          "0 B",
+		1023:       "1023 B",
+		1024:       "1.0 KiB",
+		12582912:   "12.0 MiB",
+		1073741824: "1.00 GiB",
+	}
+	for n, want := range sizes {
+		if got := fmtBytes(n); got != want {
+			t.Errorf("fmtBytes(%d) = %q，期望 %q", n, got, want)
+		}
+	}
+}
+
+func TestPerfHelpLineAndExitCodeDoc(t *testing.T) {
+	var out, errb bytes.Buffer
+	code := run(context.Background(), []string{"--help"}, &out, &errb)
+	assertExit(t, code, exitOK, errb.String())
+	// 帮助文本与退出码段都来自 main.go，不另写文案；这里钉住 perf 行与退出码 3。
+	mustContain(t, out.String(),
+		"hubctl perf [-w] [--fail-on-drop]",
+		"3 降级（与 --fail-on-drop 连用时检测到丢弃）")
 }
 
 // ---------------------------------------------------------------------------
