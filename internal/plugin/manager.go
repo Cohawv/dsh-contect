@@ -108,7 +108,10 @@ type Manager struct {
 
 	cfgPath     string // 配置文件路径（"" 表示不落盘）
 	cfgReadOnly bool   // 只读模式：禁止写盘
-	store       *Store // 配置文件存储（懒建）
+	// stopCosts 记录每个插件的实际 Stop 耗时（V8 ⑤ 停机诊断）。
+	// 由 mu 保护：StopAll 写、Summary 读，两者可能被不同协程调用。
+	stopCosts map[string]time.Duration
+	store     *Store // 配置文件存储（懒建）
 
 	// blocked 记录「Stop 超时后拒绝再次装配」的插件（F5）。
 	// 超时的 Stop 协程仍在跑，若此时又 Init 同一个实例（进程级单例），
@@ -772,8 +775,47 @@ func (m *Manager) StopAll() {
 		if !m.isEnabled(p) || m.stateOf(name) != StateRunning {
 			continue
 		}
+		start := time.Now()
 		m.safeStop(p)
+		m.recordStopCost(name, time.Since(start))
 	}
+}
+
+// recordStopCost 记下单个插件的 Stop 耗时。
+func (m *Manager) recordStopCost(name string, d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopCosts == nil {
+		m.stopCosts = make(map[string]time.Duration)
+	}
+	m.stopCosts[name] = d
+}
+
+// StopCosts 返回各插件的 Stop 耗时（按耗时降序），供停机诊断。
+//
+// 为什么要这个：停机慢通常只有一个元凶（某个插件在等自己的 goroutine），
+// 但日志里只看到「停机花了 8 秒」，不知道是谁。按耗时排序打印，一眼能定位；
+// 这也让「某个插件的 Stop 悄悄变慢」在版本之间变得可比较。
+func (m *Manager) StopCosts() []StopCost {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]StopCost, 0, len(m.stopCosts))
+	for name, d := range m.stopCosts {
+		out = append(out, StopCost{Name: name, Cost: d})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Cost == out[j].Cost {
+			return out[i].Name < out[j].Name // 同耗时按名字排，保证输出稳定
+		}
+		return out[i].Cost > out[j].Cost
+	})
+	return out
+}
+
+// StopCost 是单个插件的 Stop 实际耗时。
+type StopCost struct {
+	Name string
+	Cost time.Duration
 }
 
 // Reload 逐个插件重新装配（Stop → Init → Start，不重启进程），返回每个插件的结果。
@@ -1152,6 +1194,24 @@ func (m *Manager) Summary() string {
 		if info.Error != "" {
 			b.WriteByte(':')
 			b.WriteString(info.Error)
+		}
+	}
+	// V8 ⑤：附加停机耗时（按耗时降序，只列前 5 个）。
+	// 单独一段而不是塞进每个插件后面：停机时真正要看的是「谁最慢」，
+	// 按耗时排序比按名字排列更容易一眼定位元凶。
+	if costs := m.StopCosts(); len(costs) > 0 {
+		b.WriteString(" | 停机耗时:")
+		for i, c := range costs {
+			if i >= 5 {
+				b.WriteString(" …")
+				break
+			}
+			if i > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(c.Name)
+			b.WriteByte('=')
+			b.WriteString(c.Cost.Round(time.Millisecond).String())
 		}
 	}
 	return b.String()

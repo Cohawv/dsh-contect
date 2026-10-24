@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"time"
 
 	"lan-agent-hub/internal/protocol"
 )
@@ -101,3 +102,11 @@ func (c *ndjsonConn) SendBatch(envs []protocol.Envelope) error {
 }
 
 func (c *ndjsonConn) Close() error { return c.conn.Close() }
+
+// SetReadDeadline 设置下次 Recv 的截止时间（V8 ⑤ 读空闲超时的落地手段）。
+// 传零值 time.Time 表示清除截止时间。
+func (c *ndjsonConn) SetReadDeadline(t time.Time) error { return c.conn.SetReadDeadline(t) }
+
+// SetWriteDeadline 设置下次 Write 的截止时间（V8 ⑤ 写超时的落地手段）。
+// 传零值 time.Time 表示清除截止时间。
+func (c *ndjsonConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }

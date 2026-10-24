@@ -6,9 +6,18 @@
 package core
 
 import (
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// defaultSubTimeout 是 SubscribeWithTimeout 未指定时长时的守护值（V8 ⑤）。
+//
+// 5 秒的依据：正常的通知型处理器（上下线记录、房间变更、指标累加）都是微秒级，
+// 5 秒是「明显不正常」的下限。再长就失去隔离意义，再短容易误杀刚好在做
+// 一次磁盘写或一次小 GC 的处理器。
+const defaultSubTimeout = 5 * time.Second
 
 // Handler 是事件处理器；payload 的具体类型由 topic 决定。
 type Handler func(topic string, payload any)
@@ -16,11 +25,14 @@ type Handler func(topic string, payload any)
 // subEntry 是订阅记录：每个订阅拥有唯一 id，便于精确注销（cancel）。
 // async 为 true 时走「每 topic 独立 goroutine + 有界队列」派发，绝不阻塞发布方。
 type subEntry struct {
-	id     int
-	h      Handler
-	async  bool
-	ch     chan asyncJob
-	done   chan struct{}
+	id    int
+	h     Handler
+	async bool
+	ch    chan asyncJob
+	done  chan struct{}
+	// V8 ⑤：timeout > 0 表示该订阅受超时守护；deg 为降级标志（指针，跨拷贝共享）。
+	timeout time.Duration
+	deg     *atomic.Bool
 }
 
 // asyncJob 是异步派发的任务单元。
@@ -38,10 +50,11 @@ type asyncJob struct {
 //     绝不阻塞 Publish（与 Session.Deliver 的「缓冲满即丢」策略一致）；
 //   - 同步派发保持注册顺序，单个处理器 panic 不影响其它订阅者。
 type EventBus struct {
-	mu      sync.RWMutex
-	subs    map[string][]subEntry
-	nextID  int
-	dropped int64
+	mu       sync.RWMutex
+	subs     map[string][]subEntry
+	nextID   int
+	dropped  int64
+	degraded int64 // V8 ⑤：因超时被降级的订阅次数
 }
 
 func NewEventBus() *EventBus {
@@ -90,6 +103,60 @@ func (b *EventBus) SubscribeAsync(topic string, h Handler, queue int) func() {
 	}()
 
 	return b.cancelOf(topic, id)
+}
+
+// SubscribeWithTimeout 同步订阅并给处理器加执行上限（V8 ⑤）。
+//
+// 与 Subscribe / SubscribeAsync 的区别与选择依据：
+//   - Subscribe：就地同步执行。最快、保序，但一个卡住的处理器会拖住**所有**发布方
+//     （因为它跑在发布方的协程里）。适合内核内部那些确定是微秒级的订阅。
+//   - SubscribeAsync：独立协程 + 有界队列。发布方永不被阻塞，但不再保序，
+//     且队列满就丢。适合「可丢、不要顺序」的派生通知。
+//   - SubscribeWithTimeout：保序语义 + 卡死隔离。派发时在独立协程执行并等待，
+//     超时则把该订阅标记为 degraded、**后续事件不再投递给它**，
+//     发布方只在超时那一次多等一个 timeout。适合「必须看到每条事件、但绝不能拖垮主线」
+//     的插件订阅（如把事件转发到外部 webhook）。
+//
+// 为什么降级后是「暂停投递」而不是「继续尝试」：卡住的处理器往往不是偶发，
+// 而是它依赖的外部资源没了（webhook 目标不可达）。继续投递等于每个事件都让
+// 发布方白等一个 timeout，把单点故障放大成全体延迟。
+//
+// 已知代价（如实记录）：Go 无法杀死 goroutine，超时的那次执行会继续跑到自己结束；
+// 只是它的结果被丢弃、且不再有新事件进来。因此这个能力适用于「偶发卡顿」，
+// 不能用来兜住「每个事件都无限阻塞」的处理器——那种情况该用 SubscribeAsync 或修处理器。
+func (b *EventBus) SubscribeWithTimeout(topic string, h Handler, timeout time.Duration) func() {
+	if timeout <= 0 {
+		timeout = defaultSubTimeout
+	}
+	b.mu.Lock()
+	b.nextID++
+	id := b.nextID
+	deg := new(atomic.Bool)
+	b.subs[topic] = append(b.subs[topic], subEntry{id: id, h: h, timeout: timeout, deg: deg})
+	b.mu.Unlock()
+	return b.cancelOf(topic, id)
+}
+
+// DegradedCount 返回累计因超时被降级的订阅次数，供 /metrics 与日志观测。
+func (b *EventBus) DegradedCount() int64 {
+	return atomic.LoadInt64(&b.degraded)
+}
+
+// RecoverDegraded 清除所有订阅的降级标志，让被暂停的订阅重新参与派发。
+//
+// 为什么不自动恢复：自动恢复会让「每个事件都超时」的处理器变成
+// 「每隔几个事件就拖一次主线」的慢性病，而且没有任何人能看见它在复发。
+// 恢复必须是一次显式的人工动作（插件重载或手动调用）。
+func (b *EventBus) RecoverDegraded() {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, hs := range b.subs {
+		for i := range hs {
+			if hs[i].deg != nil {
+				hs[i].deg.Store(false)
+			}
+		}
+	}
 }
 
 // cancelOf 构造针对特定订阅 id 的注销函数（幂等）。
@@ -157,9 +224,34 @@ func (b *EventBus) Publish(topic string, payload any) {
 			}
 			continue
 		}
-		func() {
+		if e.timeout <= 0 {
+			func() {
+				defer func() { _ = recover() }()
+				e.h(topic, payload)
+			}()
+			continue
+		}
+		// V8 ⑤ 守护派发：已降级的订阅直接跳过，绝不再让发布方为它等一次超时。
+		if e.deg != nil && e.deg.Load() {
+			continue
+		}
+		// Go 1.21 的循环变量在迭代间复用，闭包必须显式拷贝，否则 goroutine 拿到的
+		// 可能是下一轮的订阅者——那会变成「派给错的处理器」，比超时更难查。
+		entry := e
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
 			defer func() { _ = recover() }()
-			e.h(topic, payload)
+			entry.h(topic, payload)
 		}()
+		select {
+		case <-done:
+		case <-time.After(entry.timeout):
+			if entry.deg != nil && entry.deg.CompareAndSwap(false, true) {
+				n := atomic.AddInt64(&b.degraded, 1)
+				log.Printf("eventbus: 订阅者处理 %q 超过 %s，标记 degraded 并暂停投递（累计 %d 次；恢复需显式调用 RecoverDegraded）",
+					topic, entry.timeout, n)
+			}
+		}
 	}
 }

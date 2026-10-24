@@ -32,6 +32,23 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// HTTP 超时默认值（V8 ⑤）。
+//
+// 这里只有两个「安全」的超时，另外两个（ReadTimeout / WriteTimeout）**故意不设**，
+// 原因见 startTimeout 上方的说明——它们会掐断 SSE 长连接。
+const (
+	defaultReadHeaderTimeout = 10 * time.Second
+	defaultIdleTimeout       = 120 * time.Second
+	defaultHandlerTimeout    = 5 * time.Second
+	// slowHandlerThreshold 是「慢 handler」告警线：超过就记一条 WARN。
+	slowHandlerThreshold = time.Second
+	// handlerTimeoutBody 是 handler 超时时返回的响应体（TimeoutHandler 要求给字符串）。
+	//
+	// 用 JSON 而不是纯文本：控制台的 fetch 一律按 JSON 解析，
+	// 返回纯文本会先抛一个 SyntaxError，把「服务端超时」伪装成「前端解析错误」。
+	handlerTimeoutBody = `{"error":"handler timeout"}`
+)
+
 // HTTPGateway 是 httpgateway 插件实体。
 type HTTPGateway struct {
 	hub      *core.Hub
@@ -40,6 +57,10 @@ type HTTPGateway struct {
 	mux      *http.ServeMux
 	httpAddr string
 	srv      *http.Server
+	// V8 ⑤ 超时配置（Init 时解析）。
+	readHeaderTimeout time.Duration
+	idleTimeout       time.Duration
+	handlerTimeout    time.Duration
 }
 
 // Meta 声明插件元信息。
@@ -62,6 +83,24 @@ func (p *HTTPGateway) Options() []plugin.OptionDef {
 			Default:     ":8081",
 			Description: "HTTP 监听地址，形如 :8081 或 0.0.0.0:8081（改动需重启插件生效）",
 		},
+		{
+			Key:         "readHeaderTimeout",
+			Type:        plugin.OptionDuration,
+			Default:     "10s",
+			Description: "读完请求头的上限（如 10s）：防止只发半个请求头的连接长期占资源。填 0 关闭",
+		},
+		{
+			Key:         "idleTimeout",
+			Type:        plugin.OptionDuration,
+			Default:     "120s",
+			Description: "keep-alive 空闲连接的上限（如 120s）。不影响正在传输的请求，含 SSE。填 0 关闭",
+		},
+		{
+			Key:         "handlerTimeout",
+			Type:        plugin.OptionDuration,
+			Default:     "5s",
+			Description: "单个 API handler 的执行上限（如 5s），超时返回 503。只作用于本插件的 11 个端点，不影响流式端点",
+		},
 	}
 }
 
@@ -75,6 +114,19 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 	p.hub = hub
 	p.mux = ctx.ServeMux()
 	p.httpAddr = ctx.String("httpAddr", ":8081")
+	// V8 ⑤：超时配置。负数视为关闭（Duration 解析失败也会走到默认值）。
+	p.readHeaderTimeout = ctx.Duration("readHeaderTimeout", defaultReadHeaderTimeout)
+	p.idleTimeout = ctx.Duration("idleTimeout", defaultIdleTimeout)
+	p.handlerTimeout = ctx.Duration("handlerTimeout", defaultHandlerTimeout)
+	if p.readHeaderTimeout < 0 {
+		p.readHeaderTimeout = 0
+	}
+	if p.idleTimeout < 0 {
+		p.idleTimeout = 0
+	}
+	if p.handlerTimeout < 0 {
+		p.handlerTimeout = 0
+	}
 	// 插件实例是进程级单例，先清掉上一次装配的残留，
 	// 避免「上一次装配启用了 discovery、这一次禁用」时仍读到旧的 Service。
 	p.disco = nil
@@ -97,7 +149,7 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 		if regErr != nil {
 			return
 		}
-		if e := ctx.RegisterHTTP(pattern, h); e != nil {
+		if e := ctx.RegisterHTTP(pattern, p.guard(h)); e != nil {
 			regErr = e
 		}
 	}, hub, p.disco, p.mgr)
@@ -109,11 +161,62 @@ func (p *HTTPGateway) Init(ctx *plugin.Context) error {
 	return nil
 }
 
+// guard 给单个 API handler 套上「执行上限 + 慢 handler 日志」两层保护（V8 ⑤）。
+//
+// 为什么只包本插件自己的 11 个端点、而不是整个共享 mux：
+// 共享 mux 上还有 realtime 的 /api/stream（SSE）和 logview 的日志流。
+// TimeoutHandler 的语义是「到点就返回 503 并丢弃后续写入」——套在 SSE 上
+// 等于给一条设计上要挂几小时的长连接设了 5 秒死刑。按插件自治划分边界，
+// 每个插件只对自己注册的端点负责，是这里唯一不会误伤的切法。
+func (p *HTTPGateway) guard(h http.HandlerFunc) http.HandlerFunc {
+	inner := http.Handler(http.HandlerFunc(h))
+	if p.handlerTimeout > 0 {
+		inner = http.TimeoutHandler(inner, p.handlerTimeout, handlerTimeoutBody)
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		// 用 defer 记日志：handler panic 时会向上传播，若写在调用之后，
+		// 正是最需要这条日志的那次不会被执行。
+		defer func() {
+			if d := time.Since(start); d > slowHandlerThreshold {
+				log.Printf("httpgateway: 慢 handler %s %s 耗时 %s（告警线 %s）",
+					r.Method, r.URL.Path, d.Round(time.Millisecond), slowHandlerThreshold)
+			}
+		}()
+		inner.ServeHTTP(w, r)
+	}
+}
+
 // Start 在 httpAddr 上启动 HTTP 服务（共享 mux）。
 //
 // 端口绑定是**同步**做的：绑定失败直接返回 error（State 变 Failed），
 // 而不是把 ListenAndServe 扔进 goroutine 只记日志——否则端口被占时插件会停在
 // 一个"假 Running"状态，而实际没有任何 HTTP 服务。
+//
+// 超时取舍（V8 ⑤）：只设 ReadHeaderTimeout 与 IdleTimeout，**绝不设**
+// ReadTimeout / WriteTimeout。
+//   - ReadHeaderTimeout 挡住的是「连上但只发半个请求头」的连接，这是 Slowloris 的本体：
+//     实测 50 条这样的连接会让 goroutine 数从 21 涨到 71 且永不自愈（每条一协程一 fd）。
+//     它只约束「读请求头」这一段，请求开始处理后就不再作用，因此不影响任何长响应。
+//   - IdleTimeout 只收割 keep-alive 的空闲连接，SSE 在传输期间是活跃的，不受影响。
+//   - WriteTimeout 从「读完请求头」开始计时并**覆盖整个响应写出过程**，
+//     SSE 挂到第 N 秒就会被硬切——这正是历史行为里没有它的原因，不是遗漏。
+//   - ReadTimeout 到期会给连接打上永久的读截止时间，长连接的后续读全部失败。
+//
+// 长响应的保护交给 guard 的 handlerTimeout（按端点、按语义分别设定）。
+// newServer 构造 http.Server，把本插件的超时配置传导进去。
+//
+// 单独抽出来是为了可测：如果超时只在 Start 里就地组装，测试就只能重复一遍
+// 同样的字段赋值（测的是测试自己的代码），而无法断言「配置真的传到了 server」。
+func (p *HTTPGateway) newServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              p.httpAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: p.readHeaderTimeout,
+		IdleTimeout:       p.idleTimeout,
+	}
+}
+
 func (p *HTTPGateway) Start() error {
 	if p.mux == nil {
 		return errors.New("httpgateway: mux not built")
@@ -122,13 +225,14 @@ func (p *HTTPGateway) Start() error {
 	if err != nil {
 		return fmt.Errorf("httpgateway listen %s: %w", p.httpAddr, err)
 	}
-	p.srv = &http.Server{Addr: p.httpAddr, Handler: p.mux}
+	p.srv = p.newServer(p.mux)
 	go func() {
 		if err := p.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("http gateway error: %v", err)
 		}
 	}()
-	log.Printf("LAN Agent Hub HTTP gateway on %s", p.httpAddr)
+	log.Printf("LAN Agent Hub HTTP gateway on %s（读头超时 %s · 空闲超时 %s · handler 超时 %s）",
+		p.httpAddr, p.readHeaderTimeout, p.idleTimeout, p.handlerTimeout)
 	return nil
 }
 

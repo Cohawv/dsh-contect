@@ -2,7 +2,11 @@
 // 不含任何业务规则。换传输（如加 WebSocket）只需新增一个实现，core 与业务代码不动。
 package transport
 
-import "lan-agent-hub/internal/protocol"
+import (
+	"time"
+
+	"lan-agent-hub/internal/protocol"
+)
 
 // ErrBadFrame 表示「帧本身能读出来，但内容无法解码」。
 // 它是可恢复错误：adapter 收到后应回一条 bad json 回执并继续读下一帧，
@@ -43,4 +47,21 @@ type BatchConn interface {
 type Listener interface {
 	Accept() (Conn, error)
 	Close() error
+}
+
+// DeadlineConn 是**可选**能力：给底层连接设置读/写截止时间（V8 ⑤）。
+//
+// 为什么需要它：没有截止时间时，一个「连上但不读」的客户端会让写协程永远阻塞在
+// Write 上——那条协程连同它的 goroutine 栈、未被回收的批次缓冲一起钉死，
+// 而且因为写协程卡住，队头后面的消息全部堆在 sendCh 里直到被丢弃。
+// 反过来，一个「连上但不发」的客户端会让读协程永远阻塞在 Read 上，
+// 在线表里留着一条实际已死的会话。
+//
+// 为什么做成可选接口而不是扩 Conn：TCP 有 deadline 语义，而内存/管道连接、
+// 测试替身未必有。用可选接口 + 类型断言，未实现的连接退化为「不设超时」，
+// 与 BatchConn 的取舍保持一致（不逼迫所有实现背上与自己无关的能力）。
+type DeadlineConn interface {
+	Conn
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
 }
