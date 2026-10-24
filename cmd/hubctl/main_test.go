@@ -238,6 +238,148 @@ func TestRoomsTableAndJSON(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// room 管理子动作（create / drop / rename / kick）
+// ---------------------------------------------------------------------------
+
+func TestRoomCreatePostsNameAndMembers(t *testing.T) {
+	f := newFakeHub(t)
+	f.json("/api/create_room", `{"roomId":"r-new-1"}`)
+
+	// flag 包语义：--members 必须写在位置参数之前（遇到第一个位置参数即停止解析）。
+	code, out, errb := f.run("-fmt", "table", "room", "create", "--members=a1, a2 ,,", "作战室")
+	assertExit(t, code, exitOK, errb)
+	mustContain(t, out, "ROOM-ID", "NAME", "r-new-1", "作战室")
+
+	// 无 --members 的最常见用法（仅位置参数）也必须工作。
+	code, out, errb = f.run("-fmt", "table", "room", "create", "仅我")
+	assertExit(t, code, exitOK, errb)
+	mustContain(t, out, "ROOM-ID", "NAME", "仅我")
+
+	reqs := f.reqsFor("/api/create_room")
+	if len(reqs) != 2 {
+		t.Fatalf("应 POST /api/create_room 两次（带/不带 members），实际 %d", len(reqs))
+	}
+	var body struct {
+		From    string   `json:"from"`
+		Name    string   `json:"name"`
+		Members []string `json:"members"`
+	}
+	if err := json.Unmarshal([]byte(reqs[0].Body), &body); err != nil {
+		t.Fatalf("请求体不是合法 JSON：%v（%q）", err, reqs[0].Body)
+	}
+	// --members 的语义：逗号分隔 + 容忍空片段和空白（" a2,," 只留 a1/a2）。
+	if body.Name != "作战室" || len(body.Members) != 2 || body.Members[0] != "a1" || body.Members[1] != "a2" {
+		t.Errorf("请求体字段不符：%+v", body)
+	}
+	if body.From == "" {
+		t.Errorf("create_room 请求体缺 from 身份")
+	}
+	// 无 --members 时 members 应是空数组而非 null（服务端好处理）。
+	var body2 struct {
+		Name    string   `json:"name"`
+		Members []string `json:"members"`
+	}
+	if err := json.Unmarshal([]byte(reqs[1].Body), &body2); err != nil {
+		t.Fatalf("第二笔请求体不是合法 JSON：%v（%q）", err, reqs[1].Body)
+	}
+	if body2.Name != "仅我" || len(body2.Members) != 0 {
+		t.Errorf("无 members 的请求体字段不符：%+v", body2)
+	}
+}
+
+func TestRoomDropPostsRoomID(t *testing.T) {
+	f := newFakeHub(t)
+	f.json("/api/delete_room", `{"status":"ok"}`)
+
+	code, out, errb := f.run("-fmt", "table", "room", "drop", "r-old")
+	assertExit(t, code, exitOK, errb)
+	mustContain(t, out, "/api/delete_room", "r-old 已删除")
+
+	reqs := f.reqsFor("/api/delete_room")
+	if len(reqs) != 1 {
+		t.Fatalf("应 POST /api/delete_room 一次，实际 %d", len(reqs))
+	}
+	var body map[string]string
+	_ = json.Unmarshal([]byte(reqs[0].Body), &body)
+	if body["roomId"] != "r-old" {
+		t.Errorf("请求体字段不符：%v", body)
+	}
+}
+
+// TestRoomDropTranslates404 必须用全新的 fakeHub：上面的成功用例注册过
+// 200 端点，复用同一实例的话 404 场景会静默落到旧端点上（首跑就栽过）。
+func TestRoomDropTranslates404(t *testing.T) {
+	f := newFakeHub(t) // 一个端点都不注册 → mux 自然返回 404
+
+	// 404 必须翻译成「房间不存在」的用法错误（退出码 1），
+	// 而不是透传 HTTP 细节让用户猜（那样是退出码 2）。
+	code, _, errb := f.run("room", "drop", "r-ghost")
+	assertExit(t, code, exitUsage, errb)
+	mustContain(t, errb, "房间不存在")
+}
+
+func TestRoomRenamePostsRoomIDAndName(t *testing.T) {
+	f := newFakeHub(t)
+	f.json("/api/rename_room", `{"status":"ok"}`)
+
+	code, out, errb := f.run("-fmt", "table", "room", "rename", "r1", "新名字")
+	assertExit(t, code, exitOK, errb)
+	mustContain(t, out, "/api/rename_room", "r1 → 新名字")
+
+	var body map[string]string
+	_ = json.Unmarshal([]byte(f.reqsFor("/api/rename_room")[0].Body), &body)
+	if body["roomId"] != "r1" || body["name"] != "新名字" {
+		t.Errorf("请求体字段不符：%v", body)
+	}
+}
+
+func TestRoomKickPostsRoomIDAndAgent(t *testing.T) {
+	f := newFakeHub(t)
+	f.json("/api/kick", `{"status":"ok"}`)
+
+	code, out, errb := f.run("-fmt", "table", "room", "kick", "r1", "a2")
+	assertExit(t, code, exitOK, errb)
+	mustContain(t, out, "/api/kick", "a2 ← r1")
+
+	var body map[string]string
+	_ = json.Unmarshal([]byte(f.reqsFor("/api/kick")[0].Body), &body)
+	if body["roomId"] != "r1" || body["agent"] != "a2" {
+		t.Errorf("请求体字段不符：%v", body)
+	}
+}
+
+func TestRoomUsageErrorsExit1(t *testing.T) {
+	f := newFakeHub(t)
+	// 用法错误在发请求之前就该拦下——fakeHub 一个端点都没注册，
+	// 如果这些用例真的打了网络，会以退出码 2 收场，正好被断言抓住。
+	cases := []struct {
+		name string
+		args []string
+		hint string
+	}{
+		{"无子动作", []string{"room"}, "需要子动作"},
+		{"未知子动作", []string{"room", "purge"}, "未知 room 子动作"},
+		{"create 缺名称", []string{"room", "create"}, "用法：hubctl room create"},
+		{"drop 缺房间ID", []string{"room", "drop"}, "用法：hubctl room drop"},
+		{"rename 缺新名称", []string{"room", "rename", "r1"}, "用法：hubctl room rename"},
+		{"kick 缺成员", []string{"room", "kick", "r1"}, "用法：hubctl room kick"},
+	}
+	for _, tc := range cases {
+		code, _, errb := f.run(tc.args...)
+		if code != exitUsage {
+			t.Errorf("%s：退出码 = %d，期望 %d（stderr=%q）", tc.name, code, exitUsage, errb)
+		}
+		if !strings.Contains(errb, tc.hint) {
+			t.Errorf("%s：stderr 缺提示 %q，实际 %q", tc.name, tc.hint, errb)
+		}
+	}
+	if n := len(f.reqsFor("/api/create_room")) + len(f.reqsFor("/api/delete_room")) +
+		len(f.reqsFor("/api/rename_room")) + len(f.reqsFor("/api/kick")); n != 0 {
+		t.Errorf("用法错误不应发出任何网络请求，实际发出 %d 个", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // send / say / bcast
 // ---------------------------------------------------------------------------
 

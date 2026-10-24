@@ -56,6 +56,7 @@ func init() {
 		{"status", "hubctl status", "服务状态总览（GET /api/status）", (*app).cmdStatus},
 		{"agents", "hubctl agents [-w]", "Agent 表格；-w 监听模式（GET /api/agents + SSE /api/stream）", (*app).cmdAgents},
 		{"rooms", "hubctl rooms", "房间列表（GET /api/rooms）", (*app).cmdRooms},
+		{"room", `hubctl room create|drop|rename|kick ...`, "房间管理：create NAME [--members a,b] · drop ID · rename ID NAME · kick ID AGENT", (*app).cmdRoom},
 		{"send", `hubctl send --to A --text "hi"`, "点对点发送（POST /api/send）", (*app).cmdSend},
 		{"say", `hubctl say --room R --text "hi"`, "房间发送（POST /api/room）", (*app).cmdSay},
 		{"bcast", `hubctl bcast --text "hi"`, "广播（POST /api/broadcast）", (*app).cmdBcast},

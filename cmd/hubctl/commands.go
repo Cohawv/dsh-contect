@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -244,6 +246,124 @@ func (a *app) cmdRooms(args []string) error {
 		rows = append(rows, []string{r.ID, r.Name, strconv.Itoa(r.MemberCount), joinList(r.Members)})
 	}
 	return a.print(raw, []string{"ID", "NAME", "MEMBERS", "MEMBER-LIST"}, rows)
+}
+
+// ---------------------------------------------------------------------------
+// room（房间管理：create / drop / rename / kick）
+// ---------------------------------------------------------------------------
+
+// cmdRoom 房间管理子动作。收在一个命令里而不是平铺四个，是因为它们共享
+// 「room <动作> <参数>」的心智模型，且顶层命令表已经 16 条——再平铺就翻页了。
+// 删除/踢人是不可逆操作：系统无权限体系，命令行的防线只有一条——
+// drop/kick 的参数必须**显式**写出房间 ID，不存在「默认房间」这种隐式目标。
+func (a *app) cmdRoom(args []string) error {
+	if len(args) == 0 {
+		return usageErr("room 需要子动作：create | drop | rename | kick")
+	}
+	action, rest := strings.ToLower(args[0]), args[1:]
+	switch action {
+	case "create":
+		return a.roomCreate(rest)
+	case "drop":
+		return a.roomDrop(rest)
+	case "rename":
+		return a.roomRename(rest)
+	case "kick":
+		return a.roomKick(rest)
+	default:
+		return usageErr("未知 room 子动作 %q（可用：create, drop, rename, kick）", action)
+	}
+}
+
+// roomNotFound 把 404 翻译成人话：删/改/踢拿错 ID 是最高频的用法错误，
+// 直接透传 "服务端返回 HTTP 404" 等于让用户猜。
+func roomNotFound(err error) error {
+	var se *statusError
+	if errors.As(err, &se) && se.status == http.StatusNotFound {
+		return usageErr("房间不存在（检查房间 ID；已删除的房间 ID 不会复用）")
+	}
+	return err
+}
+
+func (a *app) roomCreate(args []string) error {
+	fs := newFlagSet("room create")
+	members := fs.String("members", "", "逗号分隔的初始成员（可选，如 --members alice,bob）")
+	if err := fs.Parse(args); err != nil {
+		return usageErr("hubctl room create：%v", err)
+	}
+	if fs.NArg() != 1 {
+		// 注意顺序：flag 包遇到第一个位置参数就停止解析，
+		// 所以 --members 必须写在名称之前——提示里直接反映这一点。
+		return usageErr("用法：hubctl room create [--members a,b] <名称>")
+	}
+	name := fs.Arg(0)
+	var memberList []string
+	for _, m := range strings.Split(*members, ",") {
+		if m = strings.TrimSpace(m); m != "" {
+			memberList = append(memberList, m)
+		}
+	}
+	var resp struct {
+		RoomID string `json:"roomId"`
+	}
+	if err := a.cl.postJSON(a.ctx, "/api/create_room", map[string]any{
+		"from": defaultFrom, "name": name, "members": memberList,
+	}, &resp); err != nil {
+		return err
+	}
+	if resp.RoomID == "" {
+		return &statusError{status: 0, path: "/api/create_room", body: "响应缺 roomId"}
+	}
+	return a.print(map[string]any{"roomId": resp.RoomID, "name": name},
+		[]string{"ROOM-ID", "NAME"}, [][]string{{resp.RoomID, name}})
+}
+
+func (a *app) roomDrop(args []string) error {
+	fs := newFlagSet("room drop")
+	if err := fs.Parse(args); err != nil {
+		return usageErr("hubctl room drop：%v", err)
+	}
+	if fs.NArg() != 1 {
+		return usageErr("用法：hubctl room drop <房间ID>（不可逆操作，ID 必须显式给出）")
+	}
+	id := fs.Arg(0)
+	var raw map[string]any
+	if err := a.cl.postJSON(a.ctx, "/api/delete_room", map[string]string{"roomId": id}, &raw); err != nil {
+		return roomNotFound(err)
+	}
+	return a.print(raw, []string{"ENDPOINT", "STATUS"}, [][]string{{"/api/delete_room", id + " 已删除"}})
+}
+
+func (a *app) roomRename(args []string) error {
+	fs := newFlagSet("room rename")
+	if err := fs.Parse(args); err != nil {
+		return usageErr("hubctl room rename：%v", err)
+	}
+	if fs.NArg() != 2 {
+		return usageErr("用法：hubctl room rename <房间ID> <新名称>")
+	}
+	id, name := fs.Arg(0), fs.Arg(1)
+	var raw map[string]any
+	if err := a.cl.postJSON(a.ctx, "/api/rename_room", map[string]string{"roomId": id, "name": name}, &raw); err != nil {
+		return roomNotFound(err)
+	}
+	return a.print(raw, []string{"ENDPOINT", "STATUS"}, [][]string{{"/api/rename_room", id + " → " + name}})
+}
+
+func (a *app) roomKick(args []string) error {
+	fs := newFlagSet("room kick")
+	if err := fs.Parse(args); err != nil {
+		return usageErr("hubctl room kick：%v", err)
+	}
+	if fs.NArg() != 2 {
+		return usageErr("用法：hubctl room kick <房间ID> <成员ID>")
+	}
+	id, agent := fs.Arg(0), fs.Arg(1)
+	var raw map[string]any
+	if err := a.cl.postJSON(a.ctx, "/api/kick", map[string]string{"roomId": id, "agent": agent}, &raw); err != nil {
+		return roomNotFound(err)
+	}
+	return a.print(raw, []string{"ENDPOINT", "STATUS"}, [][]string{{"/api/kick", agent + " ← " + id}})
 }
 
 // ---------------------------------------------------------------------------

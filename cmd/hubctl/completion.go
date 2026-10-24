@@ -11,7 +11,7 @@ _hubctl() {
     local cur cmd i
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
-    local commands="status agents rooms send say bcast plugins logs messages perf watch fmt completion help"
+    local commands="status agents rooms room send say bcast plugins logs messages perf watch fmt completion help"
     local globals="--addr --fmt --color --help --version"
 
     cmd=""
@@ -29,6 +29,7 @@ _hubctl() {
 
     case "$cmd" in
         plugins)   COMPREPLY=($(compgen -W "start stop" -- "$cur")) ;;
+        room)      COMPREPLY=($(compgen -W "create drop rename kick" -- "$cur")) ;;
         fmt)       COMPREPLY=($(compgen -W "json table" -- "$cur")) ;;
         completion) COMPREPLY=($(compgen -W "bash zsh powershell" -- "$cur")) ;;
         send)      COMPREPLY=($(compgen -W "--to --text --from" -- "$cur")) ;;
@@ -57,6 +58,7 @@ _hubctl() {
     'status:服务状态总览（GET /api/status）'
     'agents:Agent 表格，-w 监听 SSE'
     'rooms:房间列表（GET /api/rooms）'
+    'room:房间管理（create/drop/rename/kick）'
     'send:点对点发送（POST /api/send）'
     'say:房间发送（POST /api/room）'
     'bcast:广播（POST /api/broadcast）'
@@ -109,7 +111,7 @@ const completionPowerShell = `# hubctl PowerShell 补全 —— 由 "hubctl comp
 Register-ArgumentCompleter -CommandName hubctl -Native -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
 
-    $commands = @('status', 'agents', 'rooms', 'send', 'say', 'bcast', 'plugins',
+    $commands = @('status', 'agents', 'rooms', 'room', 'send', 'say', 'bcast', 'plugins',
                   'logs', 'messages', 'perf', 'watch', 'fmt', 'completion', 'help')
     $globals = @('--addr', '--fmt', '--color', '--help', '--version')
 
@@ -132,6 +134,7 @@ Register-ArgumentCompleter -CommandName hubctl -Native -ScriptBlock {
     $next = @()
     switch ($sub) {
         'plugins'    { $next = @('start', 'stop') }
+        'room'       { $next = @('create', 'drop', 'rename', 'kick') }
         'fmt'        { $next = @('json', 'table') }
         'completion' { $next = @('bash', 'zsh', 'powershell') }
         'send'       { $next = @('--to', '--text', '--from') }
