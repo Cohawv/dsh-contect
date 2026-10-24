@@ -13,8 +13,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# 版本号：git 描述 + 短 sha；无 tag 时回退到 dev+sha
-VER="v1.0.0+$(git describe --tags --always 2>/dev/null | head -c 7 || echo dev)"
+# 版本号：git tag 优先（正式发布）。打 tag 后 describe 输出 tag 本身（如 V1.0.0）；
+# tag 之后再有提交则输出 V1.0.0-N-g<sha>（N = 领先 tag 的提交数）——语义正确的自增。
+# 无任何 tag 时回退 dev（首次构建前的冷启动）。
+VER="$(git describe --tags --always 2>/dev/null || echo dev)"
 BT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 LDFLAGS="-s -w -X main.version=$VER -X main.buildTime=$BT"
